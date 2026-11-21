@@ -24,13 +24,13 @@ export function newPairingToken(): string {
 }
 
 /**
- * Tenant fallback (2b-1): the app cannot know its Supabase tenant id at
- * pairing time — `licences` has user_id (auth UUID), no tenant_id, and
- * `verifyLicenceKey` returns a boolean only. So when init arrives
+ * Tenant fallback (2b-1): the app cannot know its D1 tenant id at
+ * pairing time — `licences` has user_id (opaque owner id), no tenant_id,
+ * and `verifyLicenceKey` returns a boolean only. So when init arrives
  * without a tenant_id, derive a stable, non-reversible D1-local label
- * from the licence key. Phase 4 (real tenants from owner_email)
- * migrates this; until then the value is a label only — D1 has no FK
- * into Supabase tenants.
+ * from the licence key. Phase 4 (real tenants from owner_email, in the
+ * D1 `tenants` table) migrates this; until then the value is a label
+ * only, with no FK into `tenants`.
  */
 export async function deriveTenantId(licenceKey: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(licenceKey));

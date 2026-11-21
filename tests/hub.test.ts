@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { handleRequest, route, type Env } from "../src/hub";
 import { FakeD1 } from "./fake-d1";
 import { deriveSixDigit, deriveTenantId } from "../src/pairing";
@@ -14,27 +14,17 @@ function fakeEnv(db: FakeD1, overrides: Partial<Env> = {}): Env {
     DB: db as unknown as D1Database,
     INTERNAL_SECRET: "test-internal",
     CRON_SECRET: "test-cron",
-    SUPABASE_URL: "https://x.supabase.co",
-    SUPABASE_SERVICE_ROLE_KEY: "test-key",
     ...overrides,
   };
 }
 
-function stubLicences(rows: Record<string, unknown>[]) {
-  vi.stubGlobal(
-    "fetch",
-    async (url: string) => {
-      if (url.includes("/rest/v1/licences")) {
-        return new Response(JSON.stringify(rows), { status: 200 });
-      }
-      return new Response("{}", { status: 200 });
-    },
-  );
+// D1 seed (replaces the old Supabase fetch stubs — licences live in D1 now).
+async function seedLicence(db: FakeD1, key: string, status = "active") {
+  await db
+    .prepare("INSERT INTO licences (key, user_id, device_id, status, created_at) VALUES (?, ?, NULL, ?, ?)")
+    .bind(key, "owner@example.com", status, Date.now())
+    .run();
 }
-
-afterEach(() => {
-  vi.unstubAllGlobals();
-});
 
 describe("hub routing (2a-1 skeleton, kept)", () => {
   it("GET /health -> 200 ok:true", async () => {
@@ -57,10 +47,10 @@ describe("hub routing (2a-1 skeleton, kept)", () => {
   });
 });
 
-describe("handleRequest (2a-2 routes)", () => {
+describe("handleRequest (2a-2 routes, D1 licences)", () => {
   it("pairing init: active licence -> 200 token+code", async () => {
     const db = new FakeD1();
-    stubLicences([{ key: "L-1", status: "active" }]);
+    await seedLicence(db, "L-1");
     const res = await handleRequest(
       new Request("https://hub/api/pairing/init", {
         method: "POST",
@@ -78,7 +68,7 @@ describe("handleRequest (2a-2 routes)", () => {
 
   it("pairing init: no tenant_id -> 200, derived lic- tenant (2b-1)", async () => {
     const db = new FakeD1();
-    stubLicences([{ key: "L-1", status: "active" }]);
+    await seedLicence(db, "L-1");
     const res = await handleRequest(
       new Request("https://hub/api/pairing/init", {
         method: "POST",
@@ -99,7 +89,7 @@ describe("handleRequest (2a-2 routes)", () => {
 
   it("pairing init: supplied tenant_id is kept (2b-1)", async () => {
     const db = new FakeD1();
-    stubLicences([{ key: "L-1", status: "active" }]);
+    await seedLicence(db, "L-1");
     const res = await handleRequest(
       new Request("https://hub/api/pairing/init", {
         method: "POST",
@@ -119,7 +109,7 @@ describe("handleRequest (2a-2 routes)", () => {
 
   it("pairing init: revoked licence -> 403 licence_invalid", async () => {
     const db = new FakeD1();
-    stubLicences([{ key: "L-1", status: "revoked" }]);
+    await seedLicence(db, "L-1", "revoked");
     const res = await handleRequest(
       new Request("https://hub/api/pairing/init", {
         method: "POST",
@@ -132,23 +122,23 @@ describe("handleRequest (2a-2 routes)", () => {
     expect(((await res.json()) as Record<string, unknown>).error).toBe("licence_invalid");
   });
 
-  it("pairing init: Supabase env missing -> 503 config_missing", async () => {
+  it("pairing init: unknown licence -> 403 licence_invalid", async () => {
     const db = new FakeD1();
-    const env = fakeEnv(db, { SUPABASE_URL: undefined, SUPABASE_SERVICE_ROLE_KEY: undefined });
     const res = await handleRequest(
       new Request("https://hub/api/pairing/init", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ device_id: "dev-1", tenant_id: "t-1", licence_key: "L-1" }),
+        body: JSON.stringify({ device_id: "dev-1", tenant_id: "t-1", licence_key: "NOPE" }),
       }),
-      env,
+      fakeEnv(db),
     );
-    expect(res.status).toBe(503);
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as Record<string, unknown>).error).toBe("licence_invalid");
   });
 
   it("pairing register: token one-time (second use 403)", async () => {
     const db = new FakeD1();
-    stubLicences([{ key: "L-1", status: "active" }]);
+    await seedLicence(db, "L-1");
     const env = fakeEnv(db);
     const init = await handleRequest(
       new Request("https://hub/api/pairing/init", {
@@ -195,7 +185,7 @@ describe("handleRequest (2a-2 routes)", () => {
 
   it("pairing init rate limit: 11th call in a minute -> 429", async () => {
     const db = new FakeD1();
-    stubLicences([{ key: "L-1", status: "active" }]);
+    await seedLicence(db, "L-1");
     const env = fakeEnv(db);
     let lastStatus = 0;
     for (let i = 0; i < 11; i++) {
@@ -254,20 +244,21 @@ describe("handleRequest (2a-2 routes)", () => {
   });
 });
 
-describe("keepalive probe (2a-4: real checks)", () => {
-  it("empty D1 + no Supabase key -> ok:true, d1.devices 0, supabase not_configured", async () => {
+describe("keepalive probe (2a-4: real checks, D1 licences)", () => {
+  it("empty D1 -> ok:true, d1.devices 0, licences ok count 0", async () => {
     const db = new FakeD1();
-    const env = fakeEnv(db, { SUPABASE_URL: undefined, SUPABASE_SERVICE_ROLE_KEY: undefined });
-    const res = await handleRequest(new Request("https://hub/api/keepalive"), env);
+    const res = await handleRequest(new Request("https://hub/api/keepalive"), fakeEnv(db));
     expect(res.status).toBe(200);
     const body = (await res.json()) as Record<string, any>;
     expect(body.ok).toBe(true);
     expect(body.checks.d1.ok).toBe(true);
     expect(body.checks.d1.devices).toBe(0);
-    expect(body.checks.supabase.state).toBe("not_configured");
+    expect(body.checks.licences.state).toBe("ok");
+    expect(body.checks.licences.count).toBe(0);
+    expect(body.checks.supabase).toBeUndefined();
   });
 
-  it("one device in D1 -> d1.devices 1", async () => {
+  it("one device + one licence in D1 -> devices 1, licences 1", async () => {
     const db = new FakeD1();
     await db
       .prepare(
@@ -275,35 +266,10 @@ describe("keepalive probe (2a-4: real checks)", () => {
       )
       .bind("dev-1", "t-1", "key", Date.now(), Date.now(), 1)
       .run();
-    const env = fakeEnv(db, { SUPABASE_URL: undefined, SUPABASE_SERVICE_ROLE_KEY: undefined });
-    const res = await handleRequest(new Request("https://hub/api/keepalive"), env);
+    await seedLicence(db, "L-1");
+    const res = await handleRequest(new Request("https://hub/api/keepalive"), fakeEnv(db));
     const body = (await res.json()) as Record<string, any>;
     expect(body.checks.d1.devices).toBe(1);
-  });
-
-  it("Supabase tenants readable -> supabase ok", async () => {
-    const db = new FakeD1();
-    vi.stubGlobal(
-      "fetch",
-      async (url: string) => {
-        if (url.includes("/rest/v1/tenants")) {
-          return new Response("[]", { status: 200 });
-        }
-        return new Response("{}", { status: 200 });
-      },
-    );
-    const res = await handleRequest(new Request("https://hub/api/keepalive"), fakeEnv(db));
-    const body = (await res.json()) as Record<string, any>;
-    expect(body.ok).toBe(true);
-    expect(body.checks.supabase.state).toBe("ok");
-  });
-
-  it("Supabase tenants table missing (404) -> supabase schema_pending, ok still true (D1)", async () => {
-    const db = new FakeD1();
-    vi.stubGlobal("fetch", async () => new Response("{}", { status: 404 }));
-    const res = await handleRequest(new Request("https://hub/api/keepalive"), fakeEnv(db));
-    const body = (await res.json()) as Record<string, any>;
-    expect(body.ok).toBe(true);
-    expect(body.checks.supabase.state).toBe("schema_pending");
+    expect(body.checks.licences.count).toBe(1);
   });
 });

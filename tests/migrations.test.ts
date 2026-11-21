@@ -2,42 +2,32 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 const SQL = readFileSync(
-  new URL("../supabase/migrations/0001_tenants_jobs_skills.sql", import.meta.url),
+  new URL("../d1/migrations/0002_supabase_port.sql", import.meta.url),
   "utf8",
 );
 
-describe("supabase migration 0001 (tenants/jobs/skills)", () => {
-  it("creates the three tables (IF NOT EXISTS)", () => {
-    for (const table of ["tenants", "scheduled_jobs", "global_skills"]) {
+describe("D1 migration 0002 (Supabase port: tenants/jobs/skills + licences/patterns)", () => {
+  it("creates the five tables (IF NOT EXISTS)", () => {
+    for (const table of ["tenants", "scheduled_jobs", "global_skills", "licences", "learned_patterns"]) {
       expect(SQL).toContain(`CREATE TABLE IF NOT EXISTS ${table} (`);
     }
   });
 
-  it("enables RLS on all three tables", () => {
-    for (const table of ["tenants", "scheduled_jobs", "global_skills"]) {
-      expect(SQL).toContain(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY;`);
-    }
+  it("has NO Supabase / RLS / auth references", () => {
+    // Executable SQL only: `--` header comments are provenance (which
+    // Postgres file this ports), not functional references — same
+    // comment-strip as the non-destructive test below.
+    const code = SQL.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(code.toLowerCase()).not.toContain("supabase");
+    expect(code).not.toContain("ROW LEVEL SECURITY");
+    expect(code).not.toContain("auth.jwt");
+    expect(code).not.toContain("gen_random_uuid");
   });
 
-  it("has RLS policies keyed on the JWT email claim", () => {
-    expect(SQL).toContain("auth.jwt() ->> 'email'");
-    for (const policy of [
-      "tenants_select_own",
-      "tenants_insert_own",
-      "tenants_update_own",
-      "jobs_select_own",
-      "jobs_insert_own",
-      "jobs_update_own",
-      "jobs_delete_own",
-      "skills_select_own",
-      "skills_insert_own",
-    ]) {
-      expect(SQL).toContain(`CREATE POLICY ${policy} ON`);
-    }
-  });
-
-  it("global_skills has NO update/delete policy (quarantine enforced)", () => {
-    expect(SQL).not.toMatch(/CREATE POLICY \w+ ON global_skills FOR (UPDATE|DELETE)/);
+  it("timestamps are INTEGER unix-ms, booleans INTEGER 0/1", () => {
+    expect(SQL).toContain("created_at INTEGER NOT NULL");
+    expect(SQL).toContain("approved INTEGER NOT NULL DEFAULT 0");
+    expect(SQL).toContain("enabled INTEGER NOT NULL DEFAULT 1");
   });
 
   it("global_skills status is CHECK-constrained to the 3 states", () => {
@@ -45,29 +35,24 @@ describe("supabase migration 0001 (tenants/jobs/skills)", () => {
     expect(SQL).toContain("DEFAULT 'quarantined'");
   });
 
+  it("licences: one active per user via partial unique index", () => {
+    expect(SQL).toContain("CREATE UNIQUE INDEX IF NOT EXISTS licences_one_active_per_user ON licences(user_id) WHERE status = 'active'");
+    expect(SQL).toContain("CHECK (status IN ('active', 'revoked'))");
+  });
+
+  it("learned_patterns: template is JSON TEXT, approved defaults 0", () => {
+    expect(SQL).toContain("template TEXT NOT NULL");
+    expect(SQL).toContain("template_hash TEXT UNIQUE NOT NULL");
+  });
+
   it("has the due-jobs index (enabled, next_run_at)", () => {
     expect(SQL).toContain("idx_scheduled_jobs_due ON scheduled_jobs(enabled, next_run_at)");
   });
 
   it("is non-destructive: no DROP TABLE / TRUNCATE / DELETE FROM", () => {
-    // Strip -- comments first (the header comment NAMES the forbidden
-    // statements; the check is about executable SQL).
     const code = SQL.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
     expect(code).not.toMatch(/DROP\s+TABLE/i);
     expect(code).not.toMatch(/TRUNCATE/i);
     expect(code).not.toMatch(/DELETE\s+FROM/i);
-  });
-
-  it("is re-runnable: policies use DROP POLICY IF EXISTS first", () => {
-    const creates = [...SQL.matchAll(/CREATE POLICY (\w+) ON/g)].map((m) => m[1]);
-    expect(creates.length).toBeGreaterThan(0);
-    for (const name of creates) {
-      expect(SQL).toContain(`DROP POLICY IF EXISTS ${name} ON`);
-    }
-  });
-
-  it("references the live tables as untouched (licences/learned_patterns)", () => {
-    expect(SQL).toContain("licences");
-    expect(SQL).toContain("learned_patterns");
   });
 });

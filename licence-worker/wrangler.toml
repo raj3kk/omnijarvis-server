@@ -1,0 +1,11 @@
+name = "jarvis-licence"
+main = "worker.js"
+compatibility_date = "2026-11-21"
+
+# D1 store (Supabase REMOVED 2026-11-21). Deploy is via
+# deploy_jarvis_licence_worker.py (raw Scripts API, same binding) —
+# this file documents the binding for local wrangler use.
+[[d1_databases]]
+binding = "DB"
+database_name = "omnijarvis-db"
+database_id = "37a7ff24-9fd2-40f9-b122-82cdaea7e79d"

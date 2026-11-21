@@ -5,8 +5,12 @@
  * Licence routes live in the SEPARATE `jarvis-licence` Worker (Phase 0)
  * — unhe yahan port mat karo.
  *
+ * Store: D1 ONLY (D12 reframed 2026-11-21 — Supabase fully removed).
+ * Licence keys are verified against the D1 `licences` table; scheduled
+ * jobs come from D1 `scheduled_jobs`. No external DB, no service key.
+ *
  * Auth summary:
- * - /api/pairing/init: licence-key verified (Supabase licences table).
+ * - /api/pairing/init: licence-key verified (D1 licences table).
  * - /api/pairing/register: one-time 5-min token (D1 pairing_tokens).
  * - /api/sync: paired device + Ed25519 signature (crypto.ts).
  * - /api/cron/tick: x-cron-secret (constant-time compare).
@@ -22,8 +26,6 @@ export interface Env {
   DB: D1Database;
   INTERNAL_SECRET?: string;
   CRON_SECRET?: string;
-  SUPABASE_URL?: string;
-  SUPABASE_SERVICE_ROLE_KEY?: string;
   UPSTASH_REDIS_REST_URL?: string;
   UPSTASH_REDIS_REST_TOKEN?: string;
   LANGFUSE_PUBLIC_KEY?: string;
@@ -33,14 +35,13 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "2b-1";
+const VERSION = "2b-1-d1";
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { handleSync, type SyncRequest } from "./sync";
 import { handleTick, type DispatchStep } from "./cron";
 import { checkRateLimit } from "./ratelimit";
-import { getDevice } from "./db";
-import { verifyLicenceKey, supabaseSelect, SupabaseMissing, SupabaseSchemaPending } from "./supabase";
+import { getDevice, verifyLicenceKey } from "./db";
 
 /**
  * Pure route dispatch for health/status/404 (no env access) — vitest
@@ -84,13 +85,10 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // Public: status + health (pure route()).
     if (path === "/" || path === "/health") return route(path);
     // Keep-alive probe (2a-4): REAL checks, not a static ok.
-    // - D1: device count (the Worker's core store) — `ok` reflects D1
-    //   only; a D1 failure fails the keepalive-check workflow.
-    // - Supabase: tenants readable via service key — state reported
-    //   (ok / schema_pending / not_configured / error), NOT fatal here:
-    //   until B-A lands it is `not_configured` by design, and the
-    //   workflow's direct anon-key check (when secrets exist) is the
-    //   one that fails on a real Supabase outage.
+    // - D1 devices: device count (the Worker's core store) — `ok`
+    //   reflects D1 only; a D1 failure fails the keepalive-check workflow.
+    // - D1 licences: licences-table probe (count) — the licence store
+    //   is D1 now (was Supabase tenants before the 2026-11-21 migration).
     if (path === "/api/keepalive" && method === "GET") {
       let d1Ok = false;
       let devices = 0;
@@ -104,14 +102,17 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       } catch {
         d1Ok = false;
       }
-      let supabaseState = "not_configured";
+      let licencesState = "error";
+      let licences = 0;
       try {
-        await supabaseSelect(env, "tenants", "select=id&limit=1");
-        supabaseState = "ok";
-      } catch (e) {
-        if (e instanceof SupabaseSchemaPending) supabaseState = "schema_pending";
-        else if (e instanceof SupabaseMissing) supabaseState = "not_configured";
-        else supabaseState = "error";
+        const count = await env.DB
+          .prepare("SELECT COUNT(*) AS n FROM licences")
+          .bind()
+          .first<{ n: number }>();
+        licencesState = typeof count?.n === "number" ? "ok" : "error";
+        licences = typeof count?.n === "number" ? count.n : 0;
+      } catch {
+        licencesState = "error";
       }
       return json({
         ok: d1Ok,
@@ -120,7 +121,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         time: Date.now(),
         checks: {
           d1: { ok: d1Ok, devices },
-          supabase: { state: supabaseState },
+          licences: { state: licencesState, count: licences },
         },
       });
     }
@@ -134,13 +135,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const tenantId = typeof body.tenant_id === "string" ? body.tenant_id : "";
       const licenceKey = typeof body.licence_key === "string" ? body.licence_key : "";
       if (!deviceId || !licenceKey) return json({ error: "bad_request" }, 400);
-      let licensed = false;
-      try {
-        licensed = await verifyLicenceKey(env, licenceKey);
-      } catch (e) {
-        if (e instanceof SupabaseMissing) return json({ error: "config_missing" }, 503);
-        throw e;
-      }
+      const licensed = await verifyLicenceKey(env.DB, licenceKey);
       if (!licensed) return json({ error: "licence_invalid" }, 403);
       // 2b-1: tenant_id is OPTIONAL — the app cannot know it (licences
       // has no tenant_id). Derive a stable D1-local label when absent.
@@ -207,8 +202,6 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       };
       const result = await handleTick(env.DB, env, request.headers.get("x-cron-secret"), dispatch);
       if (!result.ok && result.error === "unauthorized") return json({ error: "unauthorized" }, 401);
-      if (!result.ok && result.error === "schema_pending") return json({ error: "schema_pending" }, 503);
-      if (!result.ok && result.error === "config_missing") return json({ error: "config_missing" }, 503);
       return json(result);
     }
 
@@ -227,7 +220,6 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     return json({ error: "not_found" }, 404);
   } catch (e) {
-    if (e instanceof SupabaseSchemaPending) return json({ error: "schema_pending" }, 503);
     return json({ error: "server_error", detail: String((e as Error)?.message ?? e) }, 500);
   }
 }

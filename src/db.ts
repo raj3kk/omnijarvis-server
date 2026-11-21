@@ -2,6 +2,10 @@
  * db.ts — D1 helpers (thin wrappers; SQL yahin rehta hai, routes me nahi).
  * Env.DB is a D1Database binding (wrangler.toml). Tests pass a fake
  * implementing the same { prepare } surface.
+ *
+ * D1 is THE store (D12 reframed, 2026-11-21 — Supabase removed):
+ * licences, tenants, scheduled_jobs, global_skills live here too
+ * (migration 0002), not in any external DB.
  */
 
 export interface D1Like {
@@ -43,5 +47,54 @@ export async function touchDeviceSeen(db: D1Like, deviceId: string): Promise<voi
   await db
     .prepare("UPDATE devices SET last_seen = ? WHERE device_id = ?")
     .bind(Date.now(), deviceId)
+    .run();
+}
+
+/**
+ * Licence-key check (pairing init): D1 `licences` table (key, user_id,
+ * device_id, status) — status 'active' hona chahiye. Revoked/missing
+ * key -> false. (Was Supabase REST before the 2026-11-21 migration.)
+ */
+export async function verifyLicenceKey(db: D1Like, key: string): Promise<boolean> {
+  const row = await db
+    .prepare("SELECT status FROM licences WHERE key = ?")
+    .bind(key)
+    .first<{ status: string }>();
+  return row?.status === "active";
+}
+
+export interface DueJob {
+  id: string;
+  tenant_id: string;
+  device_id: string;
+  cron_expr: string;
+  command: string;
+  enabled: number;
+  last_run_at: number | null;
+  next_run_at: number | null;
+}
+
+/** Due jobs: enabled AND next_run_at <= now, earliest first. */
+export async function getDueJobs(db: D1Like, nowMs: number): Promise<DueJob[]> {
+  const res = await db
+    .prepare(
+      "SELECT id, tenant_id, device_id, cron_expr, command, enabled, last_run_at, next_run_at " +
+        "FROM scheduled_jobs WHERE enabled = ? AND next_run_at <= ? ORDER BY next_run_at ASC",
+    )
+    .bind(1, nowMs)
+    .all<DueJob>();
+  return res.results ?? [];
+}
+
+/** After a fire: record last run + next run (null = no future run). */
+export async function markJobRun(
+  db: D1Like,
+  jobId: string,
+  lastRunAt: number,
+  nextRunAt: number | null,
+): Promise<void> {
+  await db
+    .prepare("UPDATE scheduled_jobs SET last_run_at = ?, next_run_at = ? WHERE id = ?")
+    .bind(lastRunAt, nextRunAt, jobId)
     .run();
 }

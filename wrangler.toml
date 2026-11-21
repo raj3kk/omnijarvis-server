@@ -12,7 +12,7 @@ class_name = "JarvisHub"
 tag = "v1"
 new_sqlite_classes = ["JarvisHub"]
 
-# D1 sync store (default — D12 locked). Created via CF API 2026-11-21.
+# D1 is THE store (D12 reframed 2026-11-21 — Supabase removed). Created via CF API 2026-11-21.
 [[d1_databases]]
 binding = "DB"
 database_name = "omnijarvis-db"

@@ -1,30 +1,26 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { FakeD1 } from "./fake-d1";
 import { constantTimeEqual, cronMinuteKey, handleTick, nextCronRun } from "../src/cron";
 
-const ENV = { CRON_SECRET: "test-cron", SUPABASE_URL: "https://x.supabase.co", SUPABASE_SERVICE_ROLE_KEY: "k" };
+const ENV = { CRON_SECRET: "test-cron" };
 
-function stubSupabase(jobs: Record<string, unknown>[]) {
-  vi.stubGlobal(
-    "fetch",
-    async (url: string) => {
-      if (url.includes("/rest/v1/scheduled_jobs")) {
-        if (url.includes("select=")) return new Response(JSON.stringify(jobs), { status: 200 });
-      }
-      return new Response("{}", { status: 200 });
-    },
-  );
+async function seedJob(
+  db: FakeD1,
+  id: string,
+  cronExpr: string,
+  command: string,
+  nextRunAt: number,
+  now: number,
+) {
+  await db
+    .prepare(
+      "INSERT INTO scheduled_jobs (id, tenant_id, device_id, cron_expr, command, enabled, last_run_at, next_run_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id, "t-1", "dev-1", cronExpr, command, 1, null, nextRunAt, now)
+    .run();
 }
 
-function stubSupabase404() {
-  vi.stubGlobal("fetch", async () => new Response("{}", { status: 404 }));
-}
-
-afterEach(() => {
-  vi.unstubAllGlobals();
-});
-
-describe("cron tick", () => {
+describe("cron tick (D1 scheduled_jobs)", () => {
   it("wrong secret -> unauthorized", async () => {
     const db = new FakeD1();
     const res = await handleTick(db, ENV, "wrong", async () => true);
@@ -39,32 +35,43 @@ describe("cron tick", () => {
     expect(res.error).toBe("unauthorized");
   });
 
-  it("scheduled_jobs table missing (404) -> schema_pending", async () => {
+  it("empty D1 -> ok, fires 0", async () => {
     const db = new FakeD1();
-    stubSupabase404();
-    const res = await handleTick(db, ENV, "test-cron", async () => true);
-    expect(res.ok).toBe(false);
-    expect(res.error).toBe("schema_pending");
+    const res = await handleTick(db, ENV, "test-cron", async () => true, Date.parse("2026-11-21T09:00:00Z"));
+    expect(res.ok).toBe(true);
+    expect(res.fired).toBe(0);
+    expect(res.skipped).toBe(0);
   });
 
-  it("fires due jobs once per minute (idempotency)", async () => {
+  it("fires due jobs once per minute (idempotency); future jobs do not fire", async () => {
     const db = new FakeD1();
-    const jobs = [
-      { id: "job-1", tenant_id: "t-1", device_id: "dev-1", cron_expr: "0 9 * * *", command: "open youtube" },
-      { id: "job-2", tenant_id: "t-1", device_id: "dev-1", cron_expr: "*/15 * * * *", command: "check mail" },
-    ];
-    stubSupabase(jobs);
+    const now = Date.parse("2026-11-21T09:00:00Z");
+    await seedJob(db, "job-1", "0 9 * * *", "open youtube", now - 60_000, now);
+    await seedJob(db, "job-2", "*/15 * * * *", "check mail", now - 60_000, now);
+    await seedJob(db, "job-3", "0 10 * * *", "future job", now + 3_600_000, now);
     const dispatched: string[] = [];
     const dispatch = async (deviceId: string, step: Record<string, unknown>) => {
       dispatched.push(String(step.job_id));
       return true;
     };
-    const now = Date.parse("2026-11-21T09:00:00Z");
     const r1 = await handleTick(db, ENV, "test-cron", dispatch, now);
     expect(r1.ok).toBe(true);
     expect(r1.fired).toBe(2);
     expect(dispatched).toEqual(["job-1", "job-2"]);
+    // markJobRun wrote next_run_at: daily 09:00 -> next day 09:00.
+    // (Read BEFORE the reset below — tick 2 skips, so it never rewrites.)
+    const row = await db
+      .prepare("SELECT next_run_at FROM scheduled_jobs WHERE id = ?")
+      .bind("job-1")
+      .first<{ next_run_at: number }>();
+    expect(row?.next_run_at).toBe(Date.parse("2026-11-22T09:00:00Z"));
     // Same minute again -> both skipped (idempotency via traces).
+    // NOTE: tick 1's markJobRun already advanced next_run_at, so a plain
+    // re-tick would find no due jobs at all. Re-open the jobs (simulates
+    // the concurrent double-tick race: tick B read the due list before
+    // tick A's markJobRun landed) — the traces guard must still skip.
+    await db.prepare("UPDATE scheduled_jobs SET next_run_at = ? WHERE id = ?").bind(now - 60_000, "job-1").run();
+    await db.prepare("UPDATE scheduled_jobs SET next_run_at = ? WHERE id = ?").bind(now - 60_000, "job-2").run();
     const r2 = await handleTick(db, ENV, "test-cron", dispatch, now + 30_000);
     expect(r2.fired).toBe(0);
     expect(r2.skipped).toBe(2);

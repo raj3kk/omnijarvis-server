@@ -3,9 +3,8 @@
  *
  * Auth: header x-cron-secret == CRON_SECRET (Worker secret). Constant-time
  * compare (timing leak se bachne ke liye).
- * Due jobs: Supabase scheduled_jobs (enabled=true AND next_run_at <= now).
- * Table na ho -> 503 schema_pending (2a-3 me schema aayega; tick tab tak
- * fail-closed rehta hai, silently PASS nahi karta).
+ * Due jobs: D1 scheduled_jobs (enabled=1 AND next_run_at <= now, ms ints).
+ * (Was Supabase REST before the 2026-11-21 D1 migration.)
  * Idempotency: har fire ke liye D1 traces me kind=cron_fire,
  * detail={job_id, minute} check — pehle se fired ho to skip (dispatcher
  * retry / double-tick se ek job do baar fire nahi hoti).
@@ -15,14 +14,11 @@
  * Jitter documented: tick 5-min par hai, par GitHub best-effort delays
  * (5–30 min load par) — "exact time" ka vaada kabhi nahi.
  */
-import { supabaseSelect, supabaseUpdate, SupabaseMissing, SupabaseSchemaPending } from "./supabase";
 import type { D1Like } from "./db";
-import { insertTrace } from "./db";
+import { getDueJobs, insertTrace, markJobRun } from "./db";
 
 export interface CronEnv {
   CRON_SECRET?: string;
-  SUPABASE_URL?: string;
-  SUPABASE_SERVICE_ROLE_KEY?: string;
 }
 
 export type DispatchStep = (deviceId: string, step: Record<string, unknown>) => Promise<boolean>;
@@ -56,18 +52,7 @@ export async function handleTick(
   if (!env.CRON_SECRET || !secret || !constantTimeEqual(secret, env.CRON_SECRET)) {
     return { ok: false, fired: 0, skipped: 0, error: "unauthorized" };
   }
-  let jobs: Record<string, unknown>[];
-  try {
-    jobs = await supabaseSelect(
-      env,
-      "scheduled_jobs",
-      `select=id,tenant_id,device_id,cron_expr,command&enabled=eq.true&next_run_at=lte.${new Date(nowMs).toISOString()}`,
-    );
-  } catch (e) {
-    if (e instanceof SupabaseMissing) return { ok: false, fired: 0, skipped: 0, error: "config_missing" };
-    if (e instanceof SupabaseSchemaPending) return { ok: false, fired: 0, skipped: 0, error: "schema_pending" };
-    throw e;
-  }
+  const jobs = await getDueJobs(db, nowMs);
   let fired = 0;
   let skipped = 0;
   for (const job of jobs) {
@@ -95,10 +80,7 @@ export async function handleTick(
     // Naive +5min GALAT hota (daily job har 5 min fire hoti) — isliye
     // parser mandatory hai, simplification nahi.
     const next = nextCronRun(String(job.cron_expr), nowMs);
-    await supabaseUpdate(env, "scheduled_jobs", `id=eq.${jobId}`, {
-      last_run_at: new Date(nowMs).toISOString(),
-      next_run_at: next ? new Date(next).toISOString() : null,
-    });
+    await markJobRun(db, jobId, nowMs, next);
     fired++;
   }
   return { ok: true, fired, skipped };
