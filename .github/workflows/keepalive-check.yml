@@ -1,10 +1,12 @@
 # Keep-alive check — REAL queries, roz ek baar. Koi silent pass nahi:
-# - Hub keepalive (D1 + Supabase state, server-side): D1 fail = workflow FAIL.
-# - Supabase direct (anon key + RLS): sirf tab chalta hai jab SUPABASE_URL +
-#   SUPABASE_ANON_KEY secrets set hon; nahi to visible warning step.
+# - Hub keepalive (D1 devices + D1 licences, server-side): D1 fail =
+#   workflow FAIL; licences state != ok = visible warning.
 # - Qdrant: sirf tab chalta hai jab QDRANT_URL + QDRANT_API_KEY secrets set
 #   hon (1 test vector upsert → query → delete — cluster active rehta hai);
 #   nahi to visible warning step.
+# (D1 migration 2026-11-21: Supabase fully removed — the old "Supabase
+# direct check" step is deleted; tenants/jobs/skills/licences all live
+# in D1 now and are probed via the hub keepalive step above.)
 # Secrets parent ko set karne hain (dashboard/API se) — workflow unke bina
 # bhi chalta hai aur summary me saaf likhta hai kya skip hua.
 name: keepalive-check
@@ -21,16 +23,17 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - name: Hub keepalive (D1 + Supabase state, server-side)
+      - name: Hub keepalive (D1 devices + D1 licences, server-side)
         run: |
           set -e
           body=$(curl -s --max-time 30 "https://omnijarvis-hub.rajraj3kk.workers.dev/api/keepalive")
           echo "$body"
           ok=$(echo "$body" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))")
-          state=$(echo "$body" | python3 -c "import sys,json; print(json.load(sys.stdin)['checks']['supabase']['state'])")
-          echo "supabase state: $state"
+          state=$(echo "$body" | python3 -c "import sys,json; print(json.load(sys.stdin)['checks']['licences']['state'])")
+          count=$(echo "$body" | python3 -c "import sys,json; print(json.load(sys.stdin)['checks']['licences'].get('count', 0))")
+          echo "licences state: $state (count $count)"
           if [ "$state" != "ok" ]; then
-            echo "::warning::Supabase state is '$state' (B-A: service key / schemas pending — see AUDIT_2a-3)."
+            echo "::warning::Licences state is '$state' (D1 licences probe failed — see hub logs)."
           fi
           if [ "$ok" != "True" ]; then echo "HUB KEEPALIVE FAILED (D1)"; exit 1; fi
 
@@ -39,23 +42,6 @@ jobs:
       # 'secrets'") — so optional checks run unconditionally and branch
       # INSIDE the script on empty env vars (warning + exit 0 when the
       # secret is not set; real failure when the check itself fails).
-      - name: Supabase direct check (anon key + RLS)
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-        run: |
-          set -e
-          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_ANON_KEY" ]; then
-            echo "::warning::SUPABASE direct check SKIPPED — SUPABASE_URL / SUPABASE_ANON_KEY secrets not set (parent: Supabase dashboard → Settings → API)."
-            exit 0
-          fi
-          code=$(curl -s -o /tmp/tenants.json -w "%{http_code}" --max-time 30 \
-            "$SUPABASE_URL/rest/v1/tenants?select=id&limit=1" \
-            -H "apikey: $SUPABASE_ANON_KEY" \
-            -H "Authorization: Bearer $SUPABASE_ANON_KEY")
-          echo "tenants HTTP $code: $(cat /tmp/tenants.json)"
-          [ "$code" = "200" ] || { echo "SUPABASE DIRECT CHECK FAILED"; exit 1; }
-
       - name: Qdrant check (upsert → query → delete)
         env:
           QDRANT_URL: ${{ secrets.QDRANT_URL }}

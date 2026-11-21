@@ -28,8 +28,7 @@ src/sync.ts         # D1 proxy + conflict rule (server-wins)
 src/cron.ts         # tick handler + due-job selection + idempotency
 src/ratelimit.ts    # Upstash Redis + budgets (in-memory fallback, flagged)
 src/observability.ts# Langfuse + Sentry (env-gated, no keys = no-op)
-d1/migrations/      # versioned D1 SQL (devices, sync_state, traces, usage_counters)
-supabase/migrations/# versioned Supabase SQL (tenants, scheduled_jobs, global_skills)
+d1/migrations/      # versioned D1 SQL (0001: devices/sync/traces/counters; 0002: tenants/jobs/skills + licences/patterns — Supabase port, 2026-11-21)
 render/worker/      # light Python worker (health + smoke only in Phase 2)
 .github/workflows/  # ci, dispatcher (5-min), keepalive-daily, keepalive-check
 tests/              # vitest
@@ -40,7 +39,7 @@ tests/              # vitest
 - **Free / no card** — koi spend, koi card kahin nahi.
 - **Koi secret code/repo/logs me nahi** — repo PUBLIC hai. Keys sirf Worker secrets / CI secrets / 0600 env files me.
 - **Koi `[skip ci]`** commit message me nahi.
-- **D1 API token / Supabase service key kabhi APK me nahi** — phone hamesha Workers proxy se baat karta hai.
+- **D1 API token kabhi APK me nahi** — phone hamesha Workers proxy se baat karta hai. (Supabase fully removed 2026-11-21 — D1 is the only store.)
 - **No plain `accept()` DO me** — hibernation API only (duration charge hota hai).
 - **No Render Postgres / disk state** — Render ephemeral hai.
 - **No auto global skill publish** — quarantine + human approval ke bina kabhi nahi.
@@ -50,7 +49,7 @@ tests/              # vitest
 
 - **2a-1:** repo skeleton + health route + vitest + CI (ye commit).
 - **2a-2:** control-plane Worker (pairing/sync/cron/keep-alive/health) + DO + D1 migrations v1 + vitest.
-- **2a-3:** Supabase schemas v1 (tenants, scheduled_jobs, global_skills QUARANTINED-only) — versioned SQL + RLS.
+- **2a-3:** Supabase schemas v1 (tenants, scheduled_jobs, global_skills QUARANTINED-only) — versioned SQL + RLS. **SUPERSEDED 2026-11-21 by the D1 migration (D12 reframed): same tables now live in D1 migration 0002; Supabase project abandoned, `supabase/` deleted.**
 - **2a-4:** cron dispatcher + keep-alive + Upstash rate limits + Langfuse/Sentry.
 - **2a-5:** Render light Python worker (health/smoke only).
 - **2b:** app 1.6.x — pairing UI + WS client + D1 sync client + licence URL switch.
