@@ -31,6 +31,9 @@ export const RATE_LIMITS: Record<string, { limit: number; windowMs: number }> = 
   browser: { limit: 30, windowMs: 60_000 },
   skills: { limit: 30, windowMs: 60_000 },
   memory: { limit: 60, windowMs: 60_000 },
+  billing: { limit: 30, windowMs: 60_000 },
+  billingAdmin: { limit: 30, windowMs: 60_000 },
+  e2b: { limit: 30, windowMs: 60_000 },
 };
 
 export interface RateLimitResult {
@@ -40,6 +43,14 @@ export interface RateLimitResult {
 
 // In-memory fallback store (per-isolate; v1 documented limitation).
 const fallbackStore = new Map<string, number[]>();
+
+/** Test-only reset (mirrors resetCircuitBreakers in router.ts): the
+ * fallback store is module-level, so a test file that makes many
+ * calls for one tenant/route would otherwise trip its own 30/min
+ * budget across tests. Production behaviour is unchanged. */
+export function resetRateLimitFallback(): void {
+  fallbackStore.clear();
+}
 
 function fallbackCheck(key: string, limit: number, windowMs: number, nowMs: number): boolean {
   const hits = (fallbackStore.get(key) ?? []).filter((t) => nowMs - t < windowMs);

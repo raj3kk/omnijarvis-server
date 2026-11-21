@@ -10,6 +10,30 @@
 
 export interface D1Like {
   prepare(query: string): D1PreparedLike;
+  /**
+   * Phase 4 (GAP-10 fix): D1 batch — one batch = one transaction
+   * (BEGIN/COMMIT). Ledger writes MUST go through d1Batch() below;
+   * sequential prepares without a batch are NOT atomic. Optional so
+   * old fakes still typecheck — d1Batch falls back to sequential
+   * runs only when batch is absent (never on live D1).
+   */
+  batch?(statements: D1PreparedLike[]): Promise<unknown[]>;
+}
+
+/**
+ * Run prepared statements as ONE D1 batch (atomic). Live D1Database
+ * has batch(); the cast is inside this helper only — callers pass
+ * plain D1PreparedLike statements and never cast. Throws on any
+ * statement failure (the batch rolls back); callers must not catch
+ * and continue as if the writes landed.
+ */
+export async function d1Batch(db: D1Like, statements: D1PreparedLike[]): Promise<void> {
+  const maybeBatch = (db as unknown as { batch?: (s: unknown[]) => Promise<unknown> }).batch;
+  if (typeof maybeBatch === "function") {
+    await maybeBatch.call(db, statements as unknown[]);
+    return;
+  }
+  for (const s of statements) await s.run();
 }
 
 export interface D1PreparedLike {
@@ -70,12 +94,17 @@ export interface TenantRow {
   billing_mode: string;
   gemini_key_enc: string | null;
   pii_consent?: number | null; // 0004: DPDP consent for storing PII in doc_jobs (default 0)
+  email_verified?: number | null; // 0007: 1 = email verified (Resend token / admin god-mode)
+  pending_downgrade_tier?: string | null; // 0007: downgrade effective next cycle
 }
 
-/** Tenant lookup for the LLM router (Phase 3, stage 3a). */
+/** Tenant lookup for the LLM router (Phase 3, stage 3a). Phase 4: also
+ * returns email_verified + pending_downgrade_tier (0007 columns). */
 export async function getTenant(db: D1Like, tenantId: string): Promise<TenantRow | null> {
   const row = await db
-    .prepare("SELECT id, owner_email, plan_tier, billing_mode, gemini_key_enc, pii_consent FROM tenants WHERE id = ?")
+    .prepare(
+      "SELECT id, owner_email, plan_tier, billing_mode, gemini_key_enc, pii_consent, email_verified, pending_downgrade_tier FROM tenants WHERE id = ?",
+    )
     .bind(tenantId)
     .first<TenantRow>();
   return row;

@@ -89,11 +89,27 @@ const DEFAULT_CHAINS: Record<string, Record<RequestKind, string[]>> = {
   },
 };
 
-export const PLAN_LIMITS: Record<string, { replies: number; docs: boolean }> = {
-  free: { replies: 100, docs: false },
-  pro: { replies: 2500, docs: true },
-  business: { replies: 7500, docs: true },
+export interface PlanLimits {
+  replies: number;
+  e2b_runs: number;
+  cron_jobs: number;
+  devices: number;
+  skills: number; // free = 1, pro/business = full library (Number.MAX_SAFE_INTEGER = uncapped)
+  docs: boolean;
+}
+
+/** Phase 4: full 6-cap limits (D2). Values unchanged from 3a for
+ * replies/docs; e2b_runs/cron_jobs/devices/skills are the D2 table.
+ * Router uses replies + docs; billing/e2b/cron/pairing use the rest. */
+export const PLAN_LIMITS: Record<string, PlanLimits> = {
+  free: { replies: 100, e2b_runs: 0, cron_jobs: 0, devices: 1, skills: 1, docs: false },
+  pro: { replies: 2500, e2b_runs: 30, cron_jobs: 5, devices: 3, skills: Number.MAX_SAFE_INTEGER, docs: true },
+  business: { replies: 7500, e2b_runs: 100, cron_jobs: 20, devices: 10, skills: Number.MAX_SAFE_INTEGER, docs: true },
 };
+
+export function planLimits(planTier: string): PlanLimits {
+  return PLAN_LIMITS[planTier] ?? PLAN_LIMITS.free;
+}
 
 export const MAX_INPUT_TOKENS = 5000;
 export const MAX_CALLS_PER_TURN = 5;

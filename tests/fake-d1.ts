@@ -31,6 +31,13 @@ const PK: Record<string, string[]> = {
   skill_reviews: ["id"],
   skill_signatures: ["skill_id"],
   memories: ["id"],
+  // Phase 4 (0007 billing): TEXT ids, no autoInc branch needed.
+  subscriptions: ["id"],
+  payments: ["id"],
+  refunds: ["id"],
+  ledger_events: ["id"],
+  e2b_runs: ["id"],
+  admin_settings: ["key"],
 };
 
 export class FakeD1 implements D1Like {
@@ -50,6 +57,39 @@ export class FakeD1 implements D1Like {
   prepare(query: string): D1PreparedLike {
     const q = query.trim().replace(/\s+/g, " ");
     return new FakePrepared(this, q);
+  }
+
+  /**
+   * Phase 4 (GAP-10 fix): D1 batch = one transaction. Snapshot every
+   * table (deep copy of rows) + autoInc; run each statement in order;
+   * on ANY throw, restore the snapshot (full rollback) and re-throw.
+   * Live D1 batch has the same all-or-nothing semantics.
+   */
+  async batch(statements: D1PreparedLike[]): Promise<unknown[]> {
+    const snapshot = new Map<string, Map<string, Row>>();
+    for (const [name, table] of this.tables) {
+      const copy = new Map<string, Row>();
+      for (const [k, row] of table) copy.set(k, { ...row });
+      snapshot.set(name, copy);
+    }
+    const autoIncSnapshot = new Map(this.autoInc);
+    const out: unknown[] = [];
+    try {
+      for (const s of statements) {
+        const prepared = s as unknown as FakePrepared;
+        out.push({ success: true, meta: { changes: prepared.execSync().length } });
+      }
+    } catch (e) {
+      // Full rollback: restore snapshotted tables AND drop tables the
+      // batch created (they were not in the snapshot).
+      for (const key of [...this.tables.keys()]) {
+        if (!snapshot.has(key)) this.tables.delete(key);
+      }
+      for (const [name, table] of snapshot) this.tables.set(name, table);
+      this.autoInc = autoIncSnapshot;
+      throw e;
+    }
+    return out;
   }
 }
 
@@ -168,6 +208,16 @@ class FakePrepared implements D1PreparedLike {
   }
 
   private select(): Row[] {
+    // SUM() aggregate variant (Phase 4 reconciliation):
+    // SELECT SUM(<col>) AS <alias> FROM <table> [WHERE <conds>]
+    const sumM = this.q.match(/^SELECT SUM\((\w+)\) AS (\w+) FROM (\w+)(?: WHERE (.+))?$/);
+    if (sumM) {
+      const [, col, alias, table, where] = sumM;
+      const rows = this.filterRows(table, where, [...this.args]);
+      let total = 0;
+      for (const r of rows) total += Number(r[col] ?? 0);
+      return [{ [alias]: total }];
+    }
     // COUNT(*) variant
     const countM = this.q.match(/^SELECT COUNT\(\*\) AS (\w+) FROM (\w+)(?: WHERE (.+))?$/);
     if (countM) {
@@ -181,7 +231,15 @@ class FakePrepared implements D1PreparedLike {
     let rows = this.filterRows(table, where, [...this.args]);
     if (orderBy) {
       const dir = orderDir === "DESC" ? -1 : 1;
-      rows = [...rows].sort((a, b) => dir * (Number(a[orderBy] ?? 0) - Number(b[orderBy] ?? 0)));
+      rows = [...rows].sort((a, b) => {
+        const av = a[orderBy];
+        const bv = b[orderBy];
+        // ISO-8601 TEXT timestamps sort lexicographically; numbers numerically.
+        if (typeof av === "string" && typeof bv === "string") {
+          return dir * (av < bv ? -1 : av > bv ? 1 : 0);
+        }
+        return dir * (Number(av ?? 0) - Number(bv ?? 0));
+      });
     }
     if (limit) rows = rows.slice(0, Number(limit));
     if (colsStr.trim() !== "*") {

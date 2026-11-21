@@ -199,3 +199,58 @@ describe("D1 migration 0006 (skill registry: skill_reviews + skill_signatures + 
     expect(code.toLowerCase()).not.toContain("supabase");
   });
 });
+
+const SQL7 = readFileSync(
+  new URL("../d1/migrations/0007_billing.sql", import.meta.url),
+  "utf8",
+);
+
+describe("D1 migration 0007 (billing ledger: subscriptions + payments + refunds + ledger_events + e2b_runs + admin_settings)", () => {
+  it("creates subscriptions with the UPI spec §4 columns + tenant index", () => {
+    expect(SQL7).toContain("CREATE TABLE IF NOT EXISTS subscriptions (");
+    for (const col of ["id TEXT PRIMARY KEY", "tenant_id TEXT NOT NULL", "plan_tier TEXT NOT NULL", "billing_period TEXT NOT NULL", "amount_paise INTEGER NOT NULL", "status TEXT NOT NULL", "starts_at TEXT", "expires_at TEXT", "created_at TEXT NOT NULL"]) {
+      expect(SQL7).toContain(col);
+    }
+    expect(SQL7).toContain("idx_subscriptions_tenant ON subscriptions(tenant_id)");
+  });
+
+  it("creates payments with UNIQUE UTR + tenant index", () => {
+    expect(SQL7).toContain("CREATE TABLE IF NOT EXISTS payments (");
+    expect(SQL7).toContain("utr TEXT NOT NULL UNIQUE");
+    expect(SQL7).toContain("amount_paise INTEGER NOT NULL");
+    expect(SQL7).toContain("method TEXT NOT NULL DEFAULT 'upi'");
+    expect(SQL7).toContain("idx_payments_tenant ON payments(tenant_id)");
+  });
+
+  it("creates refunds + ledger_events + e2b_runs (held/settled/released/killed CHECK) + admin_settings", () => {
+    expect(SQL7).toContain("CREATE TABLE IF NOT EXISTS refunds (");
+    expect(SQL7).toContain("refund_utr TEXT NOT NULL");
+    expect(SQL7).toContain("CREATE TABLE IF NOT EXISTS ledger_events (");
+    expect(SQL7).toContain("detail TEXT NOT NULL");
+    expect(SQL7).toContain("CREATE TABLE IF NOT EXISTS e2b_runs (");
+    expect(SQL7).toContain("CHECK (status IN ('held', 'settled', 'released', 'killed'))");
+    expect(SQL7).toContain("CREATE TABLE IF NOT EXISTS admin_settings (");
+    expect(SQL7).toContain("key TEXT PRIMARY KEY");
+  });
+
+  it("extends tenants with email verification + pending downgrade (ALTER, duplicate-column-safe)", () => {
+    expect(SQL7).toContain("ALTER TABLE tenants ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0");
+    expect(SQL7).toContain("ALTER TABLE tenants ADD COLUMN email_verify_token_hash TEXT");
+    expect(SQL7).toContain("ALTER TABLE tenants ADD COLUMN email_verify_expires_at INTEGER");
+    expect(SQL7).toContain("ALTER TABLE tenants ADD COLUMN pending_downgrade_tier TEXT");
+  });
+
+  it("documents that 0007 follows 0006 (no collision with 3d)", () => {
+    expect(SQL7).toContain("0007");
+    expect(SQL7).toContain("0006 was taken by 3d");
+  });
+
+  it("is non-destructive: no DROP TABLE / TRUNCATE / DELETE FROM, no Supabase refs, no Razorpay", () => {
+    const code = SQL7.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(code).not.toMatch(/DROP\s+TABLE/i);
+    expect(code).not.toMatch(/TRUNCATE/i);
+    expect(code).not.toMatch(/DELETE\s+FROM/i);
+    expect(code.toLowerCase()).not.toContain("supabase");
+    expect(code.toLowerCase()).not.toContain("razorpay");
+  });
+});
