@@ -1,9 +1,15 @@
-# Render Blueprint — OmniJarvis light worker (Phase 2, stage 2a-5).
+# Render Blueprint — OmniJarvis light worker (Phase 3, stage 3b).
 # Free Web Service: 512 MB RAM, 0.1 CPU, 750 hrs/mo, 15-min sleep.
-# Demo/smoke ONLY — no state on Render (ephemeral filesystem, no disk,
-# no Postgres). Deploy: parent browser task (Render dashboard → New →
-# Blueprint → connect raj3kk/omnijarvis-server, or New → Web Service with
-# root render/worker). Flipify Gmail for the Render account.
+# Demo/smoke + doc pipeline ONLY — no state on Render (ephemeral
+# filesystem, no disk, no Postgres). Deploy: parent browser task
+# (Render dashboard → New → Blueprint → connect raj3kk/omnijarvis-server,
+# or New → Web Service with root render/worker). Flipify Gmail for the
+# Render account.
+# System deps (3b): tesseract-ocr + tesseract-ocr-hin (Hindi+English
+# OCR) + poppler-utils (pdftoppm — PDF page render for OCR) +
+# fonts-lohit-deva (Devanagari glyphs for fixtures/certs) +
+# Pango/cairo/gdk-pixbuf (WeasyPrint). apt-get update first — free-tier
+# apt cache can be stale.
 services:
   - type: web
     name: omnijarvis-render
@@ -11,6 +17,6 @@ services:
     region: singapore
     plan: free
     rootDir: render/worker
-    buildCommand: pip install -r requirements.txt
+    buildCommand: apt-get update && apt-get install -y tesseract-ocr tesseract-ocr-hin poppler-utils fonts-lohit-deva libpango-1.0-0 libcairo2 libgdk-pixbuf-2.0-0 && pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health

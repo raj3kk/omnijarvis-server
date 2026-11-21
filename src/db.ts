@@ -69,12 +69,13 @@ export interface TenantRow {
   plan_tier: string;
   billing_mode: string;
   gemini_key_enc: string | null;
+  pii_consent?: number | null; // 0004: DPDP consent for storing PII in doc_jobs (default 0)
 }
 
 /** Tenant lookup for the LLM router (Phase 3, stage 3a). */
 export async function getTenant(db: D1Like, tenantId: string): Promise<TenantRow | null> {
   const row = await db
-    .prepare("SELECT id, owner_email, plan_tier, billing_mode, gemini_key_enc FROM tenants WHERE id = ?")
+    .prepare("SELECT id, owner_email, plan_tier, billing_mode, gemini_key_enc, pii_consent FROM tenants WHERE id = ?")
     .bind(tenantId)
     .first<TenantRow>();
   return row;

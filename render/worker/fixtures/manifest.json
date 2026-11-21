@@ -1,0 +1,236 @@
+{
+  "docs": [
+    {
+      "id": "doc01",
+      "kind": "invoice",
+      "png": "doc01.png",
+      "pdf": "doc01.pdf",
+      "fields": [
+        {
+          "key": "invoice_no",
+          "value": "INV-2026-0142"
+        },
+        {
+          "key": "name",
+          "value": "Arjun Mehta"
+        },
+        {
+          "key": "item",
+          "value": "Wireless Mouse"
+        },
+        {
+          "key": "amount",
+          "value": "Rs 1250"
+        },
+        {
+          "key": "date",
+          "value": "12 Nov 2026"
+        }
+      ]
+    },
+    {
+      "id": "doc02",
+      "kind": "invoice",
+      "png": "doc02.png",
+      "pdf": "doc02.pdf",
+      "fields": [
+        {
+          "key": "invoice_no",
+          "value": "INV-2026-0143"
+        },
+        {
+          "key": "name",
+          "value": "Priya Sharma"
+        },
+        {
+          "key": "amount",
+          "value": "Rs 2499"
+        },
+        {
+          "key": "thanks",
+          "value": "धन्यवाद"
+        }
+      ]
+    },
+    {
+      "id": "doc03",
+      "kind": "receipt",
+      "png": "doc03.png",
+      "pdf": "doc03.pdf",
+      "fields": [
+        {
+          "key": "store",
+          "value": "Sharma General Store"
+        },
+        {
+          "key": "item",
+          "value": "Notebook Pack"
+        },
+        {
+          "key": "amount",
+          "value": "Rs 349"
+        },
+        {
+          "key": "date",
+          "value": "15 Nov 2026"
+        }
+      ]
+    },
+    {
+      "id": "doc04",
+      "kind": "receipt",
+      "png": "doc04.png",
+      "pdf": "doc04.pdf",
+      "fields": [
+        {
+          "key": "store",
+          "value": "Verma Kirana Store"
+        },
+        {
+          "key": "amount",
+          "value": "Rs 899"
+        },
+        {
+          "key": "thanks",
+          "value": "धन्यवाद"
+        }
+      ]
+    },
+    {
+      "id": "doc05",
+      "kind": "form",
+      "png": "doc05.png",
+      "pdf": "doc05.pdf",
+      "fields": [
+        {
+          "key": "name",
+          "value": "Vikram Singh"
+        },
+        {
+          "key": "city",
+          "value": "Patna"
+        },
+        {
+          "key": "phone",
+          "value": "98765 43210"
+        },
+        {
+          "key": "course",
+          "value": "Computer Basics"
+        }
+      ]
+    },
+    {
+      "id": "doc06",
+      "kind": "form",
+      "png": "doc06.png",
+      "pdf": "doc06.pdf",
+      "fields": [
+        {
+          "key": "name",
+          "value": "Anita Verma"
+        },
+        {
+          "key": "city",
+          "value": "Delhi"
+        },
+        {
+          "key": "phone",
+          "value": "91234 56780"
+        }
+      ]
+    },
+    {
+      "id": "doc07",
+      "kind": "certificate",
+      "png": "doc07.png",
+      "pdf": "doc07.pdf",
+      "fields": [
+        {
+          "key": "name",
+          "value": "Rahul Gupta"
+        },
+        {
+          "key": "course",
+          "value": "Python Basics"
+        },
+        {
+          "key": "date",
+          "value": "10 Nov 2026"
+        }
+      ]
+    },
+    {
+      "id": "doc08",
+      "kind": "certificate",
+      "png": "doc08.png",
+      "pdf": "doc08.pdf",
+      "fields": [
+        {
+          "key": "name",
+          "value": "Sneha Patel"
+        },
+        {
+          "key": "course",
+          "value": "Data Entry"
+        },
+        {
+          "key": "congrats",
+          "value": "बधाई"
+        }
+      ]
+    },
+    {
+      "id": "doc09",
+      "kind": "invoice",
+      "png": "doc09.png",
+      "pdf": "doc09.pdf",
+      "fields": [
+        {
+          "key": "invoice_no",
+          "value": "INV-2026-0207"
+        },
+        {
+          "key": "name",
+          "value": "Karan Joshi"
+        },
+        {
+          "key": "item",
+          "value": "USB Cable"
+        },
+        {
+          "key": "amount",
+          "value": "Rs 499"
+        },
+        {
+          "key": "date",
+          "value": "18 Nov 2026"
+        }
+      ]
+    },
+    {
+      "id": "doc10",
+      "kind": "receipt",
+      "png": "doc10.png",
+      "pdf": "doc10.pdf",
+      "fields": [
+        {
+          "key": "store",
+          "value": "Gupta Electronics"
+        },
+        {
+          "key": "item",
+          "value": "Charger 25W"
+        },
+        {
+          "key": "amount",
+          "value": "Rs 1299"
+        },
+        {
+          "key": "date",
+          "value": "20 Nov 2026"
+        }
+      ]
+    }
+  ]
+}

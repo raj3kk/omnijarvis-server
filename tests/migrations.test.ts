@@ -91,3 +91,39 @@ describe("D1 migration 0003 (LLM router metering: llm_usage + tenant key/mode + 
     expect(code.toLowerCase()).not.toContain("supabase");
   });
 });
+
+const SQL4 = readFileSync(
+  new URL("../d1/migrations/0004_docs.sql", import.meta.url),
+  "utf8",
+);
+
+describe("D1 migration 0004 (doc pipeline: doc_jobs + certificates + pii_consent)", () => {
+  it("creates doc_jobs with the 3b §2b columns", () => {
+    expect(SQL4).toContain("CREATE TABLE IF NOT EXISTS doc_jobs (");
+    for (const col of ["tenant_id TEXT NOT NULL", "device_id TEXT NOT NULL", "kind TEXT NOT NULL", "status TEXT NOT NULL", "source_name TEXT", "result_json TEXT", "confidence REAL", "created_at INTEGER NOT NULL"]) {
+      expect(SQL4).toContain(col);
+    }
+    expect(SQL4).toContain("idx_doc_jobs_tenant_time ON doc_jobs(tenant_id, created_at)");
+    expect(SQL4).toContain("idx_doc_jobs_status ON doc_jobs(status)");
+  });
+
+  it("creates certificates with UNIQUE payload_hash", () => {
+    expect(SQL4).toContain("CREATE TABLE IF NOT EXISTS certificates (");
+    for (const col of ["tenant_id TEXT NOT NULL", "doc_job_id INTEGER NOT NULL", "payload_hash TEXT UNIQUE NOT NULL", "pdf_url TEXT NOT NULL", "created_at INTEGER NOT NULL"]) {
+      expect(SQL4).toContain(col);
+    }
+    expect(SQL4).toContain("idx_certificates_hash ON certificates(payload_hash)");
+  });
+
+  it("adds tenants.pii_consent (default 0, consent-gated PII storage)", () => {
+    expect(SQL4).toContain("ALTER TABLE tenants ADD COLUMN pii_consent INTEGER NOT NULL DEFAULT 0");
+  });
+
+  it("is non-destructive: no DROP TABLE / TRUNCATE / DELETE FROM, no Supabase refs", () => {
+    const code = SQL4.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(code).not.toMatch(/DROP\s+TABLE/i);
+    expect(code).not.toMatch(/TRUNCATE/i);
+    expect(code).not.toMatch(/DELETE\s+FROM/i);
+    expect(code.toLowerCase()).not.toContain("supabase");
+  });
+});

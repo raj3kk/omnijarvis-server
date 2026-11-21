@@ -26,8 +26,17 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: render/worker/requirements.txt
+      - name: Install system deps (Tesseract + poppler + WeasyPrint libs + Devanagari font)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-hin poppler-utils fonts-lohit-deva libpango-1.0-0 libcairo2 libgdk-pixbuf-2.0-0
       - run: pip install -r render/worker/requirements.txt
-      - name: Start worker + smoke-test
+      - run: pip install reportlab
+      - name: Generate accuracy fixtures + run accuracy gate (10 synthetic docs, >= 0.85)
+        run: |
+          python render/worker/fixtures/generate.py
+          python render/worker/accuracy_check.py
+      - name: Start worker + smoke-test (health, smoke/pdf, doc endpoints, RSS < 512 MB)
         run: |
           (uvicorn main:app --host 127.0.0.1 --port 8000 --app-dir render/worker & echo $! > /tmp/render.pid)
           for i in $(seq 1 30); do
@@ -35,8 +44,5 @@ jobs:
             sleep 1
           done
           curl -sf http://127.0.0.1:8000/health
-          body=$(curl -s -X POST http://127.0.0.1:8000/smoke/pdf)
-          echo "$body"
-          echo "$body" | grep -q '"ok":true' || { echo "SMOKE PDF FAILED"; exit 1; }
-          echo "$body" | grep -q 'Hello OmniJarvis' || { echo "SAMPLE TEXT MISSING"; exit 1; }
+          python render/worker/smoke_check.py http://127.0.0.1:8000 "$(cat /tmp/render.pid)"
           kill "$(cat /tmp/render.pid)" || true

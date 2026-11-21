@@ -18,6 +18,8 @@
  * - /dispatch is DO-internal (x-internal-secret) — not exposed here.
  * - /api/llm/route + /api/llm/turn-complete: x-internal-secret (server-to-server).
  * - /api/tenants/:id/key(+status): x-admin-token (LLM_ADMIN_TOKEN).
+ * - /api/docs/*: x-internal-secret (agent) OR paired device + Ed25519
+ *   signature (3b); Free tier: doc extraction blocked.
  */
 import { JarvisHub } from "./do/JarvisHub";
 
@@ -32,6 +34,7 @@ export interface Env {
   LLM_ADMIN_TOKEN?: string;
   FOUNDER_GEMINI_KEY?: string;
   ROUTER_CONFIG?: string;
+  RENDER_WORKER_URL?: string;
   UPSTASH_REDIS_REST_URL?: string;
   UPSTASH_REDIS_REST_TOKEN?: string;
   LANGFUSE_PUBLIC_KEY?: string;
@@ -41,7 +44,7 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "3a.1";
+const VERSION = "3b";
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { handleSync, type SyncRequest } from "./sync";
@@ -50,6 +53,24 @@ import { checkRateLimit } from "./ratelimit";
 import { getDevice, getTenant, verifyLicenceKey } from "./db";
 import { completeTurn, loadRouterConfig, routeLlm, validateGeminiKey, type RequestKind } from "./router";
 import { encryptTenantKey, importMasterKey } from "./keyvault";
+import {
+  MAX_INGEST_BYTES,
+  authorizeDocsRequest,
+  canonicalPayload,
+  createDocJob,
+  docsAllowedForTenant,
+  extractStructured,
+  forwardToRender,
+  getCertificateByHash,
+  getDocJob,
+  insertCertificate,
+  redactFields,
+  redactPiiText,
+  sha256Hex,
+  sha256HexBytes,
+  sortedJson,
+  updateDocJob,
+} from "./docs";
 
 /**
  * Pure route dispatch for health/status/404 (no env access) — vitest
@@ -320,6 +341,281 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         return json({ ok: true, billing_mode: billingMode });
       }
       return json({ error: "not_found" }, 404);
+    }
+
+    // --- Doc pipeline (Phase 3, stage 3b) ---
+    // Auth: x-internal-secret (agent caller) OR paired device + Ed25519
+    // signature (headers x-device-id / x-nonce / x-ts / x-signature).
+    // JSON routes sign sortedJson(body); ingest signs the file's sha256.
+    // Free tier: doc extraction blocked (ingest + extract double-check).
+    // Rate limit: `docs` budget, 30/min/tenant.
+    if (path === "/api/docs/verify" || path.startsWith("/api/docs/verify/")) {
+      if (method !== "GET") return json({ error: "not_found" }, 404);
+      const hash = path.split("/").filter(Boolean).pop() ?? "";
+      if (!/^[0-9a-f]{64}$/.test(hash)) return json({ error: "invalid_hash" }, 400);
+      const cert = await getCertificateByHash(env.DB, hash);
+      if (!cert) return json({ ok: false, valid: false, error: "not_found" }, 404);
+      // Public, hash-only lookup — no tenant/device/PII in the response.
+      return json({ ok: true, valid: true, hash: cert.payload_hash, created_at: cert.created_at });
+    }
+
+    if (path === "/api/docs/ingest" && method === "POST") {
+      let form: FormData;
+      try {
+        form = await request.formData();
+      } catch {
+        return json({ error: "bad_request" }, 400);
+      }
+      // form.get() narrows oddly under workers-types (File vs string);
+      // cast explicitly — the arrayBuffer check proves it is a File.
+      const file = form.get("file") as unknown as File | null;
+      if (!file || typeof file.arrayBuffer !== "function") return json({ error: "file_required" }, 400);
+      const fileBytes = new Uint8Array(await file.arrayBuffer());
+      if (fileBytes.byteLength > MAX_INGEST_BYTES) {
+        return json({ error: "file_too_large" }, 413);
+      }
+      const fileHash = await sha256HexBytes(fileBytes.buffer as ArrayBuffer);
+      const deviceId = request.headers.get("x-device-id") ?? (typeof form.get("device_id") === "string" ? (form.get("device_id") as string) : "");
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId,
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: fileHash,
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof form.get("tenant_id") === "string" ? (form.get("tenant_id") as string) : "");
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const allowed = await docsAllowedForTenant(env.DB, tenantId);
+      if (!allowed.allowed) {
+        return json({ error: allowed.error ?? "plan_docs_not_allowed" }, allowed.error === "tenant_not_found" ? 404 : 403);
+      }
+      const rl = await checkRateLimit(env, "docs", tenantId);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      const isPdf =
+        (file.name ?? "").toLowerCase().endsWith(".pdf") ||
+        (fileBytes[0] === 0x25 && fileBytes[1] === 0x50 && fileBytes[2] === 0x44 && fileBytes[3] === 0x46);
+      const renderPath = isPdf ? "/doc/extract" : "/doc/ocr";
+      const fwd = new FormData();
+      fwd.append("file", new File([fileBytes], file.name || "upload", { type: file.type || "application/octet-stream" }));
+      const render = await forwardToRender(env, renderPath, { method: "POST", body: fwd });
+      if (!render.ok) {
+        const status = render.error === "render_not_configured" ? 503 : 502;
+        return json(
+          { error: render.error ?? "render_error", ...(render.warmingUp ? { hint: "render_warming_up" } : {}) },
+          status,
+        );
+      }
+      const rj = render.json ?? {};
+      const consent = (allowed.tenant?.pii_consent ?? 0) === 1;
+      const text = typeof rj.text === "string" ? redactPiiText(rj.text, consent) : "";
+      const jobId = await createDocJob(env.DB, {
+        tenant_id: tenantId,
+        device_id: auth.device_id ?? deviceId,
+        kind: isPdf ? "extract" : "ocr",
+        source_name: file.name || null,
+      });
+      await updateDocJob(env.DB, jobId, {
+        status: "ingested",
+        result_json: JSON.stringify({ pages: rj.pages ?? null, text, tables: rj.tables ?? undefined }),
+        confidence: typeof rj.confidence === "number" ? rj.confidence : null,
+      });
+      return json({
+        ok: true,
+        doc_job_id: jobId,
+        kind: isPdf ? "extract" : "ocr",
+        pages: rj.pages ?? null,
+        text,
+        confidence: typeof rj.confidence === "number" ? rj.confidence : null,
+      });
+    }
+
+    if (path === "/api/docs/extract" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const allowed = await docsAllowedForTenant(env.DB, tenantId);
+      if (!allowed.allowed) {
+        return json({ error: allowed.error ?? "plan_docs_not_allowed" }, allowed.error === "tenant_not_found" ? 404 : 403);
+      }
+      const rl = await checkRateLimit(env, "docs", tenantId);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      const schema = body.schema && typeof body.schema === "object" ? (body.schema as Record<string, unknown>) : { properties: {} };
+      let text = typeof body.text === "string" ? body.text : "";
+      const docJobId = typeof body.doc_job_id === "number" ? body.doc_job_id : null;
+      if (!text && docJobId !== null) {
+        const job = await getDocJob(env.DB, docJobId);
+        if (!job) return json({ error: "doc_job_not_found" }, 404);
+        if (job.tenant_id !== tenantId) return json({ error: "forbidden" }, 403);
+        try {
+          const prev = JSON.parse(job.result_json ?? "{}") as Record<string, unknown>;
+          text = typeof prev.text === "string" ? prev.text : "";
+        } catch {
+          text = "";
+        }
+      }
+      if (!text) return json({ error: "text_required" }, 400);
+      const consent = (allowed.tenant?.pii_consent ?? 0) === 1;
+      const result = await extractStructured({
+        db: env.DB,
+        masterKeyB64: env.KEY_ENC_SECRET,
+        founderKey: env.FOUNDER_GEMINI_KEY,
+        config: loadRouterConfig(env),
+        tenant_id: tenantId,
+        device_id: auth.device_id,
+        turn_id: typeof body.turn_id === "string" && body.turn_id ? body.turn_id : `doc-${Date.now()}`,
+        text,
+        schema,
+      });
+      if (!result.ok) {
+        const code = result.error_code ?? "extraction_failed";
+        const status =
+          code === "byok_required" ? 402 : code === "plan_docs_not_allowed" ? 403 : code === "tenant_not_found" ? 404 : 502;
+        return json({ error: code, detail: result.error ?? undefined }, status);
+      }
+      const fields = redactFields(result.fields ?? {}, consent);
+      if (docJobId !== null) {
+        await updateDocJob(env.DB, docJobId, {
+          status: "extracted",
+          result_json: JSON.stringify({ fields, missing: result.missing ?? [] }),
+          confidence: result.confidence ?? null,
+        });
+      }
+      return json({ ok: true, doc_job_id: docJobId, fields, missing: result.missing ?? [], confidence: result.confidence ?? 0 });
+    }
+
+    if (path === "/api/docs/confirm" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      const docJobId = typeof body.doc_job_id === "number" ? body.doc_job_id : null;
+      if (!tenantId || docJobId === null) return json({ error: "bad_request" }, 400);
+      const allowed = await docsAllowedForTenant(env.DB, tenantId);
+      if (!allowed.allowed) {
+        return json({ error: allowed.error ?? "plan_docs_not_allowed" }, allowed.error === "tenant_not_found" ? 404 : 403);
+      }
+      const job = await getDocJob(env.DB, docJobId);
+      if (!job) return json({ error: "doc_job_not_found" }, 404);
+      if (job.tenant_id !== tenantId) return json({ error: "forbidden" }, 403);
+      const fields = (body.fields && typeof body.fields === "object" ? body.fields : {}) as Record<string, unknown>;
+      const corrections = (body.corrections && typeof body.corrections === "object" ? body.corrections : {}) as Record<string, unknown>;
+      const merged = { ...fields, ...corrections };
+      const required = Array.isArray(body.required)
+        ? (body.required as unknown[]).filter((x): x is string => typeof x === "string")
+        : Object.keys(merged);
+      const missing = required.filter((f) => merged[f] === undefined || merged[f] === null || merged[f] === "");
+      const consent = (allowed.tenant?.pii_consent ?? 0) === 1;
+      const redacted = redactFields(merged, consent);
+      if (missing.length > 0) {
+        // One card, one click: missing fields come back WITH the merged
+        // record (no piecemeal questions) — client shows one card.
+        return json({ ok: false, error: "missing_fields", missing, fields: redacted });
+      }
+      await updateDocJob(env.DB, docJobId, { status: "confirmed", result_json: JSON.stringify({ fields: redacted }) });
+      return json({ ok: true, doc_job_id: docJobId, status: "confirmed", fields: redacted });
+    }
+
+    if (path === "/api/docs/certificate" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      const docJobId = typeof body.doc_job_id === "number" ? body.doc_job_id : null;
+      if (!tenantId || docJobId === null) return json({ error: "bad_request" }, 400);
+      const allowed = await docsAllowedForTenant(env.DB, tenantId);
+      if (!allowed.allowed) {
+        return json({ error: allowed.error ?? "plan_docs_not_allowed" }, allowed.error === "tenant_not_found" ? 404 : 403);
+      }
+      const rl = await checkRateLimit(env, "docs", tenantId);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      const job = await getDocJob(env.DB, docJobId);
+      if (!job) return json({ error: "doc_job_not_found" }, 404);
+      if (job.tenant_id !== tenantId) return json({ error: "forbidden" }, 403);
+      if (job.status !== "confirmed") return json({ error: "doc_not_confirmed" }, 409);
+      const html = typeof body.html === "string" ? body.html : "";
+      if (!html) return json({ error: "html_required" }, 400);
+      let payloadObj: Record<string, unknown>;
+      try {
+        const stored = JSON.parse(job.result_json ?? "{}") as Record<string, unknown>;
+        payloadObj =
+          body.payload && typeof body.payload === "object"
+            ? (body.payload as Record<string, unknown>)
+            : ((stored.fields as Record<string, unknown> | undefined) ?? stored);
+      } catch {
+        return json({ error: "bad_payload" }, 400);
+      }
+      const consent = (allowed.tenant?.pii_consent ?? 0) === 1;
+      const redactedPayload = redactFields(payloadObj as Record<string, unknown>, consent);
+      const canonical = canonicalPayload(redactedPayload);
+      const hash = await sha256Hex(canonical);
+      const verifyUrl = new URL(request.url).origin + "/api/docs/verify";
+      const form = new URLSearchParams();
+      form.set("html", html);
+      form.set("payload", canonical);
+      form.set("verify_url", verifyUrl);
+      const render = await forwardToRender(env, "/doc/certificate", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: form.toString(),
+      });
+      if (!render.ok) {
+        const status = render.error === "render_not_configured" ? 503 : 502;
+        return json(
+          { error: render.error ?? "render_error", ...(render.warmingUp ? { hint: "render_warming_up" } : {}) },
+          status,
+        );
+      }
+      const rj = render.json ?? {};
+      if (rj.hash && rj.hash !== hash) {
+        return json({ error: "hash_mismatch" }, 502);
+      }
+      if (typeof rj.pdf_base64 !== "string") {
+        return json({ error: "render_error" }, 502);
+      }
+      const pdfUrl = `${(env.RENDER_WORKER_URL ?? "").replace(/\/+$/, "")}/doc/certificate?hash=${hash}`;
+      try {
+        await insertCertificate(env.DB, { tenant_id: tenantId, doc_job_id: docJobId, payload_hash: hash, pdf_url: pdfUrl });
+      } catch (e) {
+        // payload_hash UNIQUE (live D1): duplicate = same certificate —
+        // return the existing one instead of failing.
+        if (!String((e as Error)?.message ?? e).includes("UNIQUE")) throw e;
+      }
+      return json({
+        ok: true,
+        hash,
+        pdf_base64: rj.pdf_base64,
+        pages: rj.pages ?? null,
+        verify_url: `${verifyUrl}/${hash}`,
+      });
     }
 
     // WS upgrade -> DO (paired-device check first).
