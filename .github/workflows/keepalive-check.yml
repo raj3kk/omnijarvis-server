@@ -34,42 +34,51 @@ jobs:
           fi
           if [ "$ok" != "True" ]; then echo "HUB KEEPALIVE FAILED (D1)"; exit 1; fi
 
+      # NOTE: `secrets` cannot be used in step `if:` conditions (GitHub
+      # rejects the workflow with 422 "Unrecognized named-value:
+      # 'secrets'") — so optional checks run unconditionally and branch
+      # INSIDE the script on empty env vars (warning + exit 0 when the
+      # secret is not set; real failure when the check itself fails).
       - name: Supabase direct check (anon key + RLS)
-        if: ${{ secrets.SUPABASE_URL != '' && secrets.SUPABASE_ANON_KEY != '' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: |
           set -e
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_ANON_KEY" ]; then
+            echo "::warning::SUPABASE direct check SKIPPED — SUPABASE_URL / SUPABASE_ANON_KEY secrets not set (parent: Supabase dashboard → Settings → API)."
+            exit 0
+          fi
           code=$(curl -s -o /tmp/tenants.json -w "%{http_code}" --max-time 30 \
-            "${{ secrets.SUPABASE_URL }}/rest/v1/tenants?select=id&limit=1" \
-            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
-            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}")
+            "$SUPABASE_URL/rest/v1/tenants?select=id&limit=1" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY")
           echo "tenants HTTP $code: $(cat /tmp/tenants.json)"
           [ "$code" = "200" ] || { echo "SUPABASE DIRECT CHECK FAILED"; exit 1; }
 
-      - name: Supabase direct check skipped (no secrets)
-        if: ${{ secrets.SUPABASE_URL == '' || secrets.SUPABASE_ANON_KEY == '' }}
-        run: 'echo "::warning::SUPABASE direct check SKIPPED — SUPABASE_URL / SUPABASE_ANON_KEY secrets not set (parent: Supabase dashboard → Settings → API)."'
-
       - name: Qdrant check (upsert → query → delete)
-        if: ${{ secrets.QDRANT_URL != '' && secrets.QDRANT_API_KEY != '' }}
+        env:
+          QDRANT_URL: ${{ secrets.QDRANT_URL }}
+          QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
         run: |
           set -e
-          H1="api-key: ${{ secrets.QDRANT_API_KEY }}"
+          if [ -z "$QDRANT_URL" ] || [ -z "$QDRANT_API_KEY" ]; then
+            echo "::warning::QDRANT check SKIPPED — QDRANT_URL / QDRANT_API_KEY secrets not set (parent: Qdrant Cloud free account)."
+            exit 0
+          fi
+          H1="api-key: $QDRANT_API_KEY"
           H2="Content-Type: application/json"
           # Collection banani ho to banao (exists ho to 409 — theek hai).
           curl -s -o /dev/null -w "create collection HTTP %{http_code}\n" --max-time 30 \
-            -X PUT "${{ secrets.QDRANT_URL }}/collections/keepalive" -H "$H1" -H "$H2" \
+            -X PUT "$QDRANT_URL/collections/keepalive" -H "$H1" -H "$H2" \
             -d '{"vectors":{"size":4,"distance":"Cosine"}}'
           curl -s -o /dev/null -w "upsert HTTP %{http_code}\n" --max-time 30 \
-            -X PUT "${{ secrets.QDRANT_URL }}/collections/keepalive/points" -H "$H1" -H "$H2" \
+            -X PUT "$QDRANT_URL/collections/keepalive/points" -H "$H1" -H "$H2" \
             -d '{"points":[{"id":1,"vector":[0.1,0.2,0.3,0.4],"payload":{"check":"keepalive"}}]}'
-          body=$(curl -s --max-time 30 -X POST "${{ secrets.QDRANT_URL }}/collections/keepalive/points/search" \
+          body=$(curl -s --max-time 30 -X POST "$QDRANT_URL/collections/keepalive/points/search" \
             -H "$H1" -H "$H2" -d '{"vector":[0.1,0.2,0.3,0.4],"limit":1}')
           echo "search: $body"
           echo "$body" | grep -q '"id":1' || { echo "QDRANT SEARCH FAILED"; exit 1; }
           curl -s -o /dev/null -w "delete HTTP %{http_code}\n" --max-time 30 \
-            -X POST "${{ secrets.QDRANT_URL }}/collections/keepalive/points/delete" -H "$H1" -H "$H2" \
+            -X POST "$QDRANT_URL/collections/keepalive/points/delete" -H "$H1" -H "$H2" \
             -d '{"points":[1]}'
-
-      - name: Qdrant check skipped (no secrets)
-        if: ${{ secrets.QDRANT_URL == '' || secrets.QDRANT_API_KEY == '' }}
-        run: 'echo "::warning::QDRANT check SKIPPED — QDRANT_URL / QDRANT_API_KEY secrets not set (parent: Qdrant Cloud free account)."'
