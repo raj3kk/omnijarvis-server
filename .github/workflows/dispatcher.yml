@@ -1,5 +1,11 @@
 # Cron dispatcher — ticks the hub every 5 minutes so due scheduled_jobs fire.
 #
+# B-3 2026-11-21: scheduler re-registration touch — the */5 schedule created
+# via API commit 04d95f33 was never picked up by GitHub's scheduler
+# (0 schedule runs in ~2h despite state=active; disable/enable toggle
+# 18:08Z also produced no run in 17 min). This no-op comment change
+# forces a fresh push so GitHub re-parses the workflow file.
+#
 # Jitter is EXPECTED (GitHub Actions best-effort delays 5–30 min under load):
 # "exact time" ka vaada kabhi nahi. Tick handler idempotency (job + minute)
 # D1 traces se karta hai — double-fire safe hai.

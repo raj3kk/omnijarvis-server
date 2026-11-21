@@ -2,6 +2,10 @@
 # workflows 60 din bina activity ke auto-disable ho jate hain; roz ka ek
 # chhota commit isey rokta hai). Sirf heartbeat.md badalta hai — koi code
 # nahi, koi deploy nahi. Commit message me kabhi "[skip ci]" nahi.
+# B-3 2026-11-21: same scheduler re-registration touch as dispatcher.yml —
+# this schedule was created by the same API commit; disable/enable toggle
+# 18:08Z did not prove re-registration, so this no-op comment forces
+# GitHub to re-parse the workflow file. First scheduled run due 2026-11-22 03:00 UTC.
 name: keepalive-daily
 
 on:

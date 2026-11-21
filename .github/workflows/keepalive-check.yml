@@ -1,4 +1,8 @@
 # Keep-alive check — REAL queries, roz ek baar. Koi silent pass nahi:
+# B-3 2026-11-21: same scheduler re-registration touch as dispatcher.yml —
+# this schedule was created by the same API commit; disable/enable toggle
+# 18:08Z did not prove re-registration, so this no-op comment forces
+# GitHub to re-parse the workflow file. First scheduled run due 2026-11-22 03:30 UTC.
 # - Hub keepalive (D1 devices + D1 licences, server-side): D1 fail =
 #   workflow FAIL; licences state != ok = visible warning.
 # - Qdrant: sirf tab chalta hai jab QDRANT_URL + QDRANT_API_KEY secrets set
