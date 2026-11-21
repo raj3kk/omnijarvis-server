@@ -1,0 +1,19 @@
+name = "omnijarvis-hub"
+main = "src/hub.ts"
+compatibility_date = "2026-11-21"
+
+# Durable Object: one per device (id = device:<device_id>).
+# Hibernation API ONLY — plain accept() kabhi nahi (duration charge).
+[[durable_objects.bindings]]
+name = "JARVIS_HUB"
+class_name = "JarvisHub"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["JarvisHub"]
+
+# D1 sync store (default — D12 locked). Created via CF API 2026-11-21.
+[[d1_databases]]
+binding = "DB"
+database_name = "omnijarvis-db"
+database_id = "37a7ff24-9fd2-40f9-b122-82cdaea7e79d"
