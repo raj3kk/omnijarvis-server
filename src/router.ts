@@ -12,8 +12,13 @@
  *   6. metering per call (usageMetadata is the source of truth)
  *
  * Two modes (D11 §3.1 — the tension, resolved by billing_mode):
- *   byok (live default):        3.5 FL -> 3.1 FL -> 2.5 FL (quality-first)
- *   founder_pays (gated):       2.5 FL -> 3.1 FL -> 3.5 FL (cost-first)
+ *   byok (live default):        3.5 FL -> 3.1 FL (quality-first)
+ *   founder_pays (gated):       3.1 FL -> 3.5 FL (cost-first)
+ * gemini-2.5-flash-lite is RETIRED (Google 404 for new users since
+ * ~Nov 2026 — "no longer available to new users, use gemini-3.5-flash-lite").
+ * It appears NOWHERE in chains/prices/validation (P0 fix, 2026-11-21):
+ * loadRouterConfig throws on any retired model in a chain (R-T19 guard),
+ * and validateGeminiKey falls back across live models (R-T18).
  * 3.8 Flash is BLOCK-LISTED in paid routes (2027 price doubles) — it is
  * refused even if it appears in config. Founder-pays tenants cannot be
  * created until a founder key exists (admin route refuses the mode).
@@ -21,25 +26,34 @@
  * Live mode (native-audio) is NOT routable here: generateContent cannot
  * serve gemini-2.5-flash-native-audio-dialog (Live API, not REST) — kind
  * "live" returns error live_not_routed by design; the phone's existing
- * Live path stays the only Live route.
+ * Live path stays the only Live route. (2026-11-21: that model name is
+ * not even in ListModels anymore, and generateContent on it is 404.)
  *
  * Gemini upstream: v1beta generateContent / embedContent, x-goog-api-key.
  * Prices are $/1M tokens == micro-dollars per token (5000 in + 500 out
- * on 2.5 FL = 5000*0.10 + 500*0.40 = 700 micro = $0.00070).
+ * on 3.1 FL = 5000*0.25 + 500*1.50 = 2000 micro = $0.00200).
+ * Margin warning (P0 audit §7.2 re-check): at 3.1 FL prices the
+ * founder-pays worst case goes NEGATIVE (Pro −₹1,442 / Business −₹4,361)
+ * at current ₹999/₹2,999 pricing — see AUDIT_P0_ROUTER_FIX.md. BYOK is
+ * unaffected (founder cost ₹0); founder-pays is gated (no founder key)
+ * and must NOT be enabled without a pricing revisit (parent decision).
  */
 import type { D1Like } from "./db";
 import { getTenant, insertTrace } from "./db";
 import { countTurnCalls, currentPeriod, getMonthUsage, recordReply, recordUsage } from "./metering";
 import { decryptTenantKey, importMasterKey } from "./keyvault";
 
-export const MODEL_25 = "gemini-2.5-flash-lite";
 export const MODEL_31 = "gemini-3.1-flash-lite";
 export const MODEL_35 = "gemini-3.5-flash-lite";
 export const MODEL_EMBED = "gemini-embedding-001";
 export const MODEL_LIVE = "gemini-2.5-flash-native-audio-dialog";
 
+/** Live text models, quality-first (BYOK primary order). Validation tries these in order. */
+export const LIVE_TEXT_MODELS = [MODEL_35, MODEL_31] as const;
+/** Retired models — must never appear in any chain, price, or validation attempt. */
+export const RETIRED_MODELS = ["gemini-2.5-flash-lite", "text-embedding-004"] as const;
+
 export const DEFAULT_PRICES: Record<string, { in: number; out: number }> = {
-  [MODEL_25]: { in: 0.1, out: 0.4 },
   [MODEL_31]: { in: 0.25, out: 1.5 },
   [MODEL_35]: { in: 0.3, out: 2.5 },
   [MODEL_EMBED]: { in: 0.15, out: 0 },
@@ -56,21 +70,21 @@ export type RequestKind =
 
 const DEFAULT_CHAINS: Record<string, Record<RequestKind, string[]>> = {
   byok: {
-    agent_plan: [MODEL_35, MODEL_31, MODEL_25],
-    quick_command: [MODEL_35, MODEL_31, MODEL_25],
-    casual_chat: [MODEL_35, MODEL_31, MODEL_25],
-    search_grounding: [MODEL_31, MODEL_25],
+    agent_plan: [MODEL_35, MODEL_31],
+    quick_command: [MODEL_35, MODEL_31],
+    casual_chat: [MODEL_35, MODEL_31],
+    search_grounding: [MODEL_31, MODEL_35],
     live: [MODEL_LIVE],
-    doc_extraction: [MODEL_35, MODEL_31, MODEL_25],
+    doc_extraction: [MODEL_35, MODEL_31],
     embeddings: [MODEL_EMBED],
   },
   founder_pays: {
-    agent_plan: [MODEL_25, MODEL_31, MODEL_35],
-    quick_command: [MODEL_25, MODEL_31, MODEL_35],
-    casual_chat: [MODEL_25, MODEL_31, MODEL_35],
-    search_grounding: [MODEL_25, MODEL_31],
+    agent_plan: [MODEL_31, MODEL_35],
+    quick_command: [MODEL_31, MODEL_35],
+    casual_chat: [MODEL_31, MODEL_35],
+    search_grounding: [MODEL_31, MODEL_35],
     live: [MODEL_LIVE],
-    doc_extraction: [MODEL_25, MODEL_31, MODEL_35],
+    doc_extraction: [MODEL_31, MODEL_35],
     embeddings: [MODEL_EMBED],
   },
 };
@@ -119,6 +133,17 @@ export function loadRouterConfig(env: { ROUTER_CONFIG?: string }): RouterConfig 
   }
   const flat = JSON.stringify(config);
   if (flat.includes("3.8")) throw new Error("router config: gemini-3.8 is block-listed in paid routes");
+  // R-T19 guard: a retired model in any chain can never serve a new key —
+  // refuse the config loudly instead of routing into a guaranteed 404.
+  for (const mode of Object.values(config.chains)) {
+    for (const chain of Object.values(mode)) {
+      for (const model of chain as string[]) {
+        if ((RETIRED_MODELS as readonly string[]).includes(model)) {
+          throw new Error(`router config: ${model} is retired and must never appear in a chain`);
+        }
+      }
+    }
+  }
   return config;
 }
 
@@ -555,30 +580,40 @@ export async function completeTurn(
 
 /**
  * Validate a tenant-supplied Gemini key with a tiny generateContent call
- * (1-word prompt on the cheapest model, ~2 tokens). Invalid key => false.
- * Upstream 429/5xx => false too (unvalidated keys are never stored).
+ * (1-word prompt, ~2 tokens). Tries the live text models in BYOK-primary
+ * order (3.5 FL, then 3.1 FL) — a single retired model must never again
+ * decide validity (P0, 2026-11-21: 2.5 FL 404 broke ALL key-setting).
+ * 404 / model-not-found => try the next live model. 401/403 (invalid key)
+ * => false at once (an invalid key is invalid on every model). 429/5xx
+ * => false (unvalidated keys are never stored). Any model ok => true.
+ * Timeout 15s per attempt, max 3 attempts (only 2 live text models exist).
  * The key travels only in the x-goog-api-key header to Google — never in
  * a URL, log, or response.
  */
 export async function validateGeminiKey(apiKey: string, fetchFn: typeof fetch = fetch): Promise<boolean> {
-  try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 15_000);
+  for (const model of LIVE_TEXT_MODELS) {
     try {
-      const res = await fetchFn(
-        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_25}:generateContent`,
-        {
-          method: "POST",
-          headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
-          body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
-          signal: ctrl.signal,
-        },
-      );
-      return res.ok;
-    } finally {
-      clearTimeout(timer);
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 15_000);
+      try {
+        const res = await fetchFn(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+          {
+            method: "POST",
+            headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
+            body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
+            signal: ctrl.signal,
+          },
+        );
+        if (res.ok) return true;
+        if (res.status === 404) continue; // retired / not found on this model — try next
+        return false; // 401/403 invalid key, 429/5xx, 400 — no point trying another model
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch {
+      return false;
     }
-  } catch {
-    return false;
   }
+  return false;
 }

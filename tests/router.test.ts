@@ -3,6 +3,10 @@
  * R-T11 turn-complete/reply counting · R-T12 keyvault round-trip ·
  * R-T13 env-config chains · R-T14 admin key-set route · R-T15 embeddings ·
  * R-T16 hub /api/llm/route mapping · R-T17 live kind refused by design.
+ * R-T18 validation fallback (first live model 404 -> second ok -> true) ·
+ * R-T19 retired model never in any chain (config guard).
+ * gemini-2.5-flash-lite is RETIRED (P0 fix 2026-11-21) — it appears nowhere
+ * in this file except this note and the R-T19 guard test.
  * Gemini upstream is MOCKED (no real key in CI). Live happy-path proof
  * needs a test BYOK key (parent-side, U-1) — see AUDIT_3a.md.
  */
@@ -10,13 +14,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeD1 } from "./fake-d1";
 import { handleRequest, type Env } from "../src/hub";
 import {
-  MODEL_25,
   MODEL_31,
   MODEL_35,
+  RETIRED_MODELS,
   completeTurn,
   loadRouterConfig,
   resetCircuitBreakers,
   routeLlm,
+  validateGeminiKey,
   type ChatMessage,
   type RouterDeps,
 } from "../src/router";
@@ -133,18 +138,18 @@ describe("router fallback + metering (R-T1–R-T10)", () => {
     expect(rows[0].cost_usd_micro).toBe(55);
   });
 
-  it("R-T2 founder-pays fallback order: 2.5 fails -> 3.1 serves, 3.5 never tried", async () => {
+  it("R-T2 founder-pays fallback order: 3.1 fails -> 3.5 serves", async () => {
     const db = new FakeD1();
     const master = await makeMasterKeyB64();
     await seedTenant(db, { id: "t-2", billingMode: "founder_pays" });
     const { fetchFn, calls } = makeMockFetch((model) =>
-      model === MODEL_25 ? errResp(500, "boom") : okText("from 3.1", 100, 20),
+      model === MODEL_31 ? errResp(500, "boom") : okText("from 3.5", 100, 20),
     );
     const res = await routeLlm(baseDeps(db, master, fetchFn, { founderKey: "FOUNDER-TEST-KEY" }), req("t-2", "turn-2"));
     expect(res.ok).toBe(true);
-    expect(res.model).toBe(MODEL_31);
-    expect(res.attempted_models).toEqual([MODEL_25, MODEL_31]);
-    expect(calls.map((c) => c.model)).not.toContain(MODEL_35);
+    expect(res.model).toBe(MODEL_35);
+    expect(res.attempted_models).toEqual([MODEL_31, MODEL_35]);
+    expect(calls.map((c) => c.model)).toEqual([MODEL_31, MODEL_35]);
   });
 
   it("R-T3 cap breach -> hard refuse, no upstream call, refused_cap row", async () => {
@@ -194,7 +199,7 @@ describe("router fallback + metering (R-T1–R-T10)", () => {
     for (let i = 0; i < 5; i++) {
       await db
         .prepare("INSERT INTO llm_usage (tenant_id, turn_id, model, attempted_models, input_tokens, output_tokens, cost_usd_micro, billing_mode, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind("t-5", "turn-5", MODEL_25, "[]", 10, 5, 3, "byok", "ok", FIXED_NOW)
+        .bind("t-5", "turn-5", MODEL_31, "[]", 10, 5, 3, "byok", "ok", FIXED_NOW)
         .run();
     }
     const { fetchFn, calls } = makeMockFetch(() => okText("x"));
@@ -327,13 +332,13 @@ describe("router additions (R-T11–R-T17)", () => {
     const master = await makeMasterKeyB64();
     await seedTenantWithKey(db, "t-13", master);
     const config = loadRouterConfig({
-      ROUTER_CONFIG: JSON.stringify({ chains: { byok: { quick_command: [MODEL_25, MODEL_31] } } }),
+      ROUTER_CONFIG: JSON.stringify({ chains: { byok: { quick_command: [MODEL_31, MODEL_35] } } }),
     });
-    const { fetchFn, calls } = makeMockFetch(() => okText("from 2.5", 100, 20));
+    const { fetchFn, calls } = makeMockFetch(() => okText("from 3.1", 100, 20));
     const res = await routeLlm(baseDeps(db, master, fetchFn, { config }), req("t-13", "turn-13"));
     expect(res.ok).toBe(true);
-    expect(res.model).toBe(MODEL_25);
-    expect(calls[0].model).toBe(MODEL_25);
+    expect(res.model).toBe(MODEL_31);
+    expect(calls[0].model).toBe(MODEL_31);
   });
 
   it("R-T15 embeddings kind: gemini-embedding-001, cost at embed price", async () => {
@@ -365,6 +370,56 @@ describe("router additions (R-T11–R-T17)", () => {
     expect(res.error_code).toBe("live_not_routed");
     expect(calls).toHaveLength(0);
     expect(await usageRows(db)).toHaveLength(0);
+  });
+});
+
+describe("router P0 fix (R-T18–R-T19)", () => {
+  it("R-T18 validation fallback: first live model 404 -> second ok -> true", async () => {
+    const { fetchFn, calls } = makeMockFetch((model) =>
+      model === MODEL_35 ? errResp(404, "models/gemini-3.5-flash-lite is not found") : okText("hi", 2, 1),
+    );
+    expect(await validateGeminiKey("SOME-KEY", fetchFn)).toBe(true);
+    expect(calls.map((c) => c.model)).toEqual([MODEL_35, MODEL_31]);
+  });
+
+  it("R-T18 validation: 401 invalid key -> false at once, no fallback attempt", async () => {
+    const { fetchFn, calls } = makeMockFetch(() => errResp(401, "API key not valid"));
+    expect(await validateGeminiKey("BAD-KEY", fetchFn)).toBe(false);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("R-T18 validation: 429 -> false (unvalidated keys never stored); both 404 -> false", async () => {
+    const { fetchFn: rateFetch, calls: rateCalls } = makeMockFetch(() => errResp(429, "Resource exhausted"));
+    expect(await validateGeminiKey("SOME-KEY", rateFetch)).toBe(false);
+    expect(rateCalls).toHaveLength(1);
+    const { fetchFn: goneFetch, calls: goneCalls } = makeMockFetch(() => errResp(404, "model not found"));
+    expect(await validateGeminiKey("SOME-KEY", goneFetch)).toBe(false);
+    expect(goneCalls.map((c) => c.model)).toEqual([MODEL_35, MODEL_31]);
+  });
+
+  it("R-T19 retired model never in any chain: config with 2.5 FL throws; defaults are live-only", () => {
+    for (const retired of RETIRED_MODELS) {
+      expect(() =>
+        loadRouterConfig({ ROUTER_CONFIG: JSON.stringify({ chains: { byok: { quick_command: [MODEL_35, retired] } } }) }),
+      ).toThrow(/retired/);
+    }
+    const defaults = loadRouterConfig({});
+    const allowed = new Set([MODEL_31, MODEL_35, "gemini-embedding-001", "gemini-2.5-flash-native-audio-dialog"]);
+    for (const [mode, kinds] of Object.entries(defaults.chains)) {
+      for (const [kind, chain] of Object.entries(kinds)) {
+        for (const model of chain as string[]) {
+          expect(allowed.has(model)).toBe(true);
+          expect(RETIRED_MODELS).not.toContain(model);
+        }
+        // Founder-pays default (C1) is the cheapest LIVE lite model, every kind.
+        if (mode === "founder_pays" && kind !== "live" && kind !== "embeddings") {
+          expect((chain as string[])[0]).toBe(MODEL_31);
+        }
+      }
+    }
+    for (const retired of RETIRED_MODELS) {
+      expect(defaults.prices).not.toHaveProperty(retired);
+    }
   });
 });
 

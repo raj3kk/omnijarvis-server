@@ -41,7 +41,7 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "3a";
+const VERSION = "3a.1";
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { handleSync, type SyncRequest } from "./sync";
