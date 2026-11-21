@@ -27,6 +27,7 @@ const PK: Record<string, string[]> = {
   llm_usage: ["id"],
   doc_jobs: ["id"],
   certificates: ["id"],
+  browser_tasks: ["id"],
 };
 
 export class FakeD1 implements D1Like {

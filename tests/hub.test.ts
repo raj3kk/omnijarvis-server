@@ -229,9 +229,9 @@ describe("handleRequest (2a-2 routes, D1 licences)", () => {
     expect(body.key_id).toBeUndefined();
   });
 
-  it("GET / -> version 3b.1 (M-4)", async () => {
+  it("GET / -> version 3c (3c browser + captcha assist)", async () => {
     const body = (await route("/").json()) as Record<string, unknown>;
-    expect(body.version).toBe("3b.1");
+    expect(body.version).toBe("3c");
   });
 
   it("pairing code: derives from token", async () => {

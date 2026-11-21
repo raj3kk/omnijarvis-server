@@ -421,3 +421,293 @@ describe("JarvisHub DO", () => {
     expect(parsed.some((m) => m.type === "PONG")).toBe(true);
   });
 });
+
+describe("JarvisHub DO — 3c captcha assist (D3 human-assist-first)", () => {
+  /** Raw CAPTCHA_ASSIST frames on a socket (never wrapped in EXECUTE_STEP). */
+  function captchaEvents(fakeWs: FakeWebSocket): Record<string, unknown>[] {
+    return fakeWs.sent
+      .map((s) => JSON.parse(s) as Record<string, unknown>)
+      .filter((m) => m.type === "CAPTCHA_ASSIST");
+  }
+
+  async function dispatchCaptchaAssist(
+    hub: JarvisHub,
+    deviceId: string,
+    event: Record<string, unknown>,
+    secret = "test-internal",
+  ) {
+    return await hub.fetch(
+      new Request("https://hub/captcha-assist", {
+        method: "POST",
+        headers: { "x-internal-secret": secret, "Content-Type": "application/json" },
+        body: JSON.stringify({ device_id: deviceId, event }),
+      }),
+    );
+  }
+
+  const assistEvent = {
+    type: "CAPTCHA_ASSIST",
+    task_id: "bt-1",
+    site: "example.com",
+    task_name: "Fill form",
+    screenshot_b64: "aGVsbG8=",
+  };
+
+  it("CAPTCHA_ASSIST live socket -> raw event sent, NOT an EXECUTE_STEP", async () => {
+    const db = new FakeD1();
+    const key = await genDeviceKey();
+    await registerDevice(db, "dev-1", "t-1", key.publicKeyB64);
+    const { hub, state } = makeHub(db);
+    const { fakeWs } = await connectAndHello(hub, state, key);
+    const res = await dispatchCaptchaAssist(hub, "dev-1", assistEvent);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as Record<string, unknown>).sent).toBe(true);
+    const events = captchaEvents(fakeWs);
+    expect(events.length).toBe(1);
+    expect(events[0]).toMatchObject({ task_id: "bt-1", site: "example.com", task_name: "Fill form" });
+    expect(executeSteps(fakeWs).length).toBe(0);
+  });
+
+  it("CAPTCHA_ASSIST wrong secret -> 401; bad event type -> 400", async () => {
+    const db = new FakeD1();
+    const { hub } = makeHub(db);
+    const wrong = await dispatchCaptchaAssist(hub, "dev-1", assistEvent, "wrong");
+    expect(wrong.status).toBe(401);
+    const bad = await dispatchCaptchaAssist(hub, "dev-1", { type: "EXECUTE_STEP" });
+    expect(bad.status).toBe(400);
+  });
+
+  it("CAPTCHA_ASSIST offline -> queued as marked row, flushed RAW on HELLO (C-T9)", async () => {
+    const db = new FakeD1();
+    const key = await genDeviceKey();
+    await registerDevice(db, "dev-1", "t-1", key.publicKeyB64);
+    const { hub, state } = makeHub(db);
+    const res = await dispatchCaptchaAssist(hub, "dev-1", assistEvent);
+    expect(((await res.json()) as Record<string, unknown>).sent).toBe(false);
+    const queued = state.sql.exec("SELECT * FROM pending_steps").toArray();
+    expect(queued.length).toBe(1);
+    expect(String(queued[0].payload)).toContain("__captcha_assist__");
+    const { fakeWs } = await connectAndHello(hub, state, key);
+    const events = captchaEvents(fakeWs);
+    expect(events.length).toBe(1);
+    expect(events[0].task_id).toBe("bt-1");
+    // Flushed as a raw event — never signed/executed as a step.
+    expect(executeSteps(fakeWs).length).toBe(0);
+    expect(state.sql.exec("SELECT * FROM pending_steps").toArray().length).toBe(0);
+  });
+
+  it("CAPTCHA_ASSIST unauthenticated socket -> queued, never sent live", async () => {
+    const db = new FakeD1();
+    const { hub, state } = makeHub(db);
+    await hub.fetch(
+      new Request("https://hub/ws/dev-1", {
+        headers: { Upgrade: "websocket", "x-expected-device": "dev-1" },
+      }),
+    );
+    const fakeWs = state.accepted[0];
+    const res = await dispatchCaptchaAssist(hub, "dev-1", assistEvent);
+    expect(((await res.json()) as Record<string, unknown>).sent).toBe(false);
+    expect(fakeWs.sent.length).toBe(0);
+    expect(state.sql.exec("SELECT * FROM pending_steps").toArray().length).toBe(1);
+  });
+
+  it("CAPTCHA_DETECTED signed -> task row awaiting_user + captcha_assist trace", async () => {
+    const db = new FakeD1();
+    const key = await genDeviceKey();
+    await registerDevice(db, "dev-1", "t-1", key.publicKeyB64);
+    const { hub, state } = makeHub(db);
+    const { ws, fakeWs } = await connectAndHello(hub, state, key);
+    await hub.webSocketMessage(
+      ws,
+      await signedMsg(
+        key,
+        "dev-1",
+        "CAPTCHA_DETECTED",
+        JSON.stringify({ task_id: "bt-9", site: "example.com", task_name: "Fill form" }),
+      ),
+    );
+    const parsed = fakeWs.sent.map((s) => JSON.parse(s) as Record<string, unknown>);
+    expect(parsed.some((m) => m.type === "ACK" && m.id === "bt-9")).toBe(true);
+    const rows = await db.prepare("SELECT * FROM browser_tasks WHERE id = ?").bind("bt-9").all();
+    expect(rows.results.length).toBe(1);
+    const row = rows.results[0] as Record<string, unknown>;
+    expect(row.status).toBe("awaiting_user");
+    expect(row.assist_count).toBe(1);
+    expect(row.provider).toBe("phone_webview");
+    const traces = (await db.prepare("SELECT * FROM traces").bind().all()).results as Record<string, unknown>[];
+    const assist = traces.filter((t) => t.kind === "captcha_assist");
+    expect(assist.length).toBe(1);
+    expect(JSON.parse(String(assist[0].detail))).toMatchObject({
+      task_id: "bt-9",
+      outcome: "requested",
+      assist_count: 1,
+    });
+  });
+
+  it("CAPTCHA_DETECTED 4th time -> cap, task paused (C-T5, device path)", async () => {
+    const db = new FakeD1();
+    const key = await genDeviceKey();
+    await registerDevice(db, "dev-1", "t-1", key.publicKeyB64);
+    const { hub, state } = makeHub(db);
+    const { ws } = await connectAndHello(hub, state, key);
+    for (let i = 0; i < 4; i++) {
+      await hub.webSocketMessage(
+        ws,
+        await signedMsg(
+          key,
+          "dev-1",
+          "CAPTCHA_DETECTED",
+          JSON.stringify({ task_id: "bt-cap", site: "example.com", task_name: "T" }),
+        ),
+      );
+    }
+    const rows = await db.prepare("SELECT * FROM browser_tasks WHERE id = ?").bind("bt-cap").all();
+    const row = rows.results[0] as Record<string, unknown>;
+    expect(row.assist_count).toBe(3);
+    expect(row.status).toBe("paused");
+    const traces = (await db.prepare("SELECT * FROM traces").bind().all()).results as Record<string, unknown>[];
+    expect(
+      traces.some(
+        (t) =>
+          t.kind === "captcha_assist" &&
+          JSON.parse(String(t.detail)).outcome === "cap_reached",
+      ),
+    ).toBe(true);
+  });
+
+  it("CAPTCHA_RESOLVED solved -> task running + trace solved:true (C-T3)", async () => {
+    const db = new FakeD1();
+    const key = await genDeviceKey();
+    await registerDevice(db, "dev-1", "t-1", key.publicKeyB64);
+    const { hub, state } = makeHub(db);
+    const { ws } = await connectAndHello(hub, state, key);
+    await hub.webSocketMessage(
+      ws,
+      await signedMsg(
+        key,
+        "dev-1",
+        "CAPTCHA_DETECTED",
+        JSON.stringify({ task_id: "bt-10", site: "example.com", task_name: "T" }),
+      ),
+    );
+    await hub.webSocketMessage(
+      ws,
+      await signedMsg(
+        key,
+        "dev-1",
+        "CAPTCHA_RESOLVED",
+        JSON.stringify({ task_id: "bt-10", site: "example.com", solved: true, duration_s: 12 }),
+      ),
+    );
+    const rows = await db.prepare("SELECT * FROM browser_tasks WHERE id = ?").bind("bt-10").all();
+    expect((rows.results[0] as Record<string, unknown>).status).toBe("running");
+    const traces = (await db.prepare("SELECT * FROM traces").bind().all()).results as Record<string, unknown>[];
+    const resolved = traces.filter(
+      (t) => t.kind === "captcha_assist" && JSON.parse(String(t.detail)).outcome === "solved",
+    );
+    expect(resolved.length).toBe(1);
+    expect(JSON.parse(String(resolved[0].detail))).toMatchObject({ solved: true, duration_s: 12 });
+  });
+
+  it("CAPTCHA_RESOLVED with a solution field -> solution NEVER traced/stored (C-T8)", async () => {
+    const db = new FakeD1();
+    const key = await genDeviceKey();
+    await registerDevice(db, "dev-1", "t-1", key.publicKeyB64);
+    const { hub, state } = makeHub(db);
+    const { ws } = await connectAndHello(hub, state, key);
+    await hub.webSocketMessage(
+      ws,
+      await signedMsg(
+        key,
+        "dev-1",
+        "CAPTCHA_DETECTED",
+        JSON.stringify({ task_id: "bt-11", site: "example.com", task_name: "T" }),
+      ),
+    );
+    await hub.webSocketMessage(
+      ws,
+      await signedMsg(
+        key,
+        "dev-1",
+        "CAPTCHA_RESOLVED",
+        JSON.stringify({
+          task_id: "bt-11",
+          site: "example.com",
+          solved: true,
+          duration_s: 9,
+          solution: "SECRET-SOLUTION-abc123",
+          token: "SECRET-TOKEN-xyz",
+          screenshot_b64: "aGVsbG8=",
+        }),
+      ),
+    );
+    const traces = (await db.prepare("SELECT * FROM traces").bind().all()).results as Record<string, unknown>[];
+    const allDetail = traces.map((t) => String(t.detail)).join("\n");
+    expect(allDetail).not.toContain("SECRET-SOLUTION-abc123");
+    expect(allDetail).not.toContain("SECRET-TOKEN-xyz");
+    expect(allDetail).not.toContain("screenshot");
+    const rows = await db.prepare("SELECT * FROM browser_tasks WHERE id = ?").bind("bt-11").all();
+    expect((rows.results[0] as Record<string, unknown>).status).toBe("running");
+  });
+
+  it("CAPTCHA_RESOLVED timeout -> task paused, never failed (C-T2)", async () => {
+    const db = new FakeD1();
+    const key = await genDeviceKey();
+    await registerDevice(db, "dev-1", "t-1", key.publicKeyB64);
+    const { hub, state } = makeHub(db);
+    const { ws } = await connectAndHello(hub, state, key);
+    await hub.webSocketMessage(
+      ws,
+      await signedMsg(
+        key,
+        "dev-1",
+        "CAPTCHA_DETECTED",
+        JSON.stringify({ task_id: "bt-12", site: "example.com", task_name: "T" }),
+      ),
+    );
+    await hub.webSocketMessage(
+      ws,
+      await signedMsg(
+        key,
+        "dev-1",
+        "CAPTCHA_RESOLVED",
+        JSON.stringify({ task_id: "bt-12", site: "example.com", solved: false, duration_s: 60 }),
+      ),
+    );
+    const rows = await db.prepare("SELECT * FROM browser_tasks WHERE id = ?").bind("bt-12").all();
+    expect((rows.results[0] as Record<string, unknown>).status).toBe("paused");
+  });
+
+  it("CAPTCHA_DETECTED bad signature -> close 4401 (signed path enforced)", async () => {
+    const db = new FakeD1();
+    const key = await genDeviceKey();
+    const otherKey = await genDeviceKey();
+    await registerDevice(db, "dev-1", "t-1", key.publicKeyB64);
+    const { hub, state } = makeHub(db);
+    const { ws, fakeWs } = await connectAndHello(hub, state, key);
+    await hub.webSocketMessage(
+      ws,
+      await signedMsg(
+        otherKey,
+        "dev-1",
+        "CAPTCHA_DETECTED",
+        JSON.stringify({ task_id: "bt-13", site: "example.com", task_name: "T" }),
+      ),
+    );
+    expect(fakeWs.closed?.code).toBe(4401);
+  });
+
+  it("unknown WS type still -> close 4400", async () => {
+    const db = new FakeD1();
+    const { hub, state } = makeHub(db);
+    await hub.fetch(
+      new Request("https://hub/ws/dev-1", {
+        headers: { Upgrade: "websocket", "x-expected-device": "dev-1" },
+      }),
+    );
+    const ws = state.accepted[0] as unknown as WebSocket;
+    const fakeWs = state.accepted[0];
+    await hub.webSocketMessage(ws, JSON.stringify({ type: "NOPE" }));
+    expect(fakeWs.closed?.code).toBe(4400);
+  });
+});

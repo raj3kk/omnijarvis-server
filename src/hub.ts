@@ -20,6 +20,9 @@
  * - /api/tenants/:id/key(+status): x-admin-token (LLM_ADMIN_TOKEN).
  * - /api/docs/*: x-internal-secret (agent) OR paired device + Ed25519
  *   signature (3b); Free tier: doc extraction blocked.
+ * - /api/browser/*: x-internal-secret (3c); device reports captcha
+ *   via signed WS messages (DO), not these routes. Executor default
+ *   PhoneWebView; E2B gated, Render refuses (hosting proof FAIL).
  */
 import { JarvisHub } from "./do/JarvisHub";
 
@@ -45,14 +48,24 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "3b.1"; // M-4: hub signs EXECUTE_STEP (Ed25519, key hub-1) + F-1 job-pause
+const VERSION = "3c"; // 3c: browser agent (PhoneWebView default, E2B gated) + captcha human-assist + AWAITING_USER
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey } from "./crypto";
 import { handleSync, type SyncRequest } from "./sync";
 import { handleTick, type DispatchStep } from "./cron";
 import { checkRateLimit } from "./ratelimit";
-import { getDevice, getTenant, verifyLicenceKey } from "./db";
+import { getDevice, getTenant, insertTrace, verifyLicenceKey } from "./db";
+import {
+  buildCaptchaAssistEvent,
+  executeBrowserTask,
+  getBrowserTask,
+  requestCaptchaAssist,
+  resolveCaptchaAssist,
+  captchaAssistTrace,
+  type AssistOutcome,
+  type CaptchaAssistEvent,
+} from "./browser";
 import { completeTurn, loadRouterConfig, routeLlm, validateGeminiKey, type RequestKind } from "./router";
 import { encryptTenantKey, importMasterKey } from "./keyvault";
 import {
@@ -106,6 +119,29 @@ async function readJson(request: Request): Promise<Record<string, unknown>> {
   } catch {
     return {};
   }
+}
+
+/** 3c: deliver a CAPTCHA_ASSIST event to a device's DO (live or queued). */
+async function dispatchCaptchaAssist(
+  env: Env,
+  deviceId: string,
+  event: CaptchaAssistEvent,
+): Promise<{ sent: boolean }> {
+  const id = env.JARVIS_HUB.idFromName(`device:${deviceId}`);
+  const stub = env.JARVIS_HUB.get(id);
+  const res = await stub.fetch(
+    new Request("https://hub/captcha-assist", {
+      method: "POST",
+      headers: {
+        "x-internal-secret": env.INTERNAL_SECRET ?? "",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ device_id: deviceId, event }),
+    }),
+  );
+  if (!res.ok) return { sent: false };
+  const body = (await res.json()) as { sent?: boolean };
+  return { sent: body.sent === true };
 }
 
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
@@ -626,6 +662,114 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         pages: rj.pages ?? null,
         verify_url: `${verifyUrl}/${hash}`,
       });
+    }
+
+    // --- Browser agent (Phase 3, stage 3c) ---
+    // Executor default PhoneWebView (hosting proof FAIL — Render
+    // refuses, E2B gated until an account exists). Internal-secret
+    // gated; the device reports captcha via signed WS messages (DO),
+    // not these routes. Rate limit: `browser` budget, 30/min/tenant.
+    if (path === "/api/browser/task" && method === "POST") {
+      if (!env.INTERNAL_SECRET || request.headers.get("x-internal-secret") !== env.INTERNAL_SECRET) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const body = await readJson(request);
+      const tenantId = typeof body.tenant_id === "string" ? body.tenant_id : "";
+      const deviceId = typeof body.device_id === "string" ? body.device_id : "";
+      const taskName = typeof body.task_name === "string" ? body.task_name : "";
+      if (!tenantId || !deviceId || !taskName) return json({ error: "bad_request" }, 400);
+      const device = await getDevice(env.DB, deviceId);
+      if (!device || device.enabled === 0) return json({ error: "device_not_paired" }, 403);
+      const rl = await checkRateLimit(env, "browser", tenantId);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      const result = await executeBrowserTask(env.DB, {
+        tenant_id: tenantId,
+        device_id: deviceId,
+        task_name: taskName,
+        site: typeof body.site === "string" ? body.site : null,
+        url: typeof body.url === "string" ? body.url : null,
+        provider: typeof body.provider === "string" ? body.provider : null,
+      });
+      if (!result.ok) return json({ error: result.error, detail: result.reason }, 503);
+      return json({ ok: true, task_id: result.task_id, provider: result.provider, status: result.status });
+    }
+
+    if (path === "/api/browser/assist" && method === "POST") {
+      if (!env.INTERNAL_SECRET || request.headers.get("x-internal-secret") !== env.INTERNAL_SECRET) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const body = await readJson(request);
+      const taskId = typeof body.task_id === "string" ? body.task_id : "";
+      if (!taskId) return json({ error: "bad_request" }, 400);
+      const task = await getBrowserTask(env.DB, taskId);
+      if (!task) return json({ error: "task_not_found" }, 404);
+      const rl = await checkRateLimit(env, "browser", task.tenant_id);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      const assist = await requestCaptchaAssist(env.DB, taskId);
+      if (!assist.ok) {
+        if (assist.error === "task_not_found") return json({ error: "task_not_found" }, 404);
+        if (assist.error === "task_closed") return json({ error: "task_closed", status: assist.status }, 409);
+        // assist_cap_reached: task auto-paused, NO event is sent.
+        await insertTrace(
+          env.DB,
+          task.tenant_id,
+          task.device_id,
+          "captcha_assist",
+          captchaAssistTrace(task.id, task.site, { outcome: "cap_reached", assist_count: assist.assist_count }),
+        );
+        return json({
+          ok: false,
+          error: "assist_cap_reached",
+          assist_count: assist.assist_count,
+          status: "paused",
+        });
+      }
+      const screenshotB64 = typeof body.screenshot_b64 === "string" ? body.screenshot_b64 : null;
+      const { event, screenshotDropped } = buildCaptchaAssistEvent(task, screenshotB64);
+      const delivered = await dispatchCaptchaAssist(env, task.device_id, event);
+      await insertTrace(
+        env.DB,
+        task.tenant_id,
+        task.device_id,
+        "captcha_assist",
+        captchaAssistTrace(task.id, task.site, { outcome: "requested", assist_count: assist.assist_count }),
+      );
+      return json({
+        ok: true,
+        task_id: taskId,
+        assist_count: assist.assist_count,
+        status: "awaiting_user",
+        delivered: delivered.sent,
+        queued: !delivered.sent,
+        screenshot_dropped: screenshotDropped,
+      });
+    }
+
+    if (path === "/api/browser/resolve" && method === "POST") {
+      if (!env.INTERNAL_SECRET || request.headers.get("x-internal-secret") !== env.INTERNAL_SECRET) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const body = await readJson(request);
+      const taskId = typeof body.task_id === "string" ? body.task_id : "";
+      if (!taskId || typeof body.solved !== "boolean") return json({ error: "bad_request" }, 400);
+      const task = await getBrowserTask(env.DB, taskId);
+      if (!task) return json({ error: "task_not_found" }, 404);
+      const outcome: AssistOutcome =
+        body.aborted === true ? "aborted" : body.solved === true ? "solved" : "timeout";
+      const res = await resolveCaptchaAssist(env.DB, taskId, outcome);
+      if (!res.ok) return json({ error: "task_not_found" }, 404);
+      await insertTrace(
+        env.DB,
+        task.tenant_id,
+        task.device_id,
+        "captcha_assist",
+        captchaAssistTrace(task.id, task.site, {
+          solved: body.solved === true,
+          duration_s: typeof body.duration_s === "number" ? body.duration_s : undefined,
+          outcome,
+        }),
+      );
+      return json({ ok: true, task_id: taskId, status: res.status });
     }
 
     // WS upgrade -> DO (paired-device check first).

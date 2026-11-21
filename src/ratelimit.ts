@@ -28,6 +28,7 @@ export const RATE_LIMITS: Record<string, { limit: number; windowMs: number }> = 
   sync: { limit: 120, windowMs: 60_000 },
   llmRoute: { limit: 60, windowMs: 60_000 },
   docs: { limit: 30, windowMs: 60_000 },
+  browser: { limit: 30, windowMs: 60_000 },
 };
 
 export interface RateLimitResult {

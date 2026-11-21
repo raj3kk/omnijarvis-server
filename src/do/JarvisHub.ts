@@ -24,6 +24,14 @@
  *   and via HELLO_ACK bootstrap for already-paired devices (M-4 §4.4).
  *   A new key_id is NEVER accepted from HELLO_ACK — rotation is
  *   re-pair-only.
+ * - Captcha assist (3c, D3 human-assist-first): the device reports
+ *   CAPTCHA_DETECTED / CAPTCHA_RESOLVED as SIGNED messages (same
+ *   verify path as HELLO/STEP_RESULT); the hub sends CAPTCHA_ASSIST
+ *   events to the paired device (live, or queued as a marked row in
+ *   pending_steps, max 50/device, C-T9). The event is display-only —
+ *   no command executes from it — so it is NOT signed; the session
+ *   itself is paired + HELLO-verified. A solution/token value is
+ *   NEVER read, traced, or stored.
  *
  * SQLite tables (DO built-in): sessions, nonces, pending_steps.
  * Presence = WS connection itself (C1) — no heartbeat polling.
@@ -40,6 +48,13 @@ import {
   verifySignature,
 } from "../crypto";
 import { getDevice, insertTrace, touchDeviceSeen } from "../db";
+import {
+  captchaAssistTrace,
+  ensureBrowserTask,
+  requestCaptchaAssist,
+  resolveCaptchaAssist,
+  type AssistOutcome,
+} from "../browser";
 
 const NONCE_TTL_MS = 300_000; // 5 min
 const HELLO_TIMEOUT_MS = 30_000; // 30s
@@ -142,6 +157,75 @@ export class JarvisHub extends DurableObject<Env> {
     }
   }
 
+  /** 3c: CAPTCHA_DETECTED from the device (PhoneWebView executor). */
+  private async handleCaptchaDetected(deviceId: string, payload: Record<string, unknown>): Promise<void> {
+    const taskId = typeof payload.task_id === "string" ? payload.task_id : "";
+    if (!taskId) return;
+    const site = typeof payload.site === "string" ? payload.site : "";
+    const taskName = typeof payload.task_name === "string" ? payload.task_name : "Browser task";
+    try {
+      const device = await getDevice(this.env.DB, deviceId);
+      if (!device) return;
+      await ensureBrowserTask(this.env.DB, {
+        id: taskId,
+        tenant_id: device.tenant_id,
+        device_id: deviceId,
+        task_name: taskName,
+        site: site || null,
+        provider: "phone_webview",
+      });
+      const res = await requestCaptchaAssist(this.env.DB, taskId);
+      if (res.ok) {
+        await insertTrace(
+          this.env.DB,
+          device.tenant_id,
+          deviceId,
+          "captcha_assist",
+          captchaAssistTrace(taskId, site || null, { outcome: "requested", assist_count: res.assist_count }),
+        );
+      } else if (res.error === "assist_cap_reached") {
+        // 4th assist: task auto-paused, no event sent. Trace the cap
+        // so the "continue karun?" prompt has an audit trail.
+        await insertTrace(
+          this.env.DB,
+          device.tenant_id,
+          deviceId,
+          "captcha_assist",
+          captchaAssistTrace(taskId, site || null, { outcome: "cap_reached", assist_count: res.assist_count }),
+        );
+      }
+      // task_closed (aborted/done): nothing to do — the device already stopped.
+    } catch {
+      // tracing/state must never break the WS session
+    }
+  }
+
+  /** 3c: CAPTCHA_RESOLVED from the device (solved / timeout / aborted). */
+  private async handleCaptchaResolved(deviceId: string, payload: Record<string, unknown>): Promise<void> {
+    const taskId = typeof payload.task_id === "string" ? payload.task_id : "";
+    if (!taskId) return;
+    const site = typeof payload.site === "string" ? payload.site : "";
+    const solved = payload.solved === true;
+    const aborted = payload.aborted === true;
+    const durationS = typeof payload.duration_s === "number" ? payload.duration_s : undefined;
+    const outcome: AssistOutcome = aborted ? "aborted" : solved ? "solved" : "timeout";
+    try {
+      const device = await getDevice(this.env.DB, deviceId);
+      if (!device) return;
+      const res = await resolveCaptchaAssist(this.env.DB, taskId, outcome);
+      if (!res.ok) return;
+      await insertTrace(
+        this.env.DB,
+        device.tenant_id,
+        deviceId,
+        "captcha_assist",
+        captchaAssistTrace(taskId, site || null, { solved, duration_s: durationS, outcome }),
+      );
+    } catch {
+      // tracing/state must never break the WS session
+    }
+  }
+
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
     this.state = state;
@@ -210,6 +294,18 @@ export class JarvisHub extends DurableObject<Env> {
       } catch {
         return; // corrupt row — stop flushing; rows stay for next connect
       }
+      // 3c: queued CAPTCHA_ASSIST events are marked rows — they go out
+      // as RAW events (never signed as EXECUTE_STEP), then deleted.
+      if (step && typeof step === "object" && "__captcha_assist__" in step) {
+        const event = step["__captcha_assist__"] as Record<string, unknown>;
+        try {
+          ws.send(JSON.stringify(event));
+        } catch {
+          return; // socket dead — stop flushing; rows stay for next connect
+        }
+        this.sql().exec("DELETE FROM pending_steps WHERE id = ?", row.id);
+        continue;
+      }
       // M-4: sign at send time; step_ts = first dispatch (row created_at).
       // Sign-fail -> STOP, leave the row (retry next HELLO). Never send unsigned.
       const envelope = await this.signStepEnvelope(deviceId, step, row.created_at);
@@ -253,6 +349,36 @@ export class JarvisHub extends DurableObject<Env> {
     return false;
   }
 
+  /**
+   * 3c: send a CAPTCHA_ASSIST event to the paired device. Live send
+   * only on an authenticated socket (HELLO done) — an unauthenticated
+   * socket never sees site/task names. Offline -> queued as a marked
+   * row in pending_steps (max 50/device, shared with steps, C-T9);
+   * flushPending sends marked rows back out as raw events.
+   */
+  private async queueOrSendEvent(deviceId: string, event: Record<string, unknown>): Promise<boolean> {
+    if (this.authenticatedDeviceId === deviceId && this.sockets.size > 0) {
+      for (const ws of this.sockets) {
+        try {
+          ws.send(JSON.stringify(event));
+          return true;
+        } catch {
+          // try next socket, else fall through to queue
+        }
+      }
+    }
+    const count = [...this.sql().exec("SELECT COUNT(*) AS n FROM pending_steps").toArray()][0] as { n: number };
+    if (count.n >= MAX_PENDING_PER_DEVICE) {
+      this.sql().exec("DELETE FROM pending_steps WHERE id = (SELECT MIN(id) FROM pending_steps)");
+    }
+    this.sql().exec(
+      "INSERT INTO pending_steps (payload, created_at) VALUES (?, ?)",
+      JSON.stringify({ __captcha_assist__: event }),
+      Date.now(),
+    );
+    return false;
+  }
+
   async fetch(request: Request): Promise<Response> {
     this.ensureTables();
     const url = new URL(request.url);
@@ -271,6 +397,23 @@ export class JarvisHub extends DurableObject<Env> {
         return Response.json({ error: "device_mismatch" }, { status: 400 });
       }
       const sent = await this.queueOrSend(body.step, body.device_id);
+      return Response.json({ ok: true, sent });
+    }
+    // 3c: CAPTCHA_ASSIST dispatch (Worker -> DO): POST /captcha-assist,
+    // secret-gated. Body: {device_id, event:{type:"CAPTCHA_ASSIST", ...}}.
+    if (path === "/captcha-assist" && request.method === "POST") {
+      const secret = (this.env as unknown as Record<string, string | undefined>).INTERNAL_SECRET;
+      if (!secret || request.headers.get("x-internal-secret") !== secret) {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+      const body = (await request.json()) as { device_id?: string; event?: Record<string, unknown> };
+      if (!body.device_id || !body.event || body.event.type !== "CAPTCHA_ASSIST") {
+        return Response.json({ error: "bad_request" }, { status: 400 });
+      }
+      if (this.expectedDeviceId && body.device_id !== this.expectedDeviceId) {
+        return Response.json({ error: "device_mismatch" }, { status: 400 });
+      }
+      const sent = await this.queueOrSendEvent(body.device_id, body.event);
       return Response.json({ ok: true, sent });
     }
     // WS upgrade (Worker routes /ws/:deviceId here with x-expected-device).
@@ -302,7 +445,7 @@ export class JarvisHub extends DurableObject<Env> {
       ws.send(JSON.stringify({ type: "PONG" }));
       return;
     }
-    if (msg.type !== "HELLO" && msg.type !== "STEP_RESULT") {
+    if (msg.type !== "HELLO" && msg.type !== "STEP_RESULT" && msg.type !== "CAPTCHA_DETECTED" && msg.type !== "CAPTCHA_RESOLVED") {
       ws.close(4400, "unknown_type");
       return;
     }
@@ -341,6 +484,21 @@ export class JarvisHub extends DurableObject<Env> {
         }),
       );
       await this.flushPending(ws);
+      return;
+    }
+    // 3c: device-reported captcha assist (PhoneWebView executor).
+    // Signed + verified above, same as HELLO/STEP_RESULT. The device
+    // is the executor here, so its task_id is authoritative — the row
+    // is created if new. A `solution`/`token` field in the payload is
+    // NEVER read, traced, or stored (D3 §3.2).
+    if (msg.type === "CAPTCHA_DETECTED") {
+      await this.handleCaptchaDetected(msg.device_id, payload);
+      ws.send(JSON.stringify({ type: "ACK", id: typeof payload.task_id === "string" ? payload.task_id : null }));
+      return;
+    }
+    if (msg.type === "CAPTCHA_RESOLVED") {
+      await this.handleCaptchaResolved(msg.device_id, payload);
+      ws.send(JSON.stringify({ type: "ACK", id: typeof payload.task_id === "string" ? payload.task_id : null }));
       return;
     }
     // STEP_RESULT: trace it (D1) + ack.

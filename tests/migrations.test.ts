@@ -127,3 +127,31 @@ describe("D1 migration 0004 (doc pipeline: doc_jobs + certificates + pii_consent
     expect(code.toLowerCase()).not.toContain("supabase");
   });
 });
+
+const SQL5 = readFileSync(
+  new URL("../d1/migrations/0005_browser.sql", import.meta.url),
+  "utf8",
+);
+
+describe("D1 migration 0005 (browser agent: browser_tasks + AWAITING_USER)", () => {
+  it("creates browser_tasks with the 3c §2b columns", () => {
+    expect(SQL5).toContain("CREATE TABLE IF NOT EXISTS browser_tasks (");
+    for (const col of ["id TEXT PRIMARY KEY", "tenant_id TEXT NOT NULL", "device_id TEXT NOT NULL", "task_name TEXT NOT NULL", "site TEXT", "url TEXT", "provider TEXT NOT NULL DEFAULT 'phone_webview'", "status TEXT NOT NULL DEFAULT 'running'", "assist_count INTEGER NOT NULL DEFAULT 0", "created_at INTEGER NOT NULL", "updated_at INTEGER NOT NULL"]) {
+      expect(SQL5).toContain(col);
+    }
+    expect(SQL5).toContain("idx_browser_tasks_device ON browser_tasks(device_id, created_at)");
+    expect(SQL5).toContain("idx_browser_tasks_status ON browser_tasks(status)");
+  });
+
+  it("status is CHECK-constrained to the 5 lifecycle states incl. awaiting_user", () => {
+    expect(SQL5).toContain("CHECK (status IN ('running', 'awaiting_user', 'paused', 'aborted', 'done'))");
+  });
+
+  it("is non-destructive: no DROP TABLE / TRUNCATE / DELETE FROM, no Supabase refs", () => {
+    const code = SQL5.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(code).not.toMatch(/DROP\s+TABLE/i);
+    expect(code).not.toMatch(/TRUNCATE/i);
+    expect(code).not.toMatch(/DELETE\s+FROM/i);
+    expect(code.toLowerCase()).not.toContain("supabase");
+  });
+});
