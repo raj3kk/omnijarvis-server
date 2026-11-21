@@ -20,6 +20,7 @@
  * SQLite tables (DO built-in): sessions, nonces, pending_steps.
  * Presence = WS connection itself (C1) — no heartbeat polling.
  */
+import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../hub";
 import { isTimestampFresh, verifySignature } from "../crypto";
 import { getDevice, insertTrace, touchDeviceSeen } from "../db";
@@ -37,17 +38,22 @@ interface DeviceMessage {
   payload_raw: string;
 }
 
-export class JarvisHub {
-  private state: DurableObjectState;
-  private env: Env;
+// NOTE: a DO class MUST extend DurableObject (from "cloudflare:workers")
+// — a plain class deploys but the Worker cannot serve ANY request
+// (live 1042 on every route, found 2026-11-21). Regression test:
+// tests/do.test.ts "class extends DurableObject".
+export class JarvisHub extends DurableObject<Env> {
+  // `state` is our own field (the base keeps it as `ctx`); sql() uses
+  // state.storage. `env` comes from the base class (protected).
+  state: DurableObjectState;
   private expectedDeviceId: string | null = null;
   private authenticatedDeviceId: string | null = null;
   private publicKey: string | null = null;
   private sockets = new Set<WebSocket>();
 
   constructor(state: DurableObjectState, env: Env) {
+    super(state, env);
     this.state = state;
-    this.env = env;
   }
 
   private sql() {

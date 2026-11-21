@@ -1,42 +1,12 @@
+import { DurableObject } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { JarvisHub } from "../src/do/JarvisHub";
 import type { Env } from "../src/hub";
 import { FakeD1 } from "./fake-d1";
 import { FakeDOState, FakeWebSocket } from "./fake-do";
 
-// Node has no WebSocketPair (Workers-only global) — stub it with fakes.
-// The DO uses pair[1] (server side); pair[0] goes to the client Response.
-class FakeWebSocketPair {
-  0: FakeWebSocket;
-  1: FakeWebSocket;
-  constructor() {
-    this[0] = new FakeWebSocket();
-    this[1] = new FakeWebSocket();
-  }
-}
-(globalThis as unknown as { WebSocketPair: typeof FakeWebSocketPair }).WebSocketPair =
-  FakeWebSocketPair;
-
-// Node's Response rejects status 101 — the DO's WS upgrade returns one.
-// Shim it: build a 200 Response, then shadow `status` with 101 and keep
-// the webSocket on the instance (test-only, Workers behaviour unchanged).
-const NativeResponse = Response;
-class TestResponse extends NativeResponse {
-  declare webSocket: WebSocket | null;
-  constructor(
-    body: BodyInit | null,
-    init?: ResponseInit & { webSocket?: unknown },
-  ) {
-    if (init?.status === 101) {
-      super(body, { status: 200, headers: init.headers });
-      this.webSocket = init.webSocket as WebSocket | null;
-      Object.defineProperty(this, "status", { value: 101 });
-    } else {
-      super(body, init);
-    }
-  }
-}
-(globalThis as unknown as { Response: typeof TestResponse }).Response = TestResponse;
+// Workers-only globals (WebSocketPair / Response-101 / DurableObject)
+// are stubbed in tests/setup.ts (must run BEFORE this module's imports).
 import { registerDevice } from "../src/pairing";
 import { canonicalString } from "../src/crypto";
 import { genDeviceKey } from "./helpers";
@@ -61,6 +31,10 @@ async function signedMsg(
 }
 
 describe("JarvisHub DO", () => {
+  it("class extends DurableObject (plain class = live 1042)", () => {
+    expect(Object.getPrototypeOf(JarvisHub)).toBe(DurableObject);
+  });
+
   it("WS upgrade without x-expected-device -> 400", async () => {
     const db = new FakeD1();
     const { hub } = makeHub(db);
