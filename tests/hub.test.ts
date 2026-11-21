@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { handleRequest, route, type Env } from "../src/hub";
 import { FakeD1 } from "./fake-d1";
 import { deriveSixDigit, deriveTenantId } from "../src/pairing";
+import { genHubKey } from "./helpers";
 
 function fakeEnv(db: FakeD1, overrides: Partial<Env> = {}): Env {
   return {
@@ -169,6 +170,68 @@ describe("handleRequest (2a-2 routes, D1 licences)", () => {
     );
     expect(r2.status).toBe(403);
     expect(((await r2.json()) as Record<string, unknown>).error).toBe("token_invalid");
+  });
+
+  it("pairing register: returns hub_public_key + key_id (M-4 §4.5)", async () => {
+    const db = new FakeD1();
+    await seedLicence(db, "L-1");
+    const hubKey = await genHubKey();
+    const env = fakeEnv(db, { HUB_SIGN_SECRET: hubKey.privateKeyB64 });
+    const init = await handleRequest(
+      new Request("https://hub/api/pairing/init", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_id: "dev-1", tenant_id: "t-1", licence_key: "L-1" }),
+      }),
+      env,
+    );
+    const { token } = (await init.json()) as { token: string };
+    const res = await handleRequest(
+      new Request("https://hub/api/pairing/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token, device_id: "dev-1", public_key: "aGVsbG8=" }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    expect(body.device_id).toBe("dev-1");
+    expect(body.hub_public_key).toBe(hubKey.publicKeyB64);
+    expect(body.key_id).toBe("hub-1");
+  });
+
+  it("pairing register: no HUB_SIGN_SECRET -> key fields omitted, still 200", async () => {
+    const db = new FakeD1();
+    await seedLicence(db, "L-1");
+    const env = fakeEnv(db);
+    const init = await handleRequest(
+      new Request("https://hub/api/pairing/init", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_id: "dev-1", tenant_id: "t-1", licence_key: "L-1" }),
+      }),
+      env,
+    );
+    const { token } = (await init.json()) as { token: string };
+    const res = await handleRequest(
+      new Request("https://hub/api/pairing/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token, device_id: "dev-1", public_key: "aGVsbG8=" }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.hub_public_key).toBeUndefined();
+    expect(body.key_id).toBeUndefined();
+  });
+
+  it("GET / -> version 3b.1 (M-4)", async () => {
+    const body = (await route("/").json()) as Record<string, unknown>;
+    expect(body.version).toBe("3b.1");
   });
 
   it("pairing code: derives from token", async () => {

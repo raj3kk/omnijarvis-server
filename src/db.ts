@@ -116,3 +116,27 @@ export async function markJobRun(
     .bind(lastRunAt, nextRunAt, jobId)
     .run();
 }
+
+/**
+ * M-4 F-1: pause a job (owner re-enables manually — no auto-resume).
+ * getDueJobs only returns enabled=1, so a paused job stops firing.
+ */
+export async function pauseJob(db: D1Like, jobId: string): Promise<void> {
+  await db.prepare("UPDATE scheduled_jobs SET enabled = ? WHERE id = ?").bind(0, jobId).run();
+}
+
+/**
+ * M-4 F-1: true when this job has a step_rejected_bad_sig trace in the
+ * last 24h (device rejected a hub-signed step). The LIKE pattern anchors
+ * on `,"job_id":"<id>",` — job_id is the FIRST detail field of the DO's
+ * step_rejected_bad_sig trace, so "job-1" never matches "job-10".
+ */
+export async function hasRecentSigReject(db: D1Like, jobId: string, nowMs: number): Promise<boolean> {
+  const row = await db
+    .prepare(
+      "SELECT id FROM traces WHERE kind = ? AND detail LIKE ? AND created_at >= ? LIMIT 1",
+    )
+    .bind("step_rejected_bad_sig", `%"job_id":"${jobId}",%`, nowMs - 24 * 60 * 60_000)
+    .first<{ id: number }>();
+  return row !== null;
+}

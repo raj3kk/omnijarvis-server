@@ -90,6 +90,83 @@ describe("cron tick (D1 scheduled_jobs)", () => {
   });
 });
 
+describe("cron F-1 (M-4): pause job after step_rejected_bad_sig", () => {
+  async function seedRejectTrace(db: FakeD1, jobId: string, createdAt: number) {
+    await db
+      .prepare("INSERT INTO traces (tenant_id, device_id, kind, detail, created_at) VALUES (?, ?, ?, ?, ?)")
+      .bind("t-1", "dev-1", "step_rejected_bad_sig", JSON.stringify({ job_id: jobId, ok: false }), createdAt)
+      .run();
+  }
+
+  it("recent reject (24h) -> dispatch skipped + job paused + job_paused_sig_fail trace", async () => {
+    const db = new FakeD1();
+    const now = Date.now();
+    await seedJob(db, "job-1", "0 9 * * *", "open youtube", now - 60_000, now);
+    await seedRejectTrace(db, "job-1", now - 60_000);
+    const dispatched: string[] = [];
+    const res = await handleTick(db, ENV, "test-cron", async (_d, step) => {
+      dispatched.push(String(step.job_id));
+      return true;
+    }, now);
+    expect(res.ok).toBe(true);
+    expect(res.fired).toBe(0);
+    expect(res.skipped).toBe(1);
+    expect(dispatched).toEqual([]);
+    const row = await db
+      .prepare("SELECT enabled FROM scheduled_jobs WHERE id = ?")
+      .bind("job-1")
+      .first<{ enabled: number }>();
+    expect(row?.enabled).toBe(0);
+    const traces = (await db.prepare("SELECT * FROM traces").bind().all()).results as Record<string, unknown>[];
+    expect(traces.some((t) => t.kind === "job_paused_sig_fail")).toBe(true);
+    // Paused job never fires again (getDueJobs only returns enabled=1).
+    const res2 = await handleTick(db, ENV, "test-cron", async () => true, now + 60_000);
+    expect(res2.fired).toBe(0);
+  });
+
+  it("old reject (>24h) -> job still dispatches", async () => {
+    const db = new FakeD1();
+    const now = Date.now();
+    await seedJob(db, "job-1", "0 9 * * *", "open youtube", now - 60_000, now);
+    await seedRejectTrace(db, "job-1", now - 25 * 60 * 60_000);
+    const dispatched: string[] = [];
+    const res = await handleTick(db, ENV, "test-cron", async (_d, step) => {
+      dispatched.push(String(step.job_id));
+      return true;
+    }, now);
+    expect(res.fired).toBe(1);
+    expect(dispatched).toEqual(["job-1"]);
+  });
+
+  it("reject for another job (job-10) does NOT pause job-1 (exact job_id match)", async () => {
+    const db = new FakeD1();
+    const now = Date.now();
+    await seedJob(db, "job-1", "0 9 * * *", "open youtube", now - 60_000, now);
+    await seedRejectTrace(db, "job-10", now - 60_000);
+    const dispatched: string[] = [];
+    const res = await handleTick(db, ENV, "test-cron", async (_d, step) => {
+      dispatched.push(String(step.job_id));
+      return true;
+    }, now);
+    expect(res.fired).toBe(1);
+    expect(dispatched).toEqual(["job-1"]);
+    const row = await db
+      .prepare("SELECT enabled FROM scheduled_jobs WHERE id = ?")
+      .bind("job-1")
+      .first<{ enabled: number }>();
+    expect(row?.enabled).toBe(1);
+  });
+
+  it("no reject trace -> job dispatches normally", async () => {
+    const db = new FakeD1();
+    const now = Date.now();
+    await seedJob(db, "job-1", "0 9 * * *", "open youtube", now - 60_000, now);
+    const res = await handleTick(db, ENV, "test-cron", async () => true, now);
+    expect(res.fired).toBe(1);
+    expect(res.skipped).toBe(0);
+  });
+});
+
 describe("nextCronRun (minimal 5-field parser)", () => {
   it("daily 09:00", () => {
     const from = Date.parse("2026-11-21T00:00:00Z");

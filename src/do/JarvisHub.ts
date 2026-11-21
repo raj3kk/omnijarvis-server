@@ -5,24 +5,40 @@
  * webSocketClose / webSocketError. Plain accept() + manual listeners
  * KABHI NAHI (poora connected time duration charge hota hai).
  *
- * Auth model (frozen, Pehle-Jaanch §3.5 + design correction):
+ * Auth model (frozen, Pehle-Jaanch §3.5 + M-4):
  * - Device signs its OUTBOUND messages (HELLO, STEP_RESULT) with its
  *   Ed25519 private key (Android Keystore). Hub verifies with the
  *   registered public key (D1 devices table).
- * - EXECUTE_STEP flows HUB -> DEVICE over the WS session established
- *   with a signed HELLO (channel authenticated at establishment).
+ * - EXECUTE_STEP flows HUB -> DEVICE SIGNED (M-4): the DO signs every
+ *   step at send time with the hub Ed25519 key (Workers secret
+ *   HUB_SIGN_SECRET) — envelope {type, step, device_id, nonce, ts,
+ *   step_ts, key_id:"hub-1", sig, payload_raw}; device verifies (app
+ *   1.7.0) and rejects on any failure. Sign-fail -> step is NOT sent
+ *   (fail-closed, never an unsigned fallback).
  * - Routing guard: Worker passes x-expected-device on the upgrade
  *   request; HELLO.device_id must match it (else 4401 close) — a device
  *   cannot claim another device's DO + pending steps.
  * - Nonces: one-time, 5-min expiry, DO SQLite (replay = 403/close).
  * - Unauthenticated sockets: 30s alarm closes them (no HELLO = close).
+ * - Hub public key reaches the device at pairing (register response)
+ *   and via HELLO_ACK bootstrap for already-paired devices (M-4 §4.4).
+ *   A new key_id is NEVER accepted from HELLO_ACK — rotation is
+ *   re-pair-only.
  *
  * SQLite tables (DO built-in): sessions, nonces, pending_steps.
  * Presence = WS connection itself (C1) — no heartbeat polling.
  */
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../hub";
-import { isTimestampFresh, verifySignature } from "../crypto";
+import {
+  HUB_KEY_ID,
+  deriveHubPublicKeyB64,
+  importPrivateKey,
+  isTimestampFresh,
+  randomNonceHex,
+  signHubMessage,
+  verifySignature,
+} from "../crypto";
 import { getDevice, insertTrace, touchDeviceSeen } from "../db";
 
 const NONCE_TTL_MS = 300_000; // 5 min
@@ -50,6 +66,81 @@ export class JarvisHub extends DurableObject<Env> {
   private authenticatedDeviceId: string | null = null;
   private publicKey: string | null = null;
   private sockets = new Set<WebSocket>();
+  // M-4 hub signing key, instance-level cache (never re-import per step).
+  // null after a failed load attempt (missing/invalid secret) — signing
+  // then fails closed (step not sent) until the DO is recreated.
+  private hubKey: { priv: CryptoKey; pubB64: string } | null = null;
+  private hubKeyTried = false;
+
+  /**
+   * Load (once) the hub Ed25519 signing key from HUB_SIGN_SECRET.
+   * Returns null when the secret is missing or malformed — the caller
+   * must then NOT send the step (M-4 §6.4). The secret value is never
+   * logged, traced, or returned.
+   */
+  private async ensureHubKey(): Promise<{ priv: CryptoKey; pubB64: string } | null> {
+    if (this.hubKeyTried) return this.hubKey;
+    this.hubKeyTried = true;
+    const secret = (this.env as unknown as Record<string, string | undefined>).HUB_SIGN_SECRET;
+    if (!secret) return null;
+    try {
+      const priv = await importPrivateKey(secret);
+      const pubB64 = await deriveHubPublicKeyB64(priv);
+      this.hubKey = { priv, pubB64 };
+      return this.hubKey;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Build the signed EXECUTE_STEP envelope (§3.1) for one delivery.
+   * payload_raw is stringified ONCE from the step and never re-serialized.
+   * stepTs = first-dispatch time (live send: null -> ts itself;
+   * flush: row created_at). One Date.now() call feeds both ts and
+   * step_ts on live send, so they are exactly equal.
+   * Returns null on sign failure — caller must not send anything.
+   */
+  private async signStepEnvelope(
+    deviceId: string,
+    step: Record<string, unknown>,
+    stepTs: number | null,
+  ): Promise<Record<string, unknown> | null> {
+    const key = await this.ensureHubKey();
+    if (!key) return null;
+    const payloadRaw = JSON.stringify(step);
+    const nonce = randomNonceHex();
+    const ts = Date.now();
+    try {
+      const sig = await signHubMessage(key.priv, deviceId, nonce, ts, payloadRaw);
+      return {
+        type: "EXECUTE_STEP",
+        step,
+        device_id: deviceId,
+        nonce,
+        ts,
+        step_ts: stepTs ?? ts,
+        key_id: HUB_KEY_ID,
+        sig,
+        payload_raw: payloadRaw,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Best-effort trace for a sign failure (§6.4). Never carries the secret. */
+  private async traceSignFailed(deviceId: string, step: Record<string, unknown>): Promise<void> {
+    try {
+      const device = await getDevice(this.env.DB, deviceId);
+      if (!device) return;
+      await insertTrace(this.env.DB, device.tenant_id, deviceId, "step_sign_failed", {
+        job_id: typeof step.job_id === "string" ? step.job_id : null,
+      });
+    } catch {
+      // tracing must never break dispatch
+    }
+  }
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -103,13 +194,31 @@ export class JarvisHub extends DurableObject<Env> {
   }
 
   private async flushPending(ws: WebSocket): Promise<void> {
-    const rows = [...this.sql().exec("SELECT id, payload FROM pending_steps ORDER BY id ASC").toArray()] as {
+    const deviceId = this.authenticatedDeviceId ?? this.expectedDeviceId;
+    if (!deviceId) return;
+    const rows = [
+      ...this.sql().exec("SELECT id, payload, created_at FROM pending_steps ORDER BY id ASC").toArray(),
+    ] as {
       id: number;
       payload: string;
+      created_at: number;
     }[];
     for (const row of rows) {
+      let step: Record<string, unknown>;
       try {
-        ws.send(JSON.stringify({ type: "EXECUTE_STEP", step: JSON.parse(row.payload) }));
+        step = JSON.parse(row.payload) as Record<string, unknown>;
+      } catch {
+        return; // corrupt row — stop flushing; rows stay for next connect
+      }
+      // M-4: sign at send time; step_ts = first dispatch (row created_at).
+      // Sign-fail -> STOP, leave the row (retry next HELLO). Never send unsigned.
+      const envelope = await this.signStepEnvelope(deviceId, step, row.created_at);
+      if (!envelope) {
+        await this.traceSignFailed(deviceId, step);
+        return;
+      }
+      try {
+        ws.send(JSON.stringify(envelope));
       } catch {
         return; // socket dead — stop flushing; rows stay for next connect
       }
@@ -117,22 +226,30 @@ export class JarvisHub extends DurableObject<Env> {
     }
   }
 
-  private async queueOrSend(step: Record<string, unknown>): Promise<boolean> {
-    const payload = JSON.stringify(step);
-    for (const ws of this.sockets) {
-      try {
-        ws.send(JSON.stringify({ type: "EXECUTE_STEP", step }));
-        return true;
-      } catch {
-        // fall through to queue
+  private async queueOrSend(step: Record<string, unknown>, deviceId: string): Promise<boolean> {
+    // M-4: live send is signed at send time. Sign-fail -> queue the step
+    // (it stays queued for a later HELLO flush) + trace; never send unsigned.
+    if (this.sockets.size > 0) {
+      const envelope = await this.signStepEnvelope(deviceId, step, null);
+      if (!envelope) {
+        await this.traceSignFailed(deviceId, step);
+      } else {
+        for (const ws of this.sockets) {
+          try {
+            ws.send(JSON.stringify(envelope));
+            return true;
+          } catch {
+            // try next socket, else fall through to queue
+          }
+        }
       }
     }
-    // No live socket: queue (max 50, oldest dropped + trace).
+    // No live socket (or send/sign failed): queue (max 50, oldest dropped + trace).
     const count = [...this.sql().exec("SELECT COUNT(*) AS n FROM pending_steps").toArray()][0] as { n: number };
     if (count.n >= MAX_PENDING_PER_DEVICE) {
       this.sql().exec("DELETE FROM pending_steps WHERE id = (SELECT MIN(id) FROM pending_steps)");
     }
-    this.sql().exec("INSERT INTO pending_steps (payload, created_at) VALUES (?, ?)", payload, Date.now());
+    this.sql().exec("INSERT INTO pending_steps (payload, created_at) VALUES (?, ?)", JSON.stringify(step), Date.now());
     return false;
   }
 
@@ -153,7 +270,7 @@ export class JarvisHub extends DurableObject<Env> {
       if (this.expectedDeviceId && body.device_id !== this.expectedDeviceId) {
         return Response.json({ error: "device_mismatch" }, { status: 400 });
       }
-      const sent = await this.queueOrSend(body.step);
+      const sent = await this.queueOrSend(body.step, body.device_id);
       return Response.json({ ok: true, sent });
     }
     // WS upgrade (Worker routes /ws/:deviceId here with x-expected-device).
@@ -211,17 +328,44 @@ export class JarvisHub extends DurableObject<Env> {
         now,
       );
       await touchDeviceSeen(this.env.DB, msg.device_id);
-      ws.send(JSON.stringify({ type: "HELLO_ACK", device_id: msg.device_id }));
+      // M-4 §4.4 HELLO_ACK bootstrap: already-paired devices get the hub
+      // public key here (first-seen store on the device; a stored key is
+      // only confirmed when key_id matches — rotation is re-pair-only).
+      // No key available (secret missing) -> fields omitted, not faked.
+      const hubKey = await this.ensureHubKey();
+      ws.send(
+        JSON.stringify({
+          type: "HELLO_ACK",
+          device_id: msg.device_id,
+          ...(hubKey ? { hub_public_key: hubKey.pubB64, key_id: HUB_KEY_ID } : {}),
+        }),
+      );
       await this.flushPending(ws);
       return;
     }
     // STEP_RESULT: trace it (D1) + ack.
     const device = await getDevice(this.env.DB, msg.device_id);
     if (device) {
+      const summary = typeof payload.summary === "string" ? payload.summary.slice(0, 200) : null;
       await insertTrace(this.env.DB, device.tenant_id, msg.device_id, "step_result", {
         ok: payload.ok ?? null,
-        summary: typeof payload.summary === "string" ? payload.summary.slice(0, 200) : null,
+        summary,
       });
+      // M-4 §6: device rejected a step on signature-verify failure ->
+      // extra trace so F-1 (cron job-pause) can find it by job_id.
+      // step_id IS the job_id for cron steps (2b-2 S5). Both device
+      // reject summaries count (bad sig + no hub key yet). The rejected
+      // step is never re-queued (it was already delivered once).
+      if (
+        summary !== null &&
+        (summary.startsWith("Hub signature verify fail") || summary.startsWith("Hub key nahi mili"))
+      ) {
+        await insertTrace(this.env.DB, device.tenant_id, msg.device_id, "step_rejected_bad_sig", {
+          job_id: typeof payload.step_id === "string" ? payload.step_id : null,
+          ok: false,
+          summary,
+        });
+      }
     }
     ws.send(JSON.stringify({ type: "ACK", id: (payload as Record<string, unknown>).step_id ?? null }));
   }

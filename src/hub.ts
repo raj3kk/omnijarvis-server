@@ -31,6 +31,7 @@ export interface Env {
   INTERNAL_SECRET?: string;
   CRON_SECRET?: string;
   KEY_ENC_SECRET?: string;
+  HUB_SIGN_SECRET?: string; // M-4: Ed25519 PKCS8 base64 — hub signs EXECUTE_STEP
   LLM_ADMIN_TOKEN?: string;
   FOUNDER_GEMINI_KEY?: string;
   ROUTER_CONFIG?: string;
@@ -44,9 +45,10 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "3b";
+const VERSION = "3b.1"; // M-4: hub signs EXECUTE_STEP (Ed25519, key hub-1) + F-1 job-pause
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
+import { getHubPublicKey } from "./crypto";
 import { handleSync, type SyncRequest } from "./sync";
 import { handleTick, type DispatchStep } from "./cron";
 import { checkRateLimit } from "./ratelimit";
@@ -194,7 +196,15 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         return json({ error: "token_invalid" }, 403);
       }
       await registerDevice(env.DB, deviceId, consumed.tenant_id, publicKey);
-      return json({ ok: true, device_id: deviceId });
+      // M-4 §4.5: pairing-time hub key delivery (device stores it in
+      // EncryptedSharedPreferences; old apps ignore the extra fields).
+      // Secret missing/invalid -> fields omitted, pairing still succeeds.
+      const hubKey = await getHubPublicKey(env);
+      return json({
+        ok: true,
+        device_id: deviceId,
+        ...(hubKey ? { hub_public_key: hubKey.publicKeyB64, key_id: hubKey.keyId } : {}),
+      });
     }
 
     // Sync proxy (paired + signed).

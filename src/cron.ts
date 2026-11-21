@@ -15,7 +15,7 @@
  * (5–30 min load par) — "exact time" ka vaada kabhi nahi.
  */
 import type { D1Like } from "./db";
-import { getDueJobs, insertTrace, markJobRun } from "./db";
+import { getDueJobs, hasRecentSigReject, insertTrace, markJobRun, pauseJob } from "./db";
 
 export interface CronEnv {
   CRON_SECRET?: string;
@@ -57,6 +57,17 @@ export async function handleTick(
   let skipped = 0;
   for (const job of jobs) {
     const jobId = String(job.id);
+    // M-4 F-1: device rejected this job's step on signature-verify
+    // failure in the last 24h -> do NOT dispatch again; pause the job
+    // (owner re-enables manually) + trace, and count it as skipped.
+    if (await hasRecentSigReject(db, jobId, nowMs)) {
+      await pauseJob(db, jobId);
+      await insertTrace(db, String(job.tenant_id), String(job.device_id), "job_paused_sig_fail", {
+        job_id: jobId,
+      });
+      skipped++;
+      continue;
+    }
     const minuteKey = cronMinuteKey(jobId, nowMs);
     const existing = await db
       .prepare("SELECT id FROM traces WHERE kind = ? AND detail LIKE ? LIMIT 1")
