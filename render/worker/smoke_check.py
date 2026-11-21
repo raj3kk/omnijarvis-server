@@ -34,8 +34,17 @@ def http_json(path: str, method: str = "GET", body: bytes | None = None,
     req = urllib.request.Request(BASE + path, data=body, method=method)
     if content_type:
         req.add_header("Content-Type", content_type)
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        # Print the error body before re-raising — the CI log is the
+        # only diagnosis for a 4xx/5xx (a bare 422 hid the real cause).
+        try:
+            print(f"HTTP {e.code} on {path}: {e.read().decode('utf-8', 'replace')[:500]}")
+        except Exception:
+            pass
+        raise
 
 
 def http_multipart(path: str, fields: dict[str, tuple[str, bytes, str]]) -> dict:

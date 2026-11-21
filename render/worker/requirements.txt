@@ -7,4 +7,8 @@ pdfplumber>=0.11,<1
 python-multipart>=0.0.9,<1
 pytesseract>=0.3,<1
 weasyprint>=60,<62
+# pydyf PINNED: WeasyPrint 61.x calls pydyf.PDF(version, identifier) —
+# pydyf >=0.11 changed the PDF() signature (TypeError) and breaks
+# write_pdf. Verified 2026-11-21: 61.2 + pydyf 0.10.0 = PDF OK.
+pydyf>=0.10,<0.11
 segno>=1.6,<2
