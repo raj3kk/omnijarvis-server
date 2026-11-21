@@ -23,6 +23,15 @@
  * - /api/browser/*: x-internal-secret (3c); device reports captcha
  *   via signed WS messages (DO), not these routes. Executor default
  *   PhoneWebView; E2B gated, Render refuses (hosting proof FAIL).
+ * - /api/skills/submit: paired device + Ed25519 signature (docs-style)
+ *   or x-internal-secret; ALWAYS quarantined, never auto-approved (3d).
+ * - /api/skills/review: x-admin-token (LLM_ADMIN_TOKEN); approve needs
+ *   a clean Render AST scan re-run + Ed25519 sign (SKILL_SIGN_SECRET).
+ * - /api/skills/library: approved-only; Free = 1 skill, Pro/Business =
+ *   full library. Quarantined skills are never listed (3d).
+ * - /api/memory/*: paired device + Ed25519 or x-internal-secret;
+ *   D1-backed vector store (JS cosine, cap 500/tenant). Qdrant is
+ *   env-gated and NOT live (account pending) — D1 fallback (3d).
  */
 import { JarvisHub } from "./do/JarvisHub";
 
@@ -36,6 +45,10 @@ export interface Env {
   KEY_ENC_SECRET?: string;
   HUB_SIGN_SECRET?: string; // M-4: Ed25519 PKCS8 base64 — hub signs EXECUTE_STEP
   LLM_ADMIN_TOKEN?: string;
+  SKILL_SIGN_SECRET?: string; // 3d: Ed25519 PKCS8 base64 — signs approved skills
+  SKILL_SIGN_PUBLIC_KEY?: string; // 3d: derived public key (clients verify)
+  QDRANT_URL?: string; // 3d: unset = qdrant_not_configured (account pending)
+  QDRANT_API_KEY?: string;
   FOUNDER_GEMINI_KEY?: string;
   ROUTER_CONFIG?: string;
   RENDER_WORKER_URL?: string;
@@ -48,10 +61,10 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "3c"; // 3c: browser agent (PhoneWebView default, E2B gated) + captcha human-assist + AWAITING_USER
+const VERSION = "3d"; // 3d: skill registry (quarantine-first + Ed25519 sign) + memory API (D1 vectors, Qdrant env-gated)
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
-import { getHubPublicKey } from "./crypto";
+import { getHubPublicKey, importPrivateKey } from "./crypto";
 import { handleSync, type SyncRequest } from "./sync";
 import { handleTick, type DispatchStep } from "./cron";
 import { checkRateLimit } from "./ratelimit";
@@ -68,6 +81,31 @@ import {
 } from "./browser";
 import { completeTurn, loadRouterConfig, routeLlm, validateGeminiKey, type RequestKind } from "./router";
 import { encryptTenantKey, importMasterKey } from "./keyvault";
+import {
+  MAX_SKILL_CODE_BYTES,
+  getSkill,
+  getSkillPublicKey,
+  getSkillSignature,
+  insertSkill,
+  insertSkillReview,
+  insertSkillSignature,
+  listApprovedSkills,
+  manifestHash,
+  newSkillId,
+  scanSkillCode,
+  setSkillStatus,
+  signSkill,
+  validateSkillManifest,
+  type SkillManifest,
+} from "./skills";
+import {
+  MAX_MEMORY_CONTENT_CHARS,
+  embedText,
+  qdrantStatus,
+  searchMemories,
+  storeMemory,
+  wipeMemories,
+} from "./memory";
 import {
   MAX_INGEST_BYTES,
   authorizeDocsRequest,
@@ -770,6 +808,324 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         }),
       );
       return json({ ok: true, task_id: taskId, status: res.status });
+    }
+
+    // --- Skill registry + memory (Phase 3, stage 3d) ---
+    // Skills: submit is ALWAYS quarantined (no auto-approve path exists);
+    // review is admin-only (LLM_ADMIN_TOKEN); approve needs a clean Render
+    // AST scan re-run + Ed25519 sign (SKILL_SIGN_SECRET). Library is
+    // approved-only (Free = 1 skill, Pro/Business = full library).
+    // Memory: D1-backed vectors (JS cosine, cap 500/tenant, FIFO evict).
+    // Qdrant is env-gated and NOT live — D1 fallback, honest errors.
+    if (path === "/api/skills/submit" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const tenant = await getTenant(env.DB, tenantId);
+      if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      const validated = validateSkillManifest(body.manifest);
+      if (!validated.ok) return json({ error: "bad_manifest", detail: validated.error }, 400);
+      const manifest = validated.manifest;
+      if (
+        typeof manifest.code === "string" &&
+        new TextEncoder().encode(manifest.code).byteLength > MAX_SKILL_CODE_BYTES
+      ) {
+        return json({ error: "code_too_large" }, 400);
+      }
+      const rl = await checkRateLimit(env, "skills", tenantId);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      const skillId = newSkillId();
+      const nowMs = Date.now();
+      await insertSkill(env.DB, {
+        id: skillId,
+        manifest: JSON.stringify(manifest),
+        submitted_by: tenantId,
+        created_at: nowMs,
+      });
+      // Advisory scan only: a pending scan never blocks the submit.
+      const scan = await scanSkillCode(env, typeof manifest.code === "string" ? manifest.code : null);
+      await insertTrace(env.DB, tenantId, auth.device_id ?? "", "skill_submit", {
+        skill_id: skillId,
+        scan_status: scan.status,
+        findings_count: scan.findings.length,
+      });
+      return json({ ok: true, skill_id: skillId, status: "quarantined", scan });
+    }
+
+    if (path === "/api/skills/review" && method === "POST") {
+      if (!env.LLM_ADMIN_TOKEN || request.headers.get("x-admin-token") !== env.LLM_ADMIN_TOKEN) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const body = await readJson(request);
+      const skillId = typeof body.skill_id === "string" ? body.skill_id : "";
+      const decision = typeof body.decision === "string" ? body.decision : "";
+      const reason = typeof body.reason === "string" ? body.reason : "";
+      const reviewer =
+        typeof body.reviewer === "string" && body.reviewer.trim() ? body.reviewer : "admin";
+      if (!skillId || (decision !== "approved" && decision !== "rejected")) {
+        return json({ error: "bad_request" }, 400);
+      }
+      if (decision === "rejected" && !reason.trim()) {
+        return json({ error: "reason_required" }, 400);
+      }
+      const rl = await checkRateLimit(env, "skills", "admin");
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      const skill = await getSkill(env.DB, skillId);
+      if (!skill) return json({ error: "skill_not_found" }, 404);
+      if (skill.status !== "quarantined") {
+        return json({ error: "skill_not_quarantined", status: skill.status }, 409);
+      }
+      let manifest: Record<string, unknown>;
+      try {
+        manifest = JSON.parse(skill.manifest) as Record<string, unknown>;
+      } catch {
+        return json({ error: "bad_manifest" }, 500);
+      }
+      if (decision === "approved") {
+        // Authoritative re-scan: approve is BLOCKED unless the scan is
+        // provably clean. Render unset -> 503 scan_unavailable.
+        const scan = await scanSkillCode(
+          env,
+          typeof manifest.code === "string" ? manifest.code : null,
+        );
+        if (scan.status === "pending") {
+          return json({ error: "scan_unavailable", detail: scan.error ?? undefined }, 503);
+        }
+        if (scan.status === "findings") {
+          // Blocked attempt, NOT a decision: no review row is written,
+          // the skill stays quarantined.
+          await insertTrace(env.DB, skill.submitted_by ?? "", "", "skill_review_blocked", {
+            skill_id: skillId,
+            findings_count: scan.findings.length,
+          });
+          return json({ error: "scan_findings", findings: scan.findings }, 409);
+        }
+        if (!env.SKILL_SIGN_SECRET) {
+          return json({ error: "skill_sign_not_configured" }, 500);
+        }
+        let priv: CryptoKey;
+        try {
+          priv = await importPrivateKey(env.SKILL_SIGN_SECRET);
+        } catch {
+          return json({ error: "skill_sign_not_configured" }, 500);
+        }
+        const hash = await manifestHash(manifest as unknown as SkillManifest);
+        const signature = await signSkill(priv, skillId, hash);
+        const publicKey = await getSkillPublicKey(env);
+        if (!publicKey) return json({ error: "skill_sign_not_configured" }, 500);
+        const nowMs = Date.now();
+        await insertSkillSignature(env.DB, {
+          skill_id: skillId,
+          signature,
+          public_key: publicKey,
+          signed_at: nowMs,
+        });
+        await setSkillStatus(env.DB, skillId, "approved");
+        await insertSkillReview(env.DB, {
+          skill_id: skillId,
+          reviewer,
+          decision: "approved",
+          reason,
+          created_at: nowMs,
+        });
+        await insertTrace(env.DB, skill.submitted_by ?? "", "", "skill_review", {
+          skill_id: skillId,
+          decision: "approved",
+        });
+        return json({ ok: true, skill_id: skillId, status: "approved", signature, public_key: publicKey });
+      }
+      const nowMs = Date.now();
+      await setSkillStatus(env.DB, skillId, "rejected");
+      await insertSkillReview(env.DB, {
+        skill_id: skillId,
+        reviewer,
+        decision: "rejected",
+        reason,
+        created_at: nowMs,
+      });
+      await insertTrace(env.DB, skill.submitted_by ?? "", "", "skill_review", {
+        skill_id: skillId,
+        decision: "rejected",
+      });
+      return json({ ok: true, skill_id: skillId, status: "rejected" });
+    }
+
+    if (path === "/api/skills/library" && method === "GET") {
+      const tenantId = url.searchParams.get("tenant_id") ?? "";
+      // GET has no body: the signed payload is the frozen string
+      // `library:<tenant_id>` (docs-style Ed25519, or internal-secret).
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? "",
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: `library:${tenantId}`,
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const resolvedTenant = auth.tenant_id ?? tenantId;
+      if (!resolvedTenant) return json({ error: "bad_request" }, 400);
+      if (auth.tenant_id && tenantId && auth.tenant_id !== tenantId) {
+        return json({ error: "forbidden" }, 403);
+      }
+      const tenant = await getTenant(env.DB, resolvedTenant);
+      if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      const rl = await checkRateLimit(env, "skills", resolvedTenant);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      const approved = await listApprovedSkills(env.DB);
+      // D2 plan cap: Free = first 1 approved skill; Pro/Business = library.
+      const capped = tenant.plan_tier === "free" ? approved.slice(0, 1) : approved;
+      const skills: Array<Record<string, unknown>> = [];
+      for (const s of capped) {
+        let manifestObj: unknown;
+        try {
+          manifestObj = JSON.parse(s.manifest);
+        } catch {
+          await insertTrace(env.DB, resolvedTenant, "", "skill_library_skip", { skill_id: s.id });
+          continue;
+        }
+        const sig = await getSkillSignature(env.DB, s.id);
+        skills.push({
+          id: s.id,
+          manifest: manifestObj,
+          status: s.status,
+          signature: sig?.signature ?? null,
+          public_key: sig?.public_key ?? (await getSkillPublicKey(env)),
+        });
+      }
+      return json({ ok: true, plan_tier: tenant.plan_tier, skills, count: skills.length });
+    }
+
+    if (path === "/api/memory/store" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const content = typeof body.content === "string" ? body.content : "";
+      if (!content.trim()) return json({ error: "content_required" }, 400);
+      if (content.length > MAX_MEMORY_CONTENT_CHARS) return json({ error: "content_too_long" }, 400);
+      const kind = typeof body.kind === "string" && body.kind.trim() ? body.kind : "fact";
+      const tenant = await getTenant(env.DB, tenantId);
+      if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      const rl = await checkRateLimit(env, "memory", tenantId);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      const emb = await embedText(
+        {
+          db: env.DB,
+          masterKeyB64: env.KEY_ENC_SECRET,
+          founderKey: env.FOUNDER_GEMINI_KEY,
+          config: loadRouterConfig(env),
+        },
+        tenantId,
+        content,
+        `mem-${Date.now()}`,
+      );
+      if (!emb.ok) {
+        const status =
+          emb.error_code === "byok_required"
+            ? 402
+            : emb.error_code === "tenant_not_found"
+              ? 404
+              : 502;
+        return json({ error: emb.error_code, detail: emb.error }, status);
+      }
+      const memoryId = await storeMemory(env.DB, tenantId, content, kind, emb.embedding);
+      await insertTrace(env.DB, tenantId, auth.device_id ?? "", "memory_store", {
+        memory_id: memoryId,
+        kind,
+      });
+      return json({ ok: true, memory_id: memoryId, kind });
+    }
+
+    if (path === "/api/memory/search" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const query = typeof body.query === "string" ? body.query : "";
+      if (!query.trim()) return json({ error: "query_required" }, 400);
+      const topK =
+        typeof body.top_k === "number" && Number.isFinite(body.top_k)
+          ? Math.min(20, Math.max(1, Math.floor(body.top_k)))
+          : 5;
+      const tenant = await getTenant(env.DB, tenantId);
+      if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      const rl = await checkRateLimit(env, "memory", tenantId);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      const emb = await embedText(
+        {
+          db: env.DB,
+          masterKeyB64: env.KEY_ENC_SECRET,
+          founderKey: env.FOUNDER_GEMINI_KEY,
+          config: loadRouterConfig(env),
+        },
+        tenantId,
+        query,
+        `mem-${Date.now()}`,
+      );
+      if (!emb.ok) {
+        const status =
+          emb.error_code === "byok_required"
+            ? 402
+            : emb.error_code === "tenant_not_found"
+              ? 404
+              : 502;
+        return json({ error: emb.error_code, detail: emb.error }, status);
+      }
+      const results = await searchMemories(env.DB, tenantId, emb.embedding, topK);
+      return json({ ok: true, results });
+    }
+
+    if (path === "/api/memory/wipe" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const tenant = await getTenant(env.DB, tenantId);
+      if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      const rl = await checkRateLimit(env, "memory", tenantId);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      const deleted = await wipeMemories(env.DB, tenantId);
+      const q = qdrantStatus(env);
+      return json({ ok: true, deleted, qdrant: q.configured ? "configured" : "not_configured" });
     }
 
     // WS upgrade -> DO (paired-device check first).

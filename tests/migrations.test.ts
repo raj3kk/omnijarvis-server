@@ -155,3 +155,47 @@ describe("D1 migration 0005 (browser agent: browser_tasks + AWAITING_USER)", () 
     expect(code.toLowerCase()).not.toContain("supabase");
   });
 });
+
+const SQL6 = readFileSync(
+  new URL("../d1/migrations/0006_skills.sql", import.meta.url),
+  "utf8",
+);
+
+describe("D1 migration 0006 (skill registry: skill_reviews + skill_signatures + memories)", () => {
+  it("creates skill_reviews with the 3d §2a columns + decision CHECK", () => {
+    expect(SQL6).toContain("CREATE TABLE IF NOT EXISTS skill_reviews (");
+    for (const col of ["id INTEGER PRIMARY KEY AUTOINCREMENT", "skill_id TEXT NOT NULL", "reviewer TEXT NOT NULL", "decision TEXT NOT NULL", "reason TEXT", "created_at INTEGER NOT NULL"]) {
+      expect(SQL6).toContain(col);
+    }
+    expect(SQL6).toContain("CHECK (decision IN ('approved', 'rejected'))");
+    expect(SQL6).toContain("idx_skill_reviews_skill ON skill_reviews(skill_id, created_at)");
+  });
+
+  it("creates skill_signatures keyed by skill_id", () => {
+    expect(SQL6).toContain("CREATE TABLE IF NOT EXISTS skill_signatures (");
+    for (const col of ["skill_id TEXT PRIMARY KEY", "signature TEXT NOT NULL", "public_key TEXT NOT NULL", "signed_at INTEGER NOT NULL"]) {
+      expect(SQL6).toContain(col);
+    }
+  });
+
+  it("creates memories with the 3d §2a columns + tenant index", () => {
+    expect(SQL6).toContain("CREATE TABLE IF NOT EXISTS memories (");
+    for (const col of ["id INTEGER PRIMARY KEY AUTOINCREMENT", "tenant_id TEXT NOT NULL", "content TEXT NOT NULL", "embedding TEXT", "kind TEXT NOT NULL DEFAULT 'fact'", "created_at INTEGER NOT NULL"]) {
+      expect(SQL6).toContain(col);
+    }
+    expect(SQL6).toContain("idx_memories_tenant ON memories(tenant_id, created_at)");
+  });
+
+  it("documents the 0005 collision (this file is 0006, not 0005)", () => {
+    expect(SQL6).toContain("0006");
+    expect(SQL6).toContain("0005 was taken by 3c");
+  });
+
+  it("is non-destructive: no DROP TABLE / TRUNCATE / DELETE FROM, no Supabase refs", () => {
+    const code = SQL6.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(code).not.toMatch(/DROP\s+TABLE/i);
+    expect(code).not.toMatch(/TRUNCATE/i);
+    expect(code).not.toMatch(/DELETE\s+FROM/i);
+    expect(code.toLowerCase()).not.toContain("supabase");
+  });
+});
