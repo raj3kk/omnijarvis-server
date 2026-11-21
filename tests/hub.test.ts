@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { handleRequest, route, type Env } from "../src/hub";
 import { FakeD1 } from "./fake-d1";
-import { deriveSixDigit } from "../src/pairing";
+import { deriveSixDigit, deriveTenantId } from "../src/pairing";
 
 function fakeEnv(db: FakeD1, overrides: Partial<Env> = {}): Env {
   return {
@@ -74,6 +74,47 @@ describe("handleRequest (2a-2 routes)", () => {
     expect(typeof body.token).toBe("string");
     expect(String(body.code)).toMatch(/^\d{6}$/);
     expect(body.code).toBe(await deriveSixDigit(String(body.token)));
+  });
+
+  it("pairing init: no tenant_id -> 200, derived lic- tenant (2b-1)", async () => {
+    const db = new FakeD1();
+    stubLicences([{ key: "L-1", status: "active" }]);
+    const res = await handleRequest(
+      new Request("https://hub/api/pairing/init", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_id: "dev-1", licence_key: "L-1" }),
+      }),
+      fakeEnv(db),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    const row = await db
+      .prepare("SELECT tenant_id FROM pairing_tokens WHERE token = ?")
+      .bind(String(body.token))
+      .first<{ tenant_id: string }>();
+    expect(row?.tenant_id).toBe(await deriveTenantId("L-1"));
+    expect(row?.tenant_id.startsWith("lic-")).toBe(true);
+  });
+
+  it("pairing init: supplied tenant_id is kept (2b-1)", async () => {
+    const db = new FakeD1();
+    stubLicences([{ key: "L-1", status: "active" }]);
+    const res = await handleRequest(
+      new Request("https://hub/api/pairing/init", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_id: "dev-1", tenant_id: "t-9", licence_key: "L-1" }),
+      }),
+      fakeEnv(db),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    const row = await db
+      .prepare("SELECT tenant_id FROM pairing_tokens WHERE token = ?")
+      .bind(String(body.token))
+      .first<{ tenant_id: string }>();
+    expect(row?.tenant_id).toBe("t-9");
   });
 
   it("pairing init: revoked licence -> 403 licence_invalid", async () => {

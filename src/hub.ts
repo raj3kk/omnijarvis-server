@@ -33,9 +33,9 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "2a-4";
+const VERSION = "2b-1";
 
-import { consumePairingToken, deriveSixDigit, issuePairingToken, registerDevice } from "./pairing";
+import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { handleSync, type SyncRequest } from "./sync";
 import { handleTick, type DispatchStep } from "./cron";
 import { checkRateLimit } from "./ratelimit";
@@ -133,7 +133,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const deviceId = typeof body.device_id === "string" ? body.device_id : "";
       const tenantId = typeof body.tenant_id === "string" ? body.tenant_id : "";
       const licenceKey = typeof body.licence_key === "string" ? body.licence_key : "";
-      if (!deviceId || !tenantId || !licenceKey) return json({ error: "bad_request" }, 400);
+      if (!deviceId || !licenceKey) return json({ error: "bad_request" }, 400);
       let licensed = false;
       try {
         licensed = await verifyLicenceKey(env, licenceKey);
@@ -142,7 +142,10 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         throw e;
       }
       if (!licensed) return json({ error: "licence_invalid" }, 403);
-      const issued = await issuePairingToken(env.DB, deviceId, tenantId);
+      // 2b-1: tenant_id is OPTIONAL — the app cannot know it (licences
+      // has no tenant_id). Derive a stable D1-local label when absent.
+      const resolvedTenantId = tenantId || (await deriveTenantId(licenceKey));
+      const issued = await issuePairingToken(env.DB, deviceId, resolvedTenantId);
       return json({ ok: true, token: issued.token, code: issued.code, expires_at: issued.expiresAt });
     }
 
