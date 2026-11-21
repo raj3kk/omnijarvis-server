@@ -33,14 +33,14 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "2a-2";
+const VERSION = "2a-4";
 
 import { consumePairingToken, deriveSixDigit, issuePairingToken, registerDevice } from "./pairing";
 import { handleSync, type SyncRequest } from "./sync";
 import { handleTick, type DispatchStep } from "./cron";
 import { checkRateLimit } from "./ratelimit";
 import { getDevice } from "./db";
-import { verifyLicenceKey, SupabaseMissing, SupabaseSchemaPending } from "./supabase";
+import { verifyLicenceKey, supabaseSelect, SupabaseMissing, SupabaseSchemaPending } from "./supabase";
 
 /**
  * Pure route dispatch for health/status/404 (no env access) — vitest
@@ -83,8 +83,46 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   try {
     // Public: status + health (pure route()).
     if (path === "/" || path === "/health") return route(path);
+    // Keep-alive probe (2a-4): REAL checks, not a static ok.
+    // - D1: device count (the Worker's core store) — `ok` reflects D1
+    //   only; a D1 failure fails the keepalive-check workflow.
+    // - Supabase: tenants readable via service key — state reported
+    //   (ok / schema_pending / not_configured / error), NOT fatal here:
+    //   until B-A lands it is `not_configured` by design, and the
+    //   workflow's direct anon-key check (when secrets exist) is the
+    //   one that fails on a real Supabase outage.
     if (path === "/api/keepalive" && method === "GET") {
-      return json({ ok: true, service: SERVICE, version: VERSION, time: Date.now() });
+      let d1Ok = false;
+      let devices = 0;
+      try {
+        const count = await env.DB
+          .prepare("SELECT COUNT(*) AS n FROM devices")
+          .bind()
+          .first<{ n: number }>();
+        d1Ok = typeof count?.n === "number";
+        devices = typeof count?.n === "number" ? count.n : 0;
+      } catch {
+        d1Ok = false;
+      }
+      let supabaseState = "not_configured";
+      try {
+        await supabaseSelect(env, "tenants", "select=id&limit=1");
+        supabaseState = "ok";
+      } catch (e) {
+        if (e instanceof SupabaseSchemaPending) supabaseState = "schema_pending";
+        else if (e instanceof SupabaseMissing) supabaseState = "not_configured";
+        else supabaseState = "error";
+      }
+      return json({
+        ok: d1Ok,
+        service: SERVICE,
+        version: VERSION,
+        time: Date.now(),
+        checks: {
+          d1: { ok: d1Ok, devices },
+          supabase: { state: supabaseState },
+        },
+      });
     }
 
     // Pairing: init (licence-verified, rate-limited).

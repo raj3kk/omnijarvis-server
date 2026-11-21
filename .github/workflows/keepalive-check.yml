@@ -1,0 +1,75 @@
+# Keep-alive check — REAL queries, roz ek baar. Koi silent pass nahi:
+# - Hub keepalive (D1 + Supabase state, server-side): D1 fail = workflow FAIL.
+# - Supabase direct (anon key + RLS): sirf tab chalta hai jab SUPABASE_URL +
+#   SUPABASE_ANON_KEY secrets set hon; nahi to visible warning step.
+# - Qdrant: sirf tab chalta hai jab QDRANT_URL + QDRANT_API_KEY secrets set
+#   hon (1 test vector upsert → query → delete — cluster active rehta hai);
+#   nahi to visible warning step.
+# Secrets parent ko set karne hain (dashboard/API se) — workflow unke bina
+# bhi chalta hai aur summary me saaf likhta hai kya skip hua.
+name: keepalive-check
+
+on:
+  schedule:
+    - cron: "30 3 * * *" # daily 03:30 UTC, heartbeat commit ke baad
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hub keepalive (D1 + Supabase state, server-side)
+        run: |
+          set -e
+          body=$(curl -s --max-time 30 "https://omnijarvis-hub.rajraj3kk.workers.dev/api/keepalive")
+          echo "$body"
+          ok=$(echo "$body" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))")
+          state=$(echo "$body" | python3 -c "import sys,json; print(json.load(sys.stdin)['checks']['supabase']['state'])")
+          echo "supabase state: $state"
+          if [ "$state" != "ok" ]; then
+            echo "::warning::Supabase state is '$state' (B-A: service key / schemas pending — see AUDIT_2a-3)."
+          fi
+          if [ "$ok" != "True" ]; then echo "HUB KEEPALIVE FAILED (D1)"; exit 1; fi
+
+      - name: Supabase direct check (anon key + RLS)
+        if: ${{ secrets.SUPABASE_URL != '' && secrets.SUPABASE_ANON_KEY != '' }}
+        run: |
+          set -e
+          code=$(curl -s -o /tmp/tenants.json -w "%{http_code}" --max-time 30 \
+            "${{ secrets.SUPABASE_URL }}/rest/v1/tenants?select=id&limit=1" \
+            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}")
+          echo "tenants HTTP $code: $(cat /tmp/tenants.json)"
+          [ "$code" = "200" ] || { echo "SUPABASE DIRECT CHECK FAILED"; exit 1; }
+
+      - name: Supabase direct check skipped (no secrets)
+        if: ${{ secrets.SUPABASE_URL == '' || secrets.SUPABASE_ANON_KEY == '' }}
+        run: 'echo "::warning::SUPABASE direct check SKIPPED — SUPABASE_URL / SUPABASE_ANON_KEY secrets not set (parent: Supabase dashboard → Settings → API)."'
+
+      - name: Qdrant check (upsert → query → delete)
+        if: ${{ secrets.QDRANT_URL != '' && secrets.QDRANT_API_KEY != '' }}
+        run: |
+          set -e
+          H1="api-key: ${{ secrets.QDRANT_API_KEY }}"
+          H2="Content-Type: application/json"
+          # Collection banani ho to banao (exists ho to 409 — theek hai).
+          curl -s -o /dev/null -w "create collection HTTP %{http_code}\n" --max-time 30 \
+            -X PUT "${{ secrets.QDRANT_URL }}/collections/keepalive" -H "$H1" -H "$H2" \
+            -d '{"vectors":{"size":4,"distance":"Cosine"}}'
+          curl -s -o /dev/null -w "upsert HTTP %{http_code}\n" --max-time 30 \
+            -X PUT "${{ secrets.QDRANT_URL }}/collections/keepalive/points" -H "$H1" -H "$H2" \
+            -d '{"points":[{"id":1,"vector":[0.1,0.2,0.3,0.4],"payload":{"check":"keepalive"}}]}'
+          body=$(curl -s --max-time 30 -X POST "${{ secrets.QDRANT_URL }}/collections/keepalive/points/search" \
+            -H "$H1" -H "$H2" -d '{"vector":[0.1,0.2,0.3,0.4],"limit":1}')
+          echo "search: $body"
+          echo "$body" | grep -q '"id":1' || { echo "QDRANT SEARCH FAILED"; exit 1; }
+          curl -s -o /dev/null -w "delete HTTP %{http_code}\n" --max-time 30 \
+            -X POST "${{ secrets.QDRANT_URL }}/collections/keepalive/points/delete" -H "$H1" -H "$H2" \
+            -d '{"points":[1]}'
+
+      - name: Qdrant check skipped (no secrets)
+        if: ${{ secrets.QDRANT_URL == '' || secrets.QDRANT_API_KEY == '' }}
+        run: 'echo "::warning::QDRANT check SKIPPED — QDRANT_URL / QDRANT_API_KEY secrets not set (parent: Qdrant Cloud free account)."'

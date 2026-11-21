@@ -1,0 +1,27 @@
+# Keep-alive daily commit — repo active rehta hai (GitHub Actions scheduled
+# workflows 60 din bina activity ke auto-disable ho jate hain; roz ka ek
+# chhota commit isey rokta hai). Sirf heartbeat.md badalta hai — koi code
+# nahi, koi deploy nahi. Commit message me kabhi "[skip ci]" nahi.
+name: keepalive-daily
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # daily 03:00 UTC (~08:30 IST)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update heartbeat
+        run: |
+          date -u +"last heartbeat: %Y-%m-%dT%H:%M:%SZ" > heartbeat.md
+          git config user.name "omnijarvis-keepalive"
+          git config user.email "keepalive@omnijarvis.local"
+          git add heartbeat.md
+          git diff --cached --quiet || git commit -m "keepalive: daily heartbeat"
+          git push

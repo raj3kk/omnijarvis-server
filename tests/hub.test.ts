@@ -212,3 +212,57 @@ describe("handleRequest (2a-2 routes)", () => {
     expect(res.status).toBe(404);
   });
 });
+
+describe("keepalive probe (2a-4: real checks)", () => {
+  it("empty D1 + no Supabase key -> ok:true, d1.devices 0, supabase not_configured", async () => {
+    const db = new FakeD1();
+    const env = fakeEnv(db, { SUPABASE_URL: undefined, SUPABASE_SERVICE_ROLE_KEY: undefined });
+    const res = await handleRequest(new Request("https://hub/api/keepalive"), env);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, any>;
+    expect(body.ok).toBe(true);
+    expect(body.checks.d1.ok).toBe(true);
+    expect(body.checks.d1.devices).toBe(0);
+    expect(body.checks.supabase.state).toBe("not_configured");
+  });
+
+  it("one device in D1 -> d1.devices 1", async () => {
+    const db = new FakeD1();
+    await db
+      .prepare(
+        "INSERT INTO devices (device_id, tenant_id, public_key, paired_at, last_seen, enabled) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .bind("dev-1", "t-1", "key", Date.now(), Date.now(), 1)
+      .run();
+    const env = fakeEnv(db, { SUPABASE_URL: undefined, SUPABASE_SERVICE_ROLE_KEY: undefined });
+    const res = await handleRequest(new Request("https://hub/api/keepalive"), env);
+    const body = (await res.json()) as Record<string, any>;
+    expect(body.checks.d1.devices).toBe(1);
+  });
+
+  it("Supabase tenants readable -> supabase ok", async () => {
+    const db = new FakeD1();
+    vi.stubGlobal(
+      "fetch",
+      async (url: string) => {
+        if (url.includes("/rest/v1/tenants")) {
+          return new Response("[]", { status: 200 });
+        }
+        return new Response("{}", { status: 200 });
+      },
+    );
+    const res = await handleRequest(new Request("https://hub/api/keepalive"), fakeEnv(db));
+    const body = (await res.json()) as Record<string, any>;
+    expect(body.ok).toBe(true);
+    expect(body.checks.supabase.state).toBe("ok");
+  });
+
+  it("Supabase tenants table missing (404) -> supabase schema_pending, ok still true (D1)", async () => {
+    const db = new FakeD1();
+    vi.stubGlobal("fetch", async () => new Response("{}", { status: 404 }));
+    const res = await handleRequest(new Request("https://hub/api/keepalive"), fakeEnv(db));
+    const body = (await res.json()) as Record<string, any>;
+    expect(body.ok).toBe(true);
+    expect(body.checks.supabase.state).toBe("schema_pending");
+  });
+});

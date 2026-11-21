@@ -1,0 +1,37 @@
+# Cron dispatcher — ticks the hub every 5 minutes so due scheduled_jobs fire.
+#
+# Jitter is EXPECTED (GitHub Actions best-effort delays 5–30 min under load):
+# "exact time" ka vaada kabhi nahi. Tick handler idempotency (job + minute)
+# D1 traces se karta hai — double-fire safe hai.
+#
+# Secret: CRON_SECRET (GitHub repo secret; Worker secret me SAME value —
+# deploy script se set hota hai). Value kabhi log me nahi aati.
+# 503 schema_pending/config_missing = known-gated state (B-A/B-C: Supabase
+# abhi wired nahi) — log + pass, failure noise nahi. 401/429/5xx = real fail.
+name: cron-dispatcher
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tick the hub
+        run: |
+          set -e
+          code=$(curl -s -o /tmp/tick.json -w "%{http_code}" --max-time 30 \
+            -X POST "https://omnijarvis-hub.rajraj3kk.workers.dev/api/cron/tick" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}")
+          echo "tick HTTP $code: $(cat /tmp/tick.json)"
+          if [ "$code" = "200" ]; then exit 0; fi
+          if [ "$code" = "503" ] && grep -Eq "schema_pending|config_missing" /tmp/tick.json; then
+            echo "GATED (B-A/B-C): Supabase not wired yet — skipping, not a failure."
+            exit 0
+          fi
+          echo "tick failed (HTTP $code)"; exit 1
