@@ -16,6 +16,8 @@
  * - /api/cron/tick: x-cron-secret (constant-time compare).
  * - /ws/:deviceId: paired-device check, then DO (x-expected-device).
  * - /dispatch is DO-internal (x-internal-secret) — not exposed here.
+ * - /api/llm/route + /api/llm/turn-complete: x-internal-secret (server-to-server).
+ * - /api/tenants/:id/key(+status): x-admin-token (LLM_ADMIN_TOKEN).
  */
 import { JarvisHub } from "./do/JarvisHub";
 
@@ -26,6 +28,10 @@ export interface Env {
   DB: D1Database;
   INTERNAL_SECRET?: string;
   CRON_SECRET?: string;
+  KEY_ENC_SECRET?: string;
+  LLM_ADMIN_TOKEN?: string;
+  FOUNDER_GEMINI_KEY?: string;
+  ROUTER_CONFIG?: string;
   UPSTASH_REDIS_REST_URL?: string;
   UPSTASH_REDIS_REST_TOKEN?: string;
   LANGFUSE_PUBLIC_KEY?: string;
@@ -35,13 +41,15 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "2b-1-d1";
+const VERSION = "3a";
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { handleSync, type SyncRequest } from "./sync";
 import { handleTick, type DispatchStep } from "./cron";
 import { checkRateLimit } from "./ratelimit";
-import { getDevice, verifyLicenceKey } from "./db";
+import { getDevice, getTenant, verifyLicenceKey } from "./db";
+import { completeTurn, loadRouterConfig, routeLlm, validateGeminiKey, type RequestKind } from "./router";
+import { encryptTenantKey, importMasterKey } from "./keyvault";
 
 /**
  * Pure route dispatch for health/status/404 (no env access) — vitest
@@ -203,6 +211,115 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const result = await handleTick(env.DB, env, request.headers.get("x-cron-secret"), dispatch);
       if (!result.ok && result.error === "unauthorized") return json({ error: "unauthorized" }, 401);
       return json(result);
+    }
+
+    // LLM router (Phase 3, stage 3a) — internal-secret gated, server-to-server only.
+    // The phone never calls this directly; hub-internal callers (doc pipeline,
+    // browser agent, cron-driven agent steps) call routeLlm() as a function
+    // or via this route with the internal secret.
+    if (path === "/api/llm/route" && method === "POST") {
+      if (!env.INTERNAL_SECRET || request.headers.get("x-internal-secret") !== env.INTERNAL_SECRET) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const body = await readJson(request);
+      const tenantId = typeof body.tenant_id === "string" ? body.tenant_id : "";
+      const rl = await checkRateLimit(env, "llmRoute", tenantId || clientIp(request));
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      let config;
+      try {
+        config = loadRouterConfig(env);
+      } catch {
+        return json({ error: "router_config_error" }, 500);
+      }
+      const result = await routeLlm(
+        {
+          db: env.DB,
+          masterKeyB64: env.KEY_ENC_SECRET,
+          founderKey: env.FOUNDER_GEMINI_KEY,
+          config,
+        },
+        {
+          tenant_id: tenantId,
+          device_id: typeof body.device_id === "string" ? body.device_id : undefined,
+          turn_id: typeof body.turn_id === "string" ? body.turn_id : "",
+          kind: (typeof body.kind === "string" ? body.kind : "quick_command") as RequestKind,
+          messages: Array.isArray(body.messages) ? body.messages : [],
+          system: typeof body.system === "string" ? body.system : undefined,
+          response_schema:
+            body.response_schema && typeof body.response_schema === "object"
+              ? (body.response_schema as Record<string, unknown>)
+              : undefined,
+        },
+      );
+      if (result.ok) return json(result);
+      const code = result.error_code ?? "upstream_error";
+      const status =
+        code === "byok_required"
+          ? 402
+          : code === "replies_cap" || code === "turn_calls_cap" || code === "plan_docs_not_allowed"
+            ? 429
+            : code === "tenant_not_found"
+              ? 404
+              : code === "bad_request" || code === "invalid_key" || code === "live_not_routed"
+                ? 400
+                : 502;
+      return json({ error: code, detail: result.error ?? undefined }, status);
+    }
+
+    // LLM turn-complete (internal-secret gated): success => 1 reply counted.
+    if (path === "/api/llm/turn-complete" && method === "POST") {
+      if (!env.INTERNAL_SECRET || request.headers.get("x-internal-secret") !== env.INTERNAL_SECRET) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const body = await readJson(request);
+      const tenantId = typeof body.tenant_id === "string" ? body.tenant_id : "";
+      const turnId = typeof body.turn_id === "string" ? body.turn_id : "";
+      if (!tenantId || !turnId || typeof body.success !== "boolean") {
+        return json({ error: "bad_request" }, 400);
+      }
+      await completeTurn(env.DB, tenantId, turnId, body.success);
+      return json({ ok: true });
+    }
+
+    // Tenant BYOK key management (admin-token gated; LLM_ADMIN_TOKEN).
+    // Key is validated (tiny Gemini call) then AES-GCM encrypted into D1.
+    // The key value is NEVER echoed back, logged, or stored plaintext.
+    if (path.startsWith("/api/tenants/") && (path.endsWith("/key") || path.endsWith("/key-status"))) {
+      if (!env.LLM_ADMIN_TOKEN || request.headers.get("x-admin-token") !== env.LLM_ADMIN_TOKEN) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const parts = path.split("/").filter(Boolean); // api, tenants, :id, key[-status]
+      const tenantId = parts[2] ?? "";
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const tenant = await getTenant(env.DB, tenantId);
+      if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      if (method === "GET" && path.endsWith("/key-status")) {
+        return json({ ok: true, has_key: !!tenant.gemini_key_enc, billing_mode: tenant.billing_mode });
+      }
+      if (method === "DELETE" && path.endsWith("/key")) {
+        await env.DB.prepare("UPDATE tenants SET gemini_key_enc = NULL WHERE id = ?").bind(tenantId).run();
+        return json({ ok: true });
+      }
+      if (method === "POST" && path.endsWith("/key")) {
+        const body = await readJson(request);
+        const key = typeof body.gemini_key === "string" ? body.gemini_key : "";
+        const billingMode = typeof body.billing_mode === "string" ? body.billing_mode : tenant.billing_mode;
+        if (!key) return json({ error: "bad_request" }, 400);
+        if (billingMode === "founder_pays" && !env.FOUNDER_GEMINI_KEY) {
+          return json({ error: "founder_pays_not_enabled" }, 400);
+        }
+        if (!env.KEY_ENC_SECRET) return json({ error: "key_vault_not_configured" }, 500);
+        const valid = await validateGeminiKey(key);
+        if (!valid) return json({ error: "invalid_key" }, 400);
+        const master = await importMasterKey(env.KEY_ENC_SECRET);
+        const enc = await encryptTenantKey(master, key);
+        await env.DB
+          .prepare("UPDATE tenants SET gemini_key_enc = ?, billing_mode = ? WHERE id = ?")
+          .bind(enc, billingMode, tenantId)
+          .run();
+        return json({ ok: true, billing_mode: billingMode });
+      }
+      return json({ error: "not_found" }, 404);
     }
 
     // WS upgrade -> DO (paired-device check first).

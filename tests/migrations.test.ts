@@ -56,3 +56,38 @@ describe("D1 migration 0002 (Supabase port: tenants/jobs/skills + licences/patte
     expect(code).not.toMatch(/DELETE\s+FROM/i);
   });
 });
+
+const SQL3 = readFileSync(
+  new URL("../d1/migrations/0003_router.sql", import.meta.url),
+  "utf8",
+);
+
+describe("D1 migration 0003 (LLM router metering: llm_usage + tenant key/mode + counters)", () => {
+  it("creates llm_usage with the D11 §6 columns", () => {
+    expect(SQL3).toContain("CREATE TABLE IF NOT EXISTS llm_usage (");
+    for (const col of ["tenant_id TEXT NOT NULL", "turn_id TEXT NOT NULL", "model TEXT NOT NULL", "attempted_models TEXT NOT NULL", "input_tokens INTEGER NOT NULL", "output_tokens INTEGER NOT NULL", "cost_usd_micro INTEGER NOT NULL", "billing_mode TEXT NOT NULL", "status TEXT NOT NULL", "created_at INTEGER NOT NULL"]) {
+      expect(SQL3).toContain(col);
+    }
+    expect(SQL3).toContain("idx_llm_usage_tenant_time ON llm_usage(tenant_id, created_at)");
+    expect(SQL3).toContain("idx_llm_usage_turn ON llm_usage(turn_id)");
+  });
+
+  it("adds tenant key + billing_mode columns (BYOK, AES-GCM envelope)", () => {
+    expect(SQL3).toContain("ALTER TABLE tenants ADD COLUMN gemini_key_enc TEXT");
+    expect(SQL3).toContain("ALTER TABLE tenants ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'byok'");
+  });
+
+  it("adds the four LLM rollup columns to usage_counters", () => {
+    for (const col of ["llm_calls INTEGER NOT NULL DEFAULT 0", "input_tokens INTEGER NOT NULL DEFAULT 0", "output_tokens INTEGER NOT NULL DEFAULT 0", "cost_usd_micro INTEGER NOT NULL DEFAULT 0"]) {
+      expect(SQL3).toContain(`ALTER TABLE usage_counters ADD COLUMN ${col}`);
+    }
+  });
+
+  it("is non-destructive: no DROP TABLE / TRUNCATE / DELETE FROM, no Supabase refs", () => {
+    const code = SQL3.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(code).not.toMatch(/DROP\s+TABLE/i);
+    expect(code).not.toMatch(/TRUNCATE/i);
+    expect(code).not.toMatch(/DELETE\s+FROM/i);
+    expect(code.toLowerCase()).not.toContain("supabase");
+  });
+});

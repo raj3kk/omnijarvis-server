@@ -24,6 +24,7 @@ const PK: Record<string, string[]> = {
   tenants: ["id"],
   scheduled_jobs: ["id"],
   global_skills: ["id"],
+  llm_usage: ["id"],
 };
 
 export class FakeD1 implements D1Like {
@@ -104,6 +105,11 @@ class FakePrepared implements D1PreparedLike {
       row.id = next;
     }
     if (table === "pending_steps" && row.id === undefined) {
+      const next = (this.db["autoInc"].get(table) ?? 0) + 1;
+      this.db["autoInc"].set(table, next);
+      row.id = next;
+    }
+    if (table === "llm_usage" && row.id === undefined) {
       const next = (this.db["autoInc"].get(table) ?? 0) + 1;
       this.db["autoInc"].set(table, next);
       row.id = next;

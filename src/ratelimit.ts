@@ -26,6 +26,7 @@ export const RATE_LIMITS: Record<string, { limit: number; windowMs: number }> = 
   pairingInit: { limit: 10, windowMs: 60_000 },
   pairingRegister: { limit: 10, windowMs: 60_000 },
   sync: { limit: 120, windowMs: 60_000 },
+  llmRoute: { limit: 60, windowMs: 60_000 },
 };
 
 export interface RateLimitResult {
