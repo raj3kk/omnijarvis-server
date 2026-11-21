@@ -1,0 +1,7 @@
+# OmniJarvis Render light worker (2a-5) — health + /smoke/pdf only.
+# Light stack (audit V2: the only combo that fits Render free 512 MB).
+# Pinned to major versions for reproducible deploys.
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+pdfplumber>=0.11,<1
+python-multipart>=0.0.9,<1
