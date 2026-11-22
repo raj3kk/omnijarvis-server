@@ -229,9 +229,9 @@ describe("handleRequest (2a-2 routes, D1 licences)", () => {
     expect(body.key_id).toBeUndefined();
   });
 
-  it("GET / -> version 11 (M-I-3 Groq-only tenant path)", async () => {
+  it("GET / -> version 12 (Qdrant fixes + Retry-After + B2 bare host)", async () => {
     const body = (await route("/").json()) as Record<string, unknown>;
-    expect(body.version).toBe("11");
+    expect(body.version).toBe("12");
   });
 
   it("pairing code: derives from token", async () => {

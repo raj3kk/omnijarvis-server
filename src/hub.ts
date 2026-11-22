@@ -111,7 +111,7 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "11"; // 11: M-I-3 Groq-only tenant path (router: Gemini key no longer required when a Groq key exists); 10 was FCM push
+const VERSION = "12"; // 12: R-15 Qdrant fixes (integer point id + tenant_id index) + Retry-After on 429s + b2Region bare hostname; 11 was M-I-3 Groq-only
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";
