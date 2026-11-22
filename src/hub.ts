@@ -110,10 +110,11 @@ export interface Env {
   B2_APPLICATION_KEY?: string;
   LICENCE_ADMIN_TOKEN?: string; // M-I-28: hub calls the licence Worker generate/release with this (same value as the Worker's own secret — no new secret)
   LICENCE_WORKER_URL?: string; // M-I-28: override, default https://jarvis-licence.rajraj3kk.workers.dev
+  LICENCE_WORKER?: Fetcher; // M-I-28: service binding to jarvis-licence (see licenceWorkerCall — workers.dev subrequests 1042)
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "14"; // 14: M-I-28 self-serve licence web UI; 13 was M-I-30 in-app cron
+const VERSION = "15"; // 15: M-I-28 service binding (workers.dev subrequest 1042 fix); 14 was the licence web UI
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";
@@ -2682,13 +2683,25 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       p: string,
       body: Record<string, unknown>,
     ): Promise<{ status: number; body: Record<string, unknown> }> => {
+      // M-I-28 fix (2026-11-22, proven live with a diag Worker): a Worker
+      // subrequest to a *.workers.dev URL gets HTTP 404 "error code:
+      // 1042" on this setup while external curl gets 200 — so the hub
+      // calls the licence Worker through the LICENCE_WORKER service
+      // binding, never its public URL. The public-URL fetch below is
+      // only the fallback when the binding is absent (vitest / local
+      // dev, where the global fetch is stubbed). The admin-token header
+      // is still sent over the binding (defence in depth — the Worker
+      // checks it on every generate/release).
       let res: Response;
       try {
-        res = await fetch(`${licenceWorkerUrl}${p}`, {
+        const init: RequestInit = {
           method: "POST",
           headers: { "x-licence-admin-token": env.LICENCE_ADMIN_TOKEN ?? "", "Content-Type": "application/json" },
           body: JSON.stringify(body),
-        });
+        };
+        res = env.LICENCE_WORKER
+          ? await env.LICENCE_WORKER.fetch(`${licenceWorkerUrl}${p}`, init)
+          : await fetch(`${licenceWorkerUrl}${p}`, init);
       } catch {
         return { status: 503, body: { error: "licence_worker_unreachable" } };
       }

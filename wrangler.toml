@@ -26,3 +26,12 @@ database_id = "37a7ff24-9fd2-40f9-b122-82cdaea7e79d"
 # API schedules endpoint after deploy — this block is the source of truth.
 [triggers]
 crons = ["*/5 * * * *"]
+
+# M-I-28: licence Worker service binding — Worker -> workers.dev
+# subrequests 1042 on this setup (proven 2026-11-22 with a diag Worker),
+# so the hub calls the licence Worker through this binding, not its
+# public URL. deploy_omnijarvis_hub.py must ALSO set this binding in
+# the Scripts API metadata (it does not read this file).
+[[services]]
+binding = "LICENCE_WORKER"
+service = "jarvis-licence"

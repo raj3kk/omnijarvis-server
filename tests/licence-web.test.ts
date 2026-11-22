@@ -482,6 +482,65 @@ describe("POST /api/licence-web/generate + release (licence Worker proxy)", () =
     expect((g2.body.licence as Record<string, unknown>).key_masked).toBe("JARVIS-AAAA-••••-••••-DDDD");
   });
 
+  it("generate uses the LICENCE_WORKER service binding when present (no public-URL fetch)", async () => {
+    const db = new FakeD1();
+    // Global fetch handles Resend but THROWS on any licence-Worker URL —
+    // proving the hub never fetches the public URL when bound.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url.includes("api.resend.com")) {
+          return new Response(JSON.stringify({ id: "re_test123" }), { status: 200 });
+        }
+        throw new Error("public licence-Worker fetch must not happen: " + url);
+      }),
+    );
+    const bindingCalls: { url: string; token: string }[] = [];
+    const bindingFetch = async (url: string, init?: RequestInit) => {
+      bindingCalls.push({ url, token: (init?.headers as Record<string, string>)["x-licence-admin-token"] ?? "" });
+      return new Response(
+        JSON.stringify({ ok: true, existing: false, licence: { key: "JARVIS-BIND-1111-2222-3333", user_id: "bind@example.com", device_id: null, status: "active", created_at: NOW } }),
+        { status: 200 },
+      );
+    };
+    // Signup + verify go through the resend stub (no binding involved).
+    const f = { lastResendHtml: () => null as string | null };
+    void f;
+    const email = "bind@example.com";
+    const s = await call(db, "/api/licence-web/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email }),
+    });
+    expect(s.status).toBe(200);
+    // The code went to the resend stub — but the stub above drops the
+    // body, so verify via a D1-seeded code (same shape the route writes).
+    const { hashEmailCode: hashCode } = await import("../src/licence-web");
+    await db.prepare("DELETE FROM licence_email_codes WHERE email = ? AND purpose = ?").bind(email, "signup").run();
+    await db
+      .prepare("INSERT INTO licence_email_codes (email, purpose, code_hash, expires_at, attempts, created_at) VALUES (?, ?, ?, ?, 0, ?)")
+      .bind(email, "signup", await hashCode("123456"), Date.now() + 600_000, Date.now())
+      .run();
+    const v = await call(db, "/api/licence-web/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, code: "123456", purpose: "signup" }),
+    });
+    expect(v.status).toBe(200);
+    const cookie = await cookieFor(db, v);
+    const g = await call(
+      db,
+      "/api/licence-web/generate",
+      { method: "POST", headers: { Cookie: cookie } },
+      { LICENCE_WORKER: { fetch: bindingFetch } as never },
+    );
+    expect(g.status).toBe(200);
+    expect((g.body.licence as Record<string, unknown>).key).toBe("JARVIS-BIND-1111-2222-3333");
+    expect(bindingCalls.length).toBe(1);
+    expect(bindingCalls[0].url).toBe("https://licence-worker.test/api/licence/generate");
+    expect(bindingCalls[0].token).toBe("lic-admin-test");
+  });
+
   it("generate passes through a 403 licence_revoked from the Worker verbatim", async () => {
     const db = new FakeD1();
     const f = stubFetch({ generate: { status: 403, body: { error: "licence_revoked" } } });
