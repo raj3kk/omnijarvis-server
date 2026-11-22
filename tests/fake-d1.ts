@@ -33,6 +33,9 @@ const PK: Record<string, string[]> = {
   skill_reviews: ["id"],
   skill_signatures: ["skill_id"],
   memories: ["id"],
+  // Track E #27 (0010 Google OAuth vault).
+  google_tokens: ["tenant_id"],
+  google_oauth_states: ["state"],
   // Phase 4 (0007 billing): TEXT ids, no autoInc branch needed.
   subscriptions: ["id"],
   payments: ["id"],
@@ -40,6 +43,9 @@ const PK: Record<string, string[]> = {
   ledger_events: ["id"],
   e2b_runs: ["id"],
   admin_settings: ["key"],
+  // Track C (0009 email + B2): TEXT ids.
+  email_sends: ["id"],
+  backups: ["id"],
 };
 
 export class FakeD1 implements D1Like {

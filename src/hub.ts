@@ -42,11 +42,23 @@
  *   gateway). subscribe/utr/renew/upgrade/downgrade: paired device or
  *   x-internal-secret; /admin/*: x-admin-token (LLM_ADMIN_TOKEN).
  *   Ledger = D1 batch transactions (GAP-10 fix). Caps hard-enforced.
+ *   Email: Resend (#52) — verification send at signup + renewal
+ *   reminders from the tick sweep; missing RESEND_API_KEY = honest
+ *   not_configured, never a faked send. Backups: B2 (#49) — admin
+ *   D1 export + encrypted upload + restore-test (dry-run).
  * - /api/e2b/*: E2B runs (Phase 4) — x-internal-secret; no E2B account
  *   yet (U-4) so runs honestly refuse e2b_not_configured; hold/settle/
  *   release/kill + 15-min auto-kill via the billing sweep.
  * - /api/legal/*: public Terms/Privacy/Refund pages (JSON).
  * - /api/billing/cron-jobs: job create (cap-checked) + list + disable.
+ * - /oauth/google/* + /api/google/* (Track E #27): direct Google OAuth
+ *   (Gmail read/send + Drive read) — the Nango-free Layer 8 path.
+ *   start: signed device, returns {auth_url} (app opens in browser);
+ *   callback: one-time D1 state row, exchanges code, stores encrypted
+ *   tokens in D1 google_tokens. API routes: paired device + Ed25519
+ *   (GET signs path+query, POST signs sortedJson(body)) OR
+ *   x-internal-secret + explicit tenant_id. Env-gated on
+ *   GOOGLE_OAUTH_CLIENT_ID/SECRET — unset = google_oauth_not_configured.
  */
 import { JarvisHub } from "./do/JarvisHub";
 
@@ -69,22 +81,34 @@ export interface Env {
   ROUTER_CONFIG?: string;
   RENDER_WORKER_URL?: string;
   E2B_API_KEY?: string; // Phase 4: unset = e2b_not_configured (U-4, no account yet)
+  GOOGLE_OAUTH_CLIENT_ID?: string; // Track E #27: GCP OAuth client (Web app) — parent-created; unset = google_oauth_not_configured
+  GOOGLE_OAUTH_CLIENT_SECRET?: string; // Track E #27: same — never logged/returned
   UPSTASH_REDIS_REST_URL?: string;
   UPSTASH_REDIS_REST_TOKEN?: string;
   LANGFUSE_PUBLIC_KEY?: string;
   LANGFUSE_SECRET_KEY?: string;
   LANGFUSE_HOST?: string;
+  LANGFUSE_BASE_URL?: string; // signups.env name; observability.ts prefers HOST, falls back here
   SENTRY_DSN?: string;
+  RESEND_API_KEY?: string; // #52: unset = email not_configured (never faked)
+  RESEND_FROM?: string; // sender, e.g. "OmniJarvis <noreply@flow99.in>"
+  RESEND_VERIFY_URL_BASE?: string; // base for verification links (default: live hub host)
+  RESEND_DAILY_CAP?: string; // local daily sent cap, default 100 (free tier)
+  B2_ENDPOINT?: string; // #49: S3 endpoint, e.g. https://s3.us-west-002.backblazeb2.com
+  B2_REGION?: string; // e.g. us-west-002 (derived from endpoint when possible)
+  B2_BUCKET?: string;
+  B2_KEY_ID?: string;
+  B2_APPLICATION_KEY?: string;
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "7"; // 7: self-extension server mirror (validateResearchCandidate + classifySkillClass + self_extended template strip-check; submit still always quarantined)
+const VERSION = "8"; // 8: open-source completeness merge (Langfuse/Sentry/Qdrant/Upstash live wiring + Anthropic SKILL.md + Resend/B2 + Google OAuth + worker Mem0/Docling/Bandit/Browser-Use + HF Spaces package); 7 was the self-extension server mirror
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";
 import { handleSync, type SyncRequest } from "./sync";
 import { constantTimeEqual, handleTick, type DispatchStep } from "./cron";
-import { checkRateLimit } from "./ratelimit";
+import { checkRateLimit, checkUpstashLive, probeUpstashCounter } from "./ratelimit";
 import { d1Batch, getDevice, getTenant, insertTrace, verifyLicenceKey } from "./db";
 import {
   buildCaptchaAssistEvent,
@@ -177,6 +201,24 @@ import {
 } from "./e2b";
 import { getMonthUsage, currentPeriod } from "./metering";
 import { planLimits } from "./router";
+import { listEmailSends, sendRenewalReminderEmail, sendVerificationEmail } from "./email";
+import { createTenantBackup, listBackups, restoreTestBackup } from "./backup";
+import {
+  GoogleError,
+  buildAuthUrl,
+  consumeOAuthState,
+  driveReadFile,
+  exchangeCodeForTokens,
+  fetchGoogleEmail,
+  gmailListMessages,
+  gmailSend,
+  googleRedirectUri,
+  googleStatus,
+  isGoogleOAuthConfigured,
+  issueOAuthState,
+  revokeGoogleTokens,
+  storeGoogleTokens,
+} from "./google";
 import { solveCaptcha, validateSolveRequest } from "./captcha";
 import {
   MAX_INGEST_BYTES,
@@ -292,7 +334,14 @@ export async function runCronTick(
     return res.ok;
   };
   const result = await handleTick(env.DB, env, env.CRON_SECRET ?? null, dispatch);
-  const sweeps = await runBillingSweeps(env.DB);
+  // Billing sweeps run after the tick in both paths. The renewal
+  // reminder callback sends the Resend email (best-effort, recorded
+  // in email_sends; a failed send never breaks the tick).
+  const sweeps = await runBillingSweeps(env.DB, Date.now(), {
+    onReminder: async ({ tenant, subscription, window }) => {
+      await sendRenewalReminderEmail(env, env.DB, { tenant, subscription, window });
+    },
+  });
   return { ...result, billing_sweeps: sweeps };
 }
 
@@ -342,6 +391,28 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           d1: { ok: d1Ok, devices },
           licences: { state: licencesState, count: licences },
         },
+      });
+    }
+
+    // Admin diagnostic (completeness #45): proves the Upstash
+    // distributed counter is live — ping + two sequential INCRs on a
+    // random, deleted probe key. ADMIN-ONLY (x-admin-token); the
+    // response carries no real route quota state, only the probe's
+    // own counts. Never a public route.
+    if (path === "/api/admin/ratelimit-probe" && method === "POST") {
+      if (!env.LLM_ADMIN_TOKEN || request.headers.get("x-admin-token") !== env.LLM_ADMIN_TOKEN) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const live = await checkUpstashLive(env);
+      const probe = live.live
+        ? await probeUpstashCounter(env)
+        : { ok: false as const, error: "upstash_not_live" };
+      return json({
+        ok: probe.ok,
+        upstash: live,
+        probe: probe.ok
+          ? { counts: (probe as { counts: number[] }).counts, sequential: true }
+          : { error: probe.error },
       });
     }
 
@@ -1689,9 +1760,32 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (!tenant) return json({ error: "tenant_not_found" }, 404);
       const res = await requestEmailVerification(env.DB, { tenant, email });
       if (!res.ok) return json({ error: res.error }, res.error === "already_verified" ? 409 : 400);
-      // Email send is NOT wired (U-6 — no Resend/SMTP in this Worker):
-      // the token hash + 24h expiry are stored; delivery is an open item.
-      return json({ ok: true, verification_pending: true });
+      // Resend send (#52): the token goes to the email ONLY — it is
+      // never in this response. email:"not_configured" when no
+      // RESEND_API_KEY (honest; token stays pending, god-mode verify
+      // still exists); email:"failed" on cap/429 (recorded in D1).
+      const sent = await sendVerificationEmail(env, env.DB, { tenant, email, token: res.token });
+      return json({
+        ok: true,
+        verification_pending: true,
+        email: sent.ok ? "sent" : sent.error === "not_configured" ? "not_configured" : "failed",
+        ...(sent.ok ? {} : { email_error: sent.error }),
+      });
+    }
+
+    // GET confirm: the email link target (links are GET by nature).
+    // Same confirmEmailVerification as the POST route — token is a
+    // one-time 24h hash-checked token, never logged or stored plaintext.
+    if (path === "/api/billing/verify-email/confirm" && method === "GET") {
+      const url = new URL(request.url);
+      const tenantId = url.searchParams.get("tenant_id") ?? "";
+      const token = url.searchParams.get("token") ?? "";
+      if (!tenantId || !token) return json({ error: "bad_request" }, 400);
+      const tenant = await getTenant(env.DB, tenantId);
+      if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      const res = await confirmEmailVerification(env.DB, { tenant, token });
+      if (!res.ok) return json({ error: res.error }, 400);
+      return json({ ok: true, email_verified: true });
     }
 
     if (path === "/api/billing/verify-email/confirm" && method === "POST") {
@@ -1849,6 +1943,52 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         .run();
       await insertTrace(env.DB, tenantId, "", "billing_godmode", { action: "verify_email", actor: "admin" });
       return json({ ok: true, email_verified: true });
+    }
+
+    // --- B2 backup (admin-only, #49) ---
+    if (path === "/api/billing/admin/backup" && method === "POST") {
+      if (!isBillingAdmin()) return json({ error: "unauthorized" }, 401);
+      const body = await readJson(request);
+      const tenantId = typeof body.tenant_id === "string" ? body.tenant_id : "";
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const tenant = await getTenant(env.DB, tenantId);
+      if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      const res = await createTenantBackup(env, env.DB, tenantId);
+      if (!res.ok) {
+        const status = res.error === "b2_not_configured" || res.error === "key_enc_not_configured" ? 503 : 502;
+        return json({ error: res.error, ...(res.detail ? { detail: res.detail } : {}) }, status);
+      }
+      return json({ ok: true, backup_id: res.backup_id, b2_key: res.b2_key, size_bytes: res.size_bytes, sha256: res.sha256 });
+    }
+
+    if (path === "/api/billing/admin/backup/restore-test" && method === "POST") {
+      if (!isBillingAdmin()) return json({ error: "unauthorized" }, 401);
+      const body = await readJson(request);
+      const backupId = typeof body.backup_id === "string" ? body.backup_id : "";
+      if (!backupId) return json({ error: "bad_request" }, 400);
+      const res = await restoreTestBackup(env, env.DB, backupId);
+      if (!res.ok) {
+        const status = res.error === "backup_not_found" ? 404 : res.error === "b2_not_configured" || res.error === "key_enc_not_configured" ? 503 : 502;
+        return json({ error: res.error, ...(res.detail ? { detail: res.detail } : {}) }, status);
+      }
+      return json({ ok: true, backup_id: res.backup_id, tenant_id: res.tenant_id, size_bytes: res.size_bytes, sha256: res.sha256, tables: res.tables, dry_run: true });
+    }
+
+    if (path === "/api/billing/admin/backups" && method === "GET") {
+      if (!isBillingAdmin()) return json({ error: "unauthorized" }, 401);
+      const url = new URL(request.url);
+      const tenantId = url.searchParams.get("tenant_id") ?? undefined;
+      const rows = await listBackups(env.DB, tenantId);
+      return json({ ok: true, backups: rows, count: rows.length });
+    }
+
+    // --- Resend send log (admin-only, #52) — failure visibility ---
+    if (path === "/api/billing/admin/email-sends" && method === "GET") {
+      if (!isBillingAdmin()) return json({ error: "unauthorized" }, 401);
+      const url = new URL(request.url);
+      const tenantId = url.searchParams.get("tenant_id") ?? undefined;
+      const rows = await listEmailSends(env.DB, tenantId);
+      return json({ ok: true, email_sends: rows, count: rows.length });
     }
 
     if (path === "/api/billing/admin/god-mode" && method === "POST") {
@@ -2063,6 +2203,195 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const headers = new Headers(request.headers);
       headers.set("x-expected-device", deviceId);
       return await stub.fetch(new Request(request.url, { method: request.method, headers }));
+    }
+
+    // --- Direct Google OAuth (Track E #27, Layer 8 free path) ---
+    // Auth: x-internal-secret (server-to-server, tenant_id explicit)
+    // OR paired device + Ed25519 signature (headers x-device-id /
+    // x-nonce / x-ts / x-signature), via authorizeDocsRequest.
+    // GET routes sign the path + query string (payloadRaw =
+    // url.pathname + url.search); POST routes sign sortedJson(body).
+    // /oauth/google/start returns JSON {auth_url} — the app opens it
+    // in the browser (a redirect cannot carry the signed headers).
+    // The callback is a plain browser GET, authenticated by the
+    // one-time server-side state row only (standard OAuth).
+    if (path === "/oauth/google/start" && method === "GET") {
+      const deviceId = request.headers.get("x-device-id") ?? url.searchParams.get("device_id") ?? "";
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId,
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: url.pathname + url.search,
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? url.searchParams.get("tenant_id") ?? "";
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      if (!isGoogleOAuthConfigured(env)) {
+        return json({ error: "google_oauth_not_configured", detail: "GCP OAuth client not set up on the hub — parent step (see Track E REPORT.md)" }, 503);
+      }
+      const rl = await checkRateLimit(env, "googleOauthStart", tenantId);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      const state = await issueOAuthState(env.DB, tenantId, auth.device_id ?? deviceId);
+      return json({ ok: true, auth_url: buildAuthUrl(env, new URL(request.url).origin, state), redirect_uri: googleRedirectUri(new URL(request.url).origin) });
+    }
+
+    if (path === "/oauth/google/callback" && method === "GET") {
+      const htmlPage = (title: string, body: string, status: number) =>
+        new Response(
+          `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head>` +
+            `<body style="font-family:sans-serif;max-width:560px;margin:48px auto;padding:0 16px"><h1>${title}</h1><p>${body}</p>` +
+            `<p>Tab band karke Jarvis app me wapas jao.</p></body></html>`,
+          { status, headers: { "Content-Type": "text/html; charset=utf-8" } },
+        );
+      const code = url.searchParams.get("code") ?? "";
+      const state = url.searchParams.get("state") ?? "";
+      const oauthErr = url.searchParams.get("error") ?? "";
+      if (oauthErr) return htmlPage("Google connect fail", `Google ne consent nahi diya (${oauthErr}). Dobara koshish karo.`, 400);
+      if (!code || !state) return htmlPage("Google connect fail", "code ya state missing hai — dobara koshish karo.", 400);
+      const consumed = await consumeOAuthState(env.DB, state);
+      if (!consumed) return htmlPage("Google connect fail", "Ye link expire ho gaya ya pehle se use ho chuka hai — AI Brain se dobara Connect dabao.", 400);
+      try {
+        const origin = new URL(request.url).origin;
+        const tokens = await exchangeCodeForTokens(env, code, origin);
+        const email = await fetchGoogleEmail(tokens.accessToken);
+        await storeGoogleTokens(env.DB, env, consumed.tenant_id, email, tokens);
+        await insertTrace(env.DB, consumed.tenant_id, consumed.device_id, "google_connected", { scopes: "gmail_read_send_drive_read" });
+        return htmlPage("Google connected", "Gmail + Drive connect ho gaya. Ab Agent Mode Gmail bhej/padh sakta hai aur Drive files padh sakta hai.", 200);
+      } catch (e) {
+        if (e instanceof GoogleError) {
+          return htmlPage("Google connect fail", `(${e.code}) ${e.message}`, e.status === 503 ? 503 : 502);
+        }
+        throw e;
+      }
+    }
+
+    if (path === "/api/google/status" && method === "GET") {
+      const deviceId = request.headers.get("x-device-id") ?? url.searchParams.get("device_id") ?? "";
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId,
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: url.pathname + url.search,
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? url.searchParams.get("tenant_id") ?? "";
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      return json({ ok: true, ...(await googleStatus(env.DB, env, tenantId)) });
+    }
+
+    if (path === "/api/google/gmail/send" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const to = typeof body.to === "string" ? body.to.trim() : "";
+      const subject = typeof body.subject === "string" ? body.subject : "";
+      const text = typeof body.body === "string" ? body.body : "";
+      if (!to || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return json({ error: "bad_request", detail: "valid 'to' email required" }, 400);
+      if (text.length > 100_000) return json({ error: "bad_request", detail: "body too large (100k chars)" }, 400);
+      const rl = await checkRateLimit(env, "googleApi", tenantId);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      try {
+        const sent = await gmailSend({ db: env.DB, env, tenantId }, { to, subject, body: text });
+        return json({ ok: true, id: sent.id });
+      } catch (e) {
+        if (e instanceof GoogleError) return json({ error: e.code, detail: e.message }, e.status);
+        throw e;
+      }
+    }
+
+    if (path === "/api/google/gmail/messages" && method === "GET") {
+      const deviceId = request.headers.get("x-device-id") ?? url.searchParams.get("device_id") ?? "";
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId,
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: url.pathname + url.search,
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? url.searchParams.get("tenant_id") ?? "";
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const rl = await checkRateLimit(env, "googleApi", tenantId);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      try {
+        const messages = await gmailListMessages(
+          { db: env.DB, env, tenantId },
+          { q: url.searchParams.get("q") ?? undefined, maxResults: Number(url.searchParams.get("max_results") ?? 5) || 5 },
+        );
+        return json({ ok: true, messages });
+      } catch (e) {
+        if (e instanceof GoogleError) return json({ error: e.code, detail: e.message }, e.status);
+        throw e;
+      }
+    }
+
+    if (path.startsWith("/api/google/drive/files/") && method === "GET") {
+      const fileId = decodeURIComponent(path.split("/").filter(Boolean).pop() ?? "");
+      if (!fileId) return json({ error: "bad_request" }, 400);
+      const deviceId = request.headers.get("x-device-id") ?? url.searchParams.get("device_id") ?? "";
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId,
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: url.pathname + url.search,
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? url.searchParams.get("tenant_id") ?? "";
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const rl = await checkRateLimit(env, "googleApi", tenantId);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      try {
+        const file = await driveReadFile({ db: env.DB, env, tenantId }, fileId);
+        return json({ ok: true, file });
+      } catch (e) {
+        if (e instanceof GoogleError) return json({ error: e.code, detail: e.message }, e.status);
+        throw e;
+      }
+    }
+
+    if (path === "/api/google/revoke" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      try {
+        await revokeGoogleTokens({ db: env.DB, env, tenantId });
+        await insertTrace(env.DB, tenantId, auth.device_id ?? "", "google_revoked", {});
+        return json({ ok: true, connected: false });
+      } catch (e) {
+        if (e instanceof GoogleError) return json({ error: e.code, detail: e.message }, e.status);
+        throw e;
+      }
     }
 
     return json({ error: "not_found" }, 404);

@@ -196,13 +196,29 @@ describe("S-T6 wipe (D1 + Qdrant field)", () => {
   });
 });
 
-describe("S-T7 Qdrant not configured", () => {
-  it("empty env -> qdrant_not_configured; configured env -> qdrant_not_live (never fake success)", async () => {
+describe("S-T7 Qdrant not configured (completeness #30: real client)", () => {
+  it("empty env -> qdrant_not_configured; configured env + mocked fetch -> real REST calls, never fake success", async () => {
     expect(await qdrantUpsert({}, "t-1", 1, [1, 0])).toEqual({ ok: false, error: "qdrant_not_configured" });
     expect(await qdrantQuery({}, "t-1", [1, 0], 5)).toEqual({ ok: false, error: "qdrant_not_configured" });
     const live = { QDRANT_URL: "https://qdrant-test.example.com", QDRANT_API_KEY: "test-key" };
-    expect(await qdrantUpsert(live, "t-1", 1, [1, 0])).toEqual({ ok: false, error: "qdrant_not_live" });
-    expect(await qdrantQuery(live, "t-1", [1, 0], 5)).toEqual({ ok: false, error: "qdrant_not_live" });
+    // Network failure with configured env -> honest qdrant_error, never ok:true.
+    const failingFetch = (async () => {
+      throw new Error("boom");
+    }) as unknown as typeof fetch;
+    expect(await qdrantUpsert(live, "t-1", 1, [1, 0], {}, { fetchFn: failingFetch })).toEqual({
+      ok: false,
+      error: "qdrant_error",
+    });
+    expect(await qdrantQuery(live, "t-1", [1, 0], 5, { fetchFn: failingFetch })).toEqual({
+      ok: false,
+      error: "qdrant_error",
+    });
+    // HTTP 500 from Qdrant -> qdrant_error as well.
+    const errFetch = (async () => new Response("oops", { status: 500 })) as unknown as typeof fetch;
+    expect(await qdrantUpsert(live, "t-1", 1, [1, 0], {}, { fetchFn: errFetch })).toEqual({
+      ok: false,
+      error: "qdrant_error",
+    });
   });
 });
 

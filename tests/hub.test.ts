@@ -229,9 +229,9 @@ describe("handleRequest (2a-2 routes, D1 licences)", () => {
     expect(body.key_id).toBeUndefined();
   });
 
-  it("GET / -> version 7 (self-extension server mirror)", async () => {
+  it("GET / -> version 8 (Track E #27 direct Google OAuth)", async () => {
     const body = (await route("/").json()) as Record<string, unknown>;
-    expect(body.version).toBe("7");
+    expect(body.version).toBe("8");
   });
 
   it("pairing code: derives from token", async () => {

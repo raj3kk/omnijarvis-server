@@ -6,11 +6,14 @@
  * tenant-isolated. Qdrant swaps in later through the MemoryStore interface
  * — one place, no route changes.
  *
- * Qdrant (honest scope): the account does NOT exist yet (parent browser
- * task, U-3). `qdrantStatus()` is env-gated (`QDRANT_URL` + `QDRANT_API_KEY`
- * both set = configured); the qdrant* stubs return an honest
- * `qdrant_not_configured` error when unset and NEVER fake a success.
- * Memory routes use the D1 store; they do not call the Qdrant stubs.
+ * Qdrant (completeness #30, Track A): the account EXISTS (keys in
+ * `.secrets/signups.env`) and the real REST client lives below —
+ * create-collection-if-missing, upsert, search — env-gated
+ * (`QDRANT_URL` + `QDRANT_API_KEY` both set = configured). Unset env
+ * -> honest `qdrant_not_configured`; any live failure ->
+ * `qdrant_error` (never a fake success). D1 REMAINS the default
+ * store: memory routes use the D1 store and do not call Qdrant;
+ * Qdrant is the upgrade path through the same function seam.
  *
  * Mem0 extraction (Render worker `/mem/extract` -> hub `/api/llm/route`)
  * is NOT built in 3d: the Render deploy is pending (U-2) and Render-side
@@ -188,12 +191,19 @@ export async function wipeMemories(db: D1Like, tenantId: string): Promise<number
   return n;
 }
 
-// --- Qdrant (env-gated stubs — the account does not exist yet) ---
+// --- Qdrant (real REST client, env-gated — completeness #30) ---
 
 export interface QdrantEnv {
   QDRANT_URL?: string;
   QDRANT_API_KEY?: string;
 }
+
+export interface QdrantOpts {
+  fetchFn?: typeof fetch;
+}
+
+/** Qdrant collection for tenant memories (one collection, tenant filter). */
+export const QDRANT_COLLECTION = "omnijarvis_memories";
 
 /** Configured ONLY when BOTH QDRANT_URL and QDRANT_API_KEY are set. */
 export function qdrantStatus(env: QdrantEnv): { configured: boolean } {
@@ -205,28 +215,142 @@ export interface QdrantResult {
   error?: string;
 }
 
+function qdrantBase(env: QdrantEnv): string {
+  return (env.QDRANT_URL ?? "").replace(/\/+$/, "");
+}
+
+function qdrantHeaders(env: QdrantEnv): Record<string, string> {
+  return { "api-key": env.QDRANT_API_KEY ?? "", "Content-Type": "application/json" };
+}
+
 /**
- * Qdrant upsert stub. Unset env -> `qdrant_not_configured`. Set env but
- * no live account yet -> `qdrant_not_live` (honest: there is no real
- * Qdrant client in 3d, and no fake success is ever returned).
+ * Ensure the collection exists with the embedding's vector size
+ * (Cosine distance). GET 200 = exists; GET 404 = PUT-create; any
+ * other status / network failure = false (caller returns qdrant_error).
+ */
+export async function qdrantEnsureCollection(
+  env: QdrantEnv,
+  vectorSize: number,
+  opts: QdrantOpts = {},
+): Promise<boolean> {
+  const fetchFn = opts.fetchFn ?? fetch;
+  const base = qdrantBase(env);
+  try {
+    const get = await fetchFn(`${base}/collections/${QDRANT_COLLECTION}`, {
+      headers: qdrantHeaders(env),
+    });
+    if (get.ok) return true;
+    if (get.status !== 404) return false;
+    const put = await fetchFn(`${base}/collections/${QDRANT_COLLECTION}`, {
+      method: "PUT",
+      headers: qdrantHeaders(env),
+      body: JSON.stringify({ vectors: { size: vectorSize, distance: "Cosine" } }),
+    });
+    return put.ok;
+  } catch {
+    return false;
+  }
+}
+
+function qdrantPointId(tenantId: string, memoryId: number): string {
+  return `${tenantId}:${memoryId}`;
+}
+
+/**
+ * Qdrant upsert. Unset env -> `qdrant_not_configured`. Any live
+ * failure (collection create / upsert non-ok / network) ->
+ * `qdrant_error` — never a fake success. `meta.content`/`meta.kind`
+ * land in the point payload so search can return hits without a
+ * second D1 read; omit them and the payload carries empty content.
  */
 export async function qdrantUpsert(
   env: QdrantEnv,
-  _tenantId: string,
-  _memoryId: number,
-  _embedding: number[],
+  tenantId: string,
+  memoryId: number,
+  embedding: number[],
+  meta: { content?: string; kind?: string; created_at?: number } = {},
+  opts: QdrantOpts = {},
 ): Promise<QdrantResult> {
   if (!qdrantStatus(env).configured) return { ok: false, error: "qdrant_not_configured" };
-  return { ok: false, error: "qdrant_not_live" };
+  if (!Number.isFinite(memoryId) || embedding.length === 0) {
+    return { ok: false, error: "qdrant_error" };
+  }
+  const fetchFn = opts.fetchFn ?? fetch;
+  const base = qdrantBase(env);
+  try {
+    const ensured = await qdrantEnsureCollection(env, embedding.length, opts);
+    if (!ensured) return { ok: false, error: "qdrant_error" };
+    const res = await fetchFn(`${base}/collections/${QDRANT_COLLECTION}/points`, {
+      method: "PUT",
+      headers: qdrantHeaders(env),
+      body: JSON.stringify({
+        points: [
+          {
+            id: qdrantPointId(tenantId, memoryId),
+            vector: embedding,
+            payload: {
+              tenant_id: tenantId,
+              memory_id: memoryId,
+              kind: meta.kind ?? "fact",
+              content: meta.content ?? "",
+              created_at: meta.created_at ?? 0,
+            },
+          },
+        ],
+      }),
+    });
+    if (!res.ok) return { ok: false, error: "qdrant_error" };
+    return { ok: true };
+  } catch {
+    return { ok: false, error: "qdrant_error" };
+  }
 }
 
-/** Qdrant query stub — same honest errors as qdrantUpsert. */
+/**
+ * Qdrant vector search, tenant-filtered. Unset env ->
+ * `qdrant_not_configured`; missing collection -> `qdrant_error`
+ * (search never auto-creates — an empty store is a D1 matter, and
+ * creating a collection on a read would hide a misconfiguration).
+ * Hits map the stored payload back to MemoryHit shape.
+ */
 export async function qdrantQuery(
   env: QdrantEnv,
-  _tenantId: string,
-  _queryEmbedding: number[],
-  _topK: number,
+  tenantId: string,
+  queryEmbedding: number[],
+  topK: number,
+  opts: QdrantOpts = {},
 ): Promise<QdrantResult & { hits?: MemoryHit[] }> {
   if (!qdrantStatus(env).configured) return { ok: false, error: "qdrant_not_configured" };
-  return { ok: false, error: "qdrant_not_live" };
+  if (queryEmbedding.length === 0) return { ok: false, error: "qdrant_error" };
+  const fetchFn = opts.fetchFn ?? fetch;
+  const base = qdrantBase(env);
+  try {
+    const res = await fetchFn(`${base}/collections/${QDRANT_COLLECTION}/points/search`, {
+      method: "POST",
+      headers: qdrantHeaders(env),
+      body: JSON.stringify({
+        vector: queryEmbedding,
+        filter: { must: [{ key: "tenant_id", match: { value: tenantId } }] },
+        limit: Math.max(1, topK),
+        with_payload: true,
+      }),
+    });
+    if (!res.ok) return { ok: false, error: "qdrant_error" };
+    const data = (await res.json()) as {
+      result?: Array<{ id: unknown; score?: number; payload?: Record<string, unknown> }>;
+    };
+    const hits: MemoryHit[] = (data.result ?? []).map((r) => {
+      const p = r.payload ?? {};
+      return {
+        id: typeof p.memory_id === "number" ? p.memory_id : 0,
+        content: typeof p.content === "string" ? p.content : "",
+        kind: typeof p.kind === "string" ? p.kind : "fact",
+        score: typeof r.score === "number" ? r.score : 0,
+        created_at: typeof p.created_at === "number" ? p.created_at : 0,
+      };
+    });
+    return { ok: true, hits };
+  } catch {
+    return { ok: false, error: "qdrant_error" };
+  }
 }

@@ -1,0 +1,31 @@
+# OmniJarvis Render light worker (3b) — doc pipeline stack.
+# Light stack (audit V2: the only combo that fits Render free 512 MB).
+# Pinned to major versions for reproducible deploys.
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+pdfplumber>=0.11,<1
+python-multipart>=0.0.9,<1
+pytesseract>=0.3,<1
+weasyprint>=60,<62
+# pydyf PINNED: WeasyPrint 61.x calls pydyf.PDF(version, identifier) —
+# pydyf >=0.11 changed the PDF() signature (TypeError) and breaks
+# write_pdf. Verified 2026-11-21: 61.2 + pydyf 0.10.0 = PDF OK.
+pydyf>=0.10,<0.11
+segno>=1.6,<2
+# Track D (2026-11-22) — optional, LAZY-imported in main.py: the base
+# worker starts and serves the original routes without them. Pinned
+# exact: these versions were installed + measured in the track work.
+# bandit 1.8.6: /doc/scan sidecar (Apache 2.0). mem0ai 2.2.1: /mem/extract
+# (Apache 2.0 library only; Platform never used; LLM via hub router).
+# 2.2.1 (not 1.0.4): 1.0.4 pins protobuf<6 but browser-use's google libs
+# need protobuf>=6.33.5 — unresolvable in one venv; 2.2.1 allows
+# protobuf<7 and the adapter was verified against both 1.0.4 and 2.2.1
+# (2.x changed add() to a single additive-extraction call returning a
+# list; the adapter sniffs the prompt and accepts both result shapes).
+# bandit 1.8.6: /doc/scan sidecar (Apache 2.0). mem0ai 2.2.1: /mem/extract
+# (Apache 2.0 library only; Platform never used; LLM via hub router).
+# Heavy deps live in requirements-heavy.txt (16 GB host only — see that
+# file): docling, browser-use/playwright. NOT added: paddleocr
+# (evidence-gated NOT APPLICABLE — see Track D REPORT.md §3).
+bandit==1.8.6
+mem0ai==2.2.1

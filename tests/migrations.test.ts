@@ -295,3 +295,54 @@ describe("D1 migration 0009 (captcha auto-solve audit: captcha_solves)", () => {
     expect(code.toLowerCase()).not.toContain("supabase");
   });
 });
+
+const SQL10 = readFileSync(
+  new URL("../d1/migrations/0010_google_oauth.sql", import.meta.url),
+  "utf8",
+);
+
+describe("D1 migration 0010 (Track E: Google OAuth token vault)", () => {
+  it("creates google_tokens + google_oauth_states, encrypted columns, non-destructive", () => {
+    expect(SQL10).toContain("CREATE TABLE IF NOT EXISTS google_tokens (");
+    expect(SQL10).toContain("CREATE TABLE IF NOT EXISTS google_oauth_states (");
+    expect(SQL10).toContain("tenant_id TEXT NOT NULL");
+    const code = SQL10.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(code).not.toMatch(/DROP\s+TABLE/i);
+    expect(code).not.toMatch(/TRUNCATE/i);
+    expect(code).not.toContain("client_secret");
+  });
+});
+
+const SQL11 = readFileSync(
+  new URL("../d1/migrations/0011_email_b2.sql", import.meta.url),
+  "utf8",
+);
+
+describe("D1 migration 0011 (Track C: Resend email log + B2 backup records)", () => {
+  it("creates email_sends with the four honest statuses + tenant index", () => {
+    expect(SQL11).toContain("CREATE TABLE IF NOT EXISTS email_sends (");
+    for (const col of ["id TEXT PRIMARY KEY", "tenant_id TEXT NOT NULL", "kind TEXT NOT NULL", "to_email TEXT NOT NULL", "status TEXT NOT NULL", "resend_id TEXT", "error TEXT", "created_at INTEGER NOT NULL"]) {
+      expect(SQL11).toContain(col);
+    }
+    expect(SQL11).toContain("CHECK (status IN ('sent', 'failed', 'capped', 'not_configured'))");
+    expect(SQL11).toContain("idx_email_sends_tenant_time ON email_sends(tenant_id, created_at)");
+  });
+
+  it("creates backups with ok/failed status + tenant index", () => {
+    expect(SQL11).toContain("CREATE TABLE IF NOT EXISTS backups (");
+    for (const col of ["id TEXT PRIMARY KEY", "tenant_id TEXT NOT NULL", "kind TEXT NOT NULL", "b2_key TEXT NOT NULL", "size_bytes INTEGER NOT NULL", "sha256 TEXT NOT NULL", "status TEXT NOT NULL", "created_at INTEGER NOT NULL"]) {
+      expect(SQL11).toContain(col);
+    }
+    expect(SQL11).toContain("CHECK (status IN ('ok', 'failed'))");
+    expect(SQL11).toContain("idx_backups_tenant_time ON backups(tenant_id, created_at)");
+  });
+
+  it("is non-destructive: no DROP TABLE / TRUNCATE / DELETE FROM, no secrets", () => {
+    const code = SQL11.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(code).not.toMatch(/DROP\s+TABLE/i);
+    expect(code).not.toMatch(/TRUNCATE/i);
+    expect(code).not.toMatch(/DELETE\s+FROM/i);
+    expect(code.toLowerCase()).not.toContain("resend_api_key");
+    expect(code.toLowerCase()).not.toContain("application_key");
+  });
+});

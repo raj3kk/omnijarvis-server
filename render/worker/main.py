@@ -12,11 +12,31 @@ Endpoints:
   QR (verification URL + SHA-256 hash of canonical payload).
   Caps: 2 MB HTML, 10 pages. Response: {ok, hash, pdf_base64, pages}.
 - POST /doc/scan -> Python source -> AST static scan (deterministic,
-  no LLM): dangerous patterns -> {ok, findings[]}.
+  no LLM): dangerous patterns -> {ok, findings[]}. Bandit (Apache 2.0)
+  runs alongside the AST scan; its issues are additive fields
+  (`bandit_available`, `bandit_findings`) — `findings` stays AST-only
+  so the hub's scanSkillCode contract is unchanged.
+- POST /mem/extract -> text -> extracted memories (facts/preferences)
+  as structured JSON. LLM/embeddings go through the hub router
+  (/api/llm/route) when HUB_LLM_URL + INTERNAL_SECRET are set and the
+  mem0 library is installed; otherwise a deterministic rule-based
+  fallback extracts (engine field says which — never a fake mem0).
+  No key is ever baked into the worker; mem0 Platform is never used.
+- POST /doc/extract-docling -> PDF -> Docling layout+tables extraction
+  (separate endpoint, not a flag on /doc/extract: different heavy dep,
+  lazy import, different response shape, /doc/extract stays untouched).
+  503 `docling_not_available` when the lib is not installed.
+- POST /browse/run -> gated Browser-Use agent run (env-gated, URL
+  allowlist, step cap; LLM via the hub router; see BROWSER_USE.md).
+  503 `browser_not_available` when disabled or libs are missing.
 
 RAM discipline (free tier 512 MB): one page / one doc at a time, no
 model loads (Tesseract binary + tessdata ~50 MB). No state on Render
 (ephemeral filesystem, 15-min sleep — demo/smoke + doc jobs only).
+Heavy optional deps (docling, mem0ai, bandit, browser-use) are LAZY
+imports inside their endpoints, so the base worker starts and serves
+the original routes even when none of them is installed. On HF Spaces
+(2 vCPU/16 GB, Track B deploy) the same worker runs with them enabled.
 """
 
 import ast
@@ -24,10 +44,13 @@ import base64
 import hashlib
 import io
 import json
+import os
+import re
 import time
+import urllib.request
 
 import pdfplumber
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 app = FastAPI(title="omnijarvis-render")
@@ -41,6 +64,21 @@ MAX_OCR_SECONDS = 30
 MAX_HTML_BYTES = 2 * 1024 * 1024
 MAX_CERT_PAGES = 10
 MAX_SCAN_BYTES = 512 * 1024
+MAX_MEM_TEXT_CHARS = 8000
+MAX_MEMORIES_PER_CALL = 20
+# Hub router (memory.ts: worker /mem/extract -> hub /api/llm/route).
+# Both env vars must be set for the mem0 path; unset -> rule fallback.
+HUB_LLM_URL = os.environ.get("HUB_LLM_URL", "").rstrip("/")
+INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")
+# Browser-Use (see BROWSER_USE.md): default OFF; allowlist empty = deny all.
+BROWSER_USE_ENABLED = os.environ.get("BROWSER_USE_ENABLED", "") == "1"
+BROWSER_ALLOWLIST = {
+    h.strip().lower()
+    for h in os.environ.get("BROWSER_ALLOWLIST", "").split(",")
+    if h.strip()
+}
+MAX_BROWSE_STEPS = 25
+MAX_BROWSE_TASK_CHARS = 1000
 
 
 def sample_pdf_bytes() -> bytes:
@@ -317,6 +355,492 @@ async def doc_certificate(
         )
 
 
+# --- Mem0 extraction (item #28; mem0 library only, never Platform) ---
+# Design (memory.ts + hub /api/llm/route): mem0's DEFAULT config needs an
+# OpenAI key (gpt-4o-mini + text-embedding-ada-002), so the worker NEVER
+# uses the default. Instead the mem0 Memory object's .llm, .embedding_model
+# and .vector_store are swapped for adapters that POST to the hub router
+# (x-internal-secret) or keep nothing (null store); the hub owns keys,
+# BYOK checks, caps and metering, and persists into D1. No key is baked
+# into the worker, no secret is ever logged, and mem0 telemetry is off
+# (MEM0_TELEMETRY=false). When the router is not configured (or mem0 is
+# not installed) the endpoint still answers via a deterministic rule-based
+# extractor — engine field says which.
+
+MEM_EXTRACT_SYSTEM = (
+    "Extract durable memories from the user's message as a JSON object "
+    '{"facts": ["..."]}. Keep only stable facts and preferences (name, '
+    "likes, goals, constraints, contact details the user stated). Drop "
+    "greetings, one-off questions and anything already implied. Short "
+    "strings, one fact per item."
+)
+# NOTE: mem0 parses json.loads(response)["facts"] and uses each fact as a
+# DICT KEY (new_message_embeddings[new_mem]) — facts MUST be plain
+# strings, not {content, kind} objects, or add() dies with
+# "unhashable type: 'dict'". Kinds are therefore not produced by the
+# mem0 path (all memories are kind "fact"); the rule fallback keeps
+# its own fact/preference split.
+MEM_EXTRACT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "facts": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["facts"],
+}
+MEM_ACTIONS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "memory": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "text": {"type": "string"},
+                    "event": {"type": "string"},
+                    "old_memory": {"type": "string"},
+                },
+                "required": ["text", "event"],
+            },
+        },
+    },
+    "required": ["memory"],
+}
+
+
+def _router_post(payload: dict, timeout: int = 60) -> dict:
+    """POST one call to the hub router. Raises on any failure — the
+    caller turns it into an honest error, never a fake extraction."""
+    req = urllib.request.Request(
+        HUB_LLM_URL + "/api/llm/route",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-internal-secret": INTERNAL_SECRET,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _mem0_router_adapters(tenant_id: str, turn_id: str):
+    """Build mem0-compatible adapters backed by the hub router.
+
+    mem0 calls .llm.generate_response(messages, response_format=...) twice
+    per add(): (1) fact extraction — user prompt starts with "Input:";
+    (2) update-memory actions — prompt mentions "new retrieved facts".
+    The response_schema sent to the router matches the call: facts schema
+    for (1), actions schema for (2). Embeddings go through kind
+    "embeddings". Returns (llm, embedder, vector_store) where the vector
+    store is an in-memory null store — the worker stores nothing; the
+    hub persists extracted memories into D1 (memory.ts storeMemory).
+    """
+    from mem0.embeddings.base import EmbeddingBase
+    from mem0.llms.base import LLMBase
+    from mem0.vector_stores.base import VectorStoreBase
+
+    class RouterLlm(LLMBase):
+        def __init__(self):
+            super().__init__(config={"model": "hub-router", "api_key": "not-used-hub-router"})
+
+        def generate_response(self, messages, tools=None, tool_choice="auto", **kwargs) -> str:
+            # mem0 sends [system, user]; detect the call type from the
+            # USER message only (the system prompt precedes it).
+            # 1.x: fact extraction user prompt starts with "Input:";
+            #      update-memory prompt mentions "new retrieved facts".
+            # 2.x (V3 pipeline): ONE additive-extraction call whose user
+            #      prompt has "## New Messages" sections; it parses
+            #      {"memory": [{"text": ...}]}.
+            user_texts = [str(m.get("content", "")) for m in messages if m.get("role") == "user"]
+            last_user = user_texts[-1] if user_texts else ""
+            if "## New Messages" in last_user:
+                schema: dict | None = MEM_ACTIONS_SCHEMA
+            elif last_user.lstrip().startswith("Input:"):
+                schema = MEM_EXTRACT_SCHEMA
+            elif "new retrieved facts are mentioned" in last_user:
+                schema = MEM_ACTIONS_SCHEMA
+            else:
+                schema = None
+            payload = {
+                "tenant_id": tenant_id,
+                "turn_id": turn_id,
+                "kind": "doc_extraction",
+                "messages": [
+                    {"role": m.get("role", "user"), "text": m.get("content", "")}
+                    for m in messages
+                ],
+                "system": MEM_EXTRACT_SYSTEM,
+            }
+            if schema is not None:
+                payload["response_schema"] = schema
+            result = _router_post(payload, timeout=120)
+            if not result.get("ok"):
+                raise RuntimeError("router: " + str(result.get("error", "upstream_error"))[:100])
+            text = result.get("text") or ""
+            if not text and isinstance(result.get("response"), dict):
+                text = json.dumps(result["response"], ensure_ascii=False)
+            return text
+
+    class RouterEmbedder(EmbeddingBase):
+        def embed(self, text, memory_action=None) -> list:
+            result = _router_post(
+                {
+                    "tenant_id": tenant_id,
+                    "turn_id": turn_id,
+                    "kind": "embeddings",
+                    "messages": [{"role": "user", "text": text}],
+                }
+            )
+            if not result.get("ok") or not result.get("embedding"):
+                raise RuntimeError("router embedding: " + str(result.get("error", "failed"))[:100])
+            return list(result["embedding"])
+
+    class NullVectorStore(VectorStoreBase):
+        """In-memory no-persistence store: search always empty (so every
+        fact is an ADD), insert/get keep rows in a dict for the call."""
+
+        def __init__(self):
+            self._rows: dict[str, dict] = {}
+
+        def create_col(self, name, vector_size, distance):
+            return None
+
+        def insert(self, vectors, payloads=None, ids=None):
+            ids = ids or []
+            for i, mid in enumerate(ids):
+                self._rows[mid] = (payloads or [{}])[i] if payloads else {}
+            return ids
+
+        def search(self, query, vectors, limit=5, top_k=None, filters=None, **_kw):
+            # mem0 1.x calls search(..., limit=5); 2.x calls
+            # search(..., top_k=5). Accept both; always empty (ADD-only).
+            return []
+
+        def search_batch(self, queries, vectors_list, top_k=1, filters=None, **_kw):
+            return [[] for _ in (queries or [])]
+
+        def delete(self, vector_id):
+            self._rows.pop(vector_id, None)
+
+        def update(self, vector_id, vector=None, payload=None):
+            if payload is not None:
+                self._rows[vector_id] = payload
+
+        def get(self, vector_id):
+            payload = self._rows.get(vector_id)
+            if payload is None:
+                return None
+
+            class _Row:
+                pass
+
+            row = _Row()
+            row.id = vector_id
+            row.payload = payload
+            return row
+
+        def list_cols(self):
+            return []
+
+        def delete_col(self):
+            self._rows.clear()
+
+        def col_info(self):
+            return {"name": "null-store", "count": len(self._rows)}
+
+        def reset(self):
+            self._rows.clear()
+
+        def list(self, filters=None, limit=100, top_k=None, **_kw):
+            return []
+
+    return RouterLlm(), RouterEmbedder(), NullVectorStore()
+
+
+# Deterministic rule fallback: no LLM, no key, no library. Patterns are
+# deliberately narrow (high precision, low recall) — a missed fact is
+# honest; a hallucinated one is not.
+_RULE_PATTERNS = [
+    (re.compile(r"\bmy name is ([A-Z][\w ]{1,60})", re.I), "fact"),
+    (re.compile(r"\bi (?:like|love|prefer|enjoy) ([^.;\n]{3,120})", re.I), "preference"),
+    (re.compile(r"\bmy (?:favourite|favorite) ([^.;\n]{3,120})", re.I), "preference"),
+    (re.compile(r"\bmy ([a-z][a-z ]{1,40}?) is ([^.;\n]{2,120})", re.I), "fact"),
+    (re.compile(r"\bi (?:am|live in|work as|work at|study) ([^.;\n]{3,120})", re.I), "fact"),
+    (re.compile(r"\bi want (?:to )?([^.;\n]{3,120})", re.I), "preference"),
+    (re.compile(r"\bplease (?:remember|note) (?:that )?([^.;\n]{3,160})", re.I), "fact"),
+]
+
+
+def _rule_extract_memories(text: str) -> list[dict]:
+    """Rule-based extraction. Returns [{content, kind}] deduped."""
+    seen: set[str] = set()
+    out: list[dict] = []
+    for pattern, kind in _RULE_PATTERNS:
+        for m in pattern.finditer(text):
+            groups = [g.strip(" .") for g in m.groups() if g]
+            # "my name is X" is covered by the dedicated name pattern;
+            # skip the generic "my <key> is <value>" duplicate for it.
+            if len(groups) == 2 and groups[0].lower() == "name":
+                continue
+            content = " ".join(groups)
+            content = re.sub(r"\s+", " ", content).strip()
+            # Skip sentence-fragment captures ("I prefer ..." from the
+            # "please remember" pattern) — keep noun-phrase facts only.
+            if len(content) < 3 or len(content) > 200 or content.lower().startswith("i "):
+                continue
+            key = content.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"content": content, "kind": kind})
+            if len(out) >= MAX_MEMORIES_PER_CALL:
+                return out
+    return out
+
+
+def _mem0_extract(text: str, tenant_id: str, turn_id: str, user_id: str,
+                  metadata: dict) -> tuple[list[dict], str]:
+    """mem0-library extraction via hub-router adapters. Returns
+    (memories, engine). Raises RuntimeError on any failure — the caller
+    reports it, never silently downgrades a mem0 claim to rules.
+
+    Construction notes (verified against mem0ai 1.0.4 AND 2.2.1 source;
+    the adapter works on both — see _mem0_router_adapters):
+    - Memory.__init__ builds a real OpenAI LLM/embedder + Qdrant store
+      from the config, so dummy placeholders are given — but .llm,
+      .embedding_model and .vector_store are ALL swapped before add(),
+      so no OpenAI/Qdrant call is ever made and no key exists.
+    - The placeholder OpenAI client is constructed by mem0 even though
+      it is never called — and its constructor parses the process proxy
+      env vars (HTTP_PROXY etc. AND no_proxy) via httpx. Sandbox/egress
+      values can hold entries httpx cannot parse (here: IPv6 literals
+      in no_proxy → "Invalid port: ':1]'"), so ALL proxy vars are
+      scrubbed around from_config only, then restored.
+    - Telemetry is OFF (MEM0_TELEMETRY=false set before the import;
+      mem0 ships PostHog + a telemetry vector store otherwise).
+    - history_db_path points at a temp dir: the worker keeps no state
+      (the hub persists into D1); the temp dir is deleted after add().
+    - The null vector store makes every fact an ADD (search is empty);
+      the hub owns dedup/persistence downstream."""
+    import tempfile
+
+    os.environ.setdefault("MEM0_TELEMETRY", "false")
+    from mem0 import Memory  # lazy: base worker works without mem0ai
+
+    _PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                   "http_proxy", "https_proxy", "all_proxy", "no_proxy")
+    with tempfile.TemporaryDirectory() as td:
+        config = {
+            "llm": {"provider": "openai", "config": {"model": "gpt-4o-mini", "api_key": "not-used-hub-router"}},
+            "embedder": {"provider": "openai", "config": {"model": "text-embedding-3-small", "api_key": "not-used-hub-router"}},
+            "vector_store": {"provider": "qdrant", "config": {"collection_name": "unused", "path": td}},
+            "history_db_path": os.path.join(td, "history.db"),
+        }
+        saved_proxies = {k: os.environ.pop(k) for k in _PROXY_VARS if k in os.environ}
+        try:
+            mem = Memory.from_config(config)
+        finally:
+            os.environ.update(saved_proxies)
+        llm, embedder, store = _mem0_router_adapters(tenant_id, turn_id)
+        mem.llm = llm
+        mem.embedding_model = embedder
+        mem.vector_store = store
+        result = mem.add(
+            messages=[{"role": "user", "content": text}],
+            user_id=user_id,
+            metadata={**metadata, "tenant_id": tenant_id},
+        )
+    memories: list[dict] = []
+    # 1.x returns {"results": [{memory, event}]}; 2.x returns the list
+    # directly ([{id, memory, event}]). Accept both.
+    if isinstance(result, list):
+        rows = result
+    elif isinstance(result, dict):
+        rows = (result or {}).get("results", []) or []
+    else:
+        rows = []
+    for row in rows:
+        content = (row or {}).get("memory", "")
+        if not content:
+            continue
+        memories.append({"content": content, "kind": "fact", "event": (row or {}).get("event", "ADD")})
+    return memories[:MAX_MEMORIES_PER_CALL], "mem0+hub-router"
+
+
+@app.post("/mem/extract")
+async def mem_extract(request: Request):
+    """Text -> extracted memories. Body JSON: {tenant_id, text,
+    user_id?, metadata?, turn_id?}. Response: {ok, memories[], engine,
+    model, count}. engine is `mem0+hub-router` when the mem0 library
+    ran with the hub router, else `rule_fallback` (deterministic, no
+    LLM). The worker stores nothing — the hub persists into D1."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad_json"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"ok": False, "error": "bad_json"}, status_code=400)
+    tenant_id = body.get("tenant_id") or ""
+    text = body.get("text") or ""
+    if not isinstance(tenant_id, str) or not tenant_id.strip():
+        return JSONResponse({"ok": False, "error": "tenant_id_required"}, status_code=400)
+    if not isinstance(text, str) or not text.strip():
+        return JSONResponse({"ok": False, "error": "text_required"}, status_code=400)
+    if len(text) > MAX_MEM_TEXT_CHARS:
+        return JSONResponse({"ok": False, "error": "text_too_long"}, status_code=413)
+    user_id = body.get("user_id") or tenant_id
+    if not isinstance(user_id, str):
+        user_id = tenant_id
+    metadata = body.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        return JSONResponse({"ok": False, "error": "bad_metadata"}, status_code=400)
+    turn_id = body.get("turn_id") or f"mem-{int(time.time())}"
+    if not isinstance(turn_id, str):
+        turn_id = f"mem-{int(time.time())}"
+    router_ready = bool(HUB_LLM_URL and INTERNAL_SECRET)
+    if router_ready:
+        try:
+            memories, engine = _mem0_extract(text, tenant_id.strip(), turn_id, user_id, metadata)
+            return {
+                "ok": True,
+                "memories": memories,
+                "engine": engine,
+                "model": "hub-router/doc_extraction (+gemini-embedding-001)",
+                "count": len(memories),
+            }
+        except Exception as exc:  # noqa: BLE001 — honest error, no silent fallback
+            return JSONResponse(
+                {"ok": False, "error": "mem_extract_failed", "detail": str(exc)[:200]},
+                status_code=502,
+            )
+    reason = "router_not_configured" if not router_ready else "mem0_unavailable"
+    memories = _rule_extract_memories(text)
+    return {
+        "ok": True,
+        "memories": memories,
+        "engine": "rule_fallback",
+        "model": "rule_fallback (no LLM call made)",
+        "count": len(memories),
+        "note": reason + ": extraction ran without mem0/router; hub must set HUB_LLM_URL + INTERNAL_SECRET for the mem0 path",
+    }
+
+
+# --- Docling extraction (item #10) ---
+# DECISION: separate endpoint POST /doc/extract-docling, NOT engine=docling
+# on /doc/extract. Reasons: (1) /doc/extract is a live hub contract
+# (hub.ts:622 forwards PDFs there) — a flag would change its response
+# shape/timing for existing callers; (2) docling is a heavy optional
+# dep (torch stack) with its own caps and 503-when-absent behaviour;
+# (3) the response differs (layout blocks + table cell grids + markdown),
+# not just "better text". The hub can route table-heavy PDFs here.
+
+MAX_DOCLING_BYTES = 5 * 1024 * 1024
+MAX_DOCLING_PAGES = 20
+MAX_DOCLING_SECONDS = 120
+
+
+import threading as _threading
+
+_DOCLING_CONVERTER = None
+# RLock (not Lock): _docling_extract holds it while _docling_converter
+# re-acquires it on first creation — a plain Lock deadlocks here.
+_DOCLING_LOCK = _threading.RLock()
+
+
+def _docling_converter():
+    """Module-level cached DocumentConverter (lazy singleton).
+
+    Measured 2026-11-22: a FRESH DocumentConverter per call leaks
+    ~150 MB/call in-process (current RSS 943 -> 1103 -> 1255 MB over
+    3 identical converts; gc.collect() does not reclaim it) AND costs
+    ~6 s of model reload per call. The singleton loads models once
+    (first call ~20 s warm, ~260 s cold when models download) and
+    holds ~1.1 GB steady. _DOCLING_LOCK serialises converts (the
+    converter is not safe for concurrent use). Deploy note: Track B
+    should warm this converter once during the Docker build so the
+    layout/OCR models are baked into the image — otherwise the FIRST
+    user call pays the ~260 s model download."""
+    global _DOCLING_CONVERTER
+    if _DOCLING_CONVERTER is None:
+        from docling.document_converter import DocumentConverter
+
+        with _DOCLING_LOCK:
+            if _DOCLING_CONVERTER is None:
+                _DOCLING_CONVERTER = DocumentConverter()
+    return _DOCLING_CONVERTER
+
+
+def _docling_extract(pdf_bytes: bytes) -> dict:
+    """Docling convert (lazy import). Returns {pages, text, markdown,
+    tables, timings}. Raises on failure — caller maps to 422/503."""
+    import tempfile
+
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory() as td:
+        import os as _os
+
+        src = _os.path.join(td, "doc.pdf")
+        with open(src, "wb") as f:
+            f.write(pdf_bytes)
+        with _DOCLING_LOCK:
+            converter = _docling_converter()
+            result = converter.convert(src)
+        convert_s = round(time.monotonic() - started, 2)
+        doc = result.document
+        text = doc.export_to_text()
+        try:
+            markdown = doc.export_to_markdown()
+        except Exception:
+            markdown = ""
+        tables: list[dict] = []
+        for t in doc.tables or []:
+            try:
+                grid = [[c.text for c in row] for row in t.data.grid]
+            except Exception:
+                grid = []
+            page_no = None
+            try:
+                prov = getattr(t, "prov", None) or []
+                first = prov[0] if prov else None
+                if isinstance(first, dict):
+                    page_no = first.get("page_no")
+                elif first is not None:
+                    page_no = getattr(first, "page_no", None)
+            except Exception:
+                page_no = None
+            tables.append({"page": page_no, "rows": grid})
+        pages = len(doc.pages) if getattr(doc, "pages", None) else 0
+    total_s = round(time.monotonic() - started, 2)
+    return {
+        "pages": pages,
+        "text": text,
+        "markdown": markdown,
+        "tables": tables,
+        "timings": {"convert_s": convert_s, "total_s": total_s},
+    }
+
+
+@app.post("/doc/extract-docling")
+async def doc_extract_docling(file: UploadFile = File(...)):
+    """PDF -> Docling layout+tables. Caps: 5 MB, 20 pages, 120s.
+    Response: {ok, engine, pages, text, markdown, tables, timings}.
+    503 docling_not_available when the lib is not installed."""
+    data = await file.read()
+    if len(data) > MAX_DOCLING_BYTES:
+        return JSONResponse({"ok": False, "error": "pdf_too_large"}, status_code=413)
+    try:
+        result = _docling_extract(data)
+    except ImportError:
+        return JSONResponse({"ok": False, "error": "docling_not_available"}, status_code=503)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(
+            {"ok": False, "error": "docling_failed", "detail": str(exc)[:200]},
+            status_code=422,
+        )
+    return {"ok": True, "engine": "docling", **result}
+
+
 # --- AST static scan (3d skill registry reuses this; deterministic, no LLM) ---
 
 DANGEROUS_CALLS = {
@@ -408,6 +932,281 @@ def scan_source(source: str) -> list[dict]:
     return findings
 
 
+# --- Bandit scan (item #36, Apache 2.0) — alongside the AST scan ---
+# In-process BanditManager (lazy import; ~0.8s import, ~0s scan on
+# small files). Source is written to a temp file because Bandit works
+# on file paths; the temp dir is deleted after the run. Any failure
+# (lib missing, crash) -> bandit_available=false and the AST findings
+# still answer — never a fake clean, never a crash of /doc/scan.
+
+def _bandit_scan(source: str) -> tuple[bool, list[dict], str | None]:
+    """Returns (available, findings, error). Findings are
+    [{line, test_id, severity, confidence, detail, cwe}]."""
+    try:
+        import tempfile
+
+        from bandit.core import config as bandit_config
+        from bandit.core import manager as bandit_manager
+    except ImportError:
+        return False, [], "bandit_not_installed"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            import os as _os
+
+            path = _os.path.join(td, "skill.py")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(source)
+            mgr = bandit_manager.BanditManager(bandit_config.BanditConfig(), "file")
+            mgr.discover_files([path])
+            mgr.run_tests()
+            findings = []
+            for issue in mgr.get_issue_list():
+                cwe = None
+                try:
+                    cwe = issue.cwe.id if issue.cwe else None
+                except Exception:
+                    cwe = None
+                findings.append({
+                    "line": issue.lineno,
+                    "test_id": issue.test_id,
+                    "severity": str(issue.severity),
+                    "confidence": str(issue.confidence),
+                    "detail": issue.text[:300],
+                    "cwe": cwe,
+                })
+        return True, findings, None
+    except Exception as exc:  # noqa: BLE001 — Bandit crash must not kill the scan
+        return False, [], str(exc)[:200]
+
+
+# --- Browser-Use agent run (item #18) — see BROWSER_USE.md ---
+# Gated: BROWSER_USE_ENABLED=1 + non-empty BROWSER_ALLOWLIST, else 503.
+# LLM is a browser-use 0.7 chat model backed by the hub router (kind
+# agent_plan) — the worker holds no key. One run at a time (lock);
+# login/captcha -> status needs_human, never auto-solved (D3 rule).
+
+_browse_lock = None  # created lazily (asyncio.Lock needs a loop)
+
+
+def _browse_lock_get():
+    global _browse_lock
+    if _browse_lock is None:
+        import asyncio
+
+        _browse_lock = asyncio.Lock()
+    return _browse_lock
+
+
+def _bu_message_text(m) -> str:
+    """Extract plain text from a browser-use message (content may be a
+    string or a list of content parts; image parts are dropped — the
+    agent runs with use_vision=False, see _run_browser_agent)."""
+    text = getattr(m, "text", None)
+    if isinstance(text, str) and text:
+        return text
+    content = getattr(m, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(getattr(p, "text", None), str):
+                parts.append(p.text)
+            elif isinstance(p, dict) and isinstance(p.get("text"), str):
+                parts.append(p["text"])
+        return "\n".join(parts)
+    return str(content or "")
+
+
+class _RouterChatModel:
+    """Factory for a browser-use 0.7 chat model backed by the hub router.
+
+    browser-use 0.7 defines its OWN BaseChatModel Protocol (NOT
+    langchain): `model`, `provider`, `name` + async
+    `ainvoke(messages, output_format=None) -> ChatInvokeCompletion`.
+    The agent ALWAYS calls ainvoke with output_format=AgentOutput, so
+    the adapter derives a JSON schema from that pydantic model, sends
+    it as the router response_schema, and validates the returned JSON
+    back into the model. Built lazily so the base worker never imports
+    browser-use. The router call is synchronous (urllib) run in a
+    thread; the agent runs with use_vision=False (text DOM only)."""
+
+    @staticmethod
+    def build(tenant_id: str, turn_id: str):
+        from browser_use.llm.views import ChatInvokeCompletion
+
+        class RouterChat:
+            model = "hub-router"
+            provider = "omnijarvis-hub-router"
+
+            @property
+            def name(self) -> str:
+                return "hub-router/agent_plan"
+
+            async def ainvoke(self, messages, output_format=None):
+                import asyncio
+
+                def _call() -> str:
+                    payload = {
+                        "tenant_id": tenant_id,
+                        "turn_id": turn_id,
+                        "kind": "agent_plan",
+                        "messages": [
+                            {"role": getattr(m, "role", "user"), "text": _bu_message_text(m)}
+                            for m in messages
+                        ],
+                    }
+                    if output_format is not None:
+                        try:
+                            payload["response_schema"] = output_format.model_json_schema()
+                        except Exception:
+                            pass
+                    result = _router_post(payload, timeout=120)
+                    if not result.get("ok"):
+                        raise RuntimeError(
+                            "router: " + str(result.get("error", "upstream_error"))[:100]
+                        )
+                    text = result.get("text") or ""
+                    if not text and isinstance(result.get("response"), dict):
+                        text = json.dumps(result["response"], ensure_ascii=False)
+                    return text
+
+                text = await asyncio.to_thread(_call)
+                if output_format is None:
+                    return ChatInvokeCompletion(completion=text, usage=None)
+                cleaned = text.strip()
+                if cleaned.startswith("```"):
+                    cleaned = cleaned.strip("`").strip()
+                    if cleaned.lower().startswith("json"):
+                        cleaned = cleaned[4:].strip()
+                try:
+                    parsed = output_format.model_validate_json(cleaned)
+                except Exception as exc:
+                    raise RuntimeError(f"router reply did not match {output_format.__name__}: {exc}") from exc
+                return ChatInvokeCompletion(completion=parsed, usage=None)
+
+        return RouterChat()
+
+
+def _browse_url_allowed(url: str) -> bool:
+    """Allowlist check on the URL host (exact host or subdomain)."""
+    from urllib.parse import urlparse
+
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    return any(host == h or host.endswith("." + h) for h in BROWSER_ALLOWLIST)
+
+
+async def _run_browser_agent(task: str, url: str | None, max_steps: int,
+                             tenant_id: str, turn_id: str) -> dict:
+    """Run browser-use Agent. Returns a plain-dict result. Raises on
+    missing libs / agent failure — caller maps to honest errors."""
+    # browser-use ships anonymized (PostHog) telemetry ON by default;
+    # the worker sends no telemetry anywhere.
+    os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
+    try:
+        from browser_use import Agent
+    except ImportError as exc:
+        raise RuntimeError("browser_use_not_installed") from exc
+    llm = _RouterChatModel.build(tenant_id, turn_id)
+    full_task = task if not url else f"{task}\nStart at this URL: {url}"
+    # 0.7.x API (BrowserSession) with fallback to pre-0.7 (Browser).
+    try:
+        from browser_use import BrowserSession
+
+        session = BrowserSession(headless=True)
+        # use_vision=False: the hub router is text-only (no image parts
+        # in its messages); the agent steers from the DOM snapshot.
+        agent = Agent(task=full_task, llm=llm, browser_session=session, use_vision=False)
+    except ImportError:
+        from browser_use import Browser
+
+        agent = Agent(task=full_task, llm=llm, browser=Browser(headless=True), use_vision=False)
+    import asyncio
+
+    history = await asyncio.wait_for(agent.run(max_steps=max_steps), timeout=300)
+    final = ""
+    urls: list[str] = []
+    try:
+        final = history.final_result() or ""
+    except Exception:
+        final = ""
+    try:
+        urls = [str(u) for u in (history.urls() or [])]
+    except Exception:
+        urls = []
+    blocked = [u for u in urls if not _browse_url_allowed(u)]
+    status = "done"
+    if blocked:
+        status = "needs_human"
+        final = (final + " [stopped: navigation left the allowlist]").strip()
+    return {"status": status, "final_text": final, "urls_visited": urls,
+            "steps": len(urls)}
+
+
+@app.post("/browse/run")
+async def browse_run(request: Request):
+    """Gated Browser-Use run. Body JSON: {tenant_id, task, url?,
+    max_steps?}. Response: {ok, status, steps, final_text,
+    urls_visited}. status: done | needs_human | error. 503 when
+    disabled or libs missing; 403 on non-allowlisted URL; 429 when a
+    run is already in progress."""
+    if not BROWSER_USE_ENABLED:
+        return JSONResponse({"ok": False, "error": "browser_disabled"}, status_code=503)
+    if not BROWSER_ALLOWLIST:
+        return JSONResponse({"ok": False, "error": "browser_allowlist_empty"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad_json"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"ok": False, "error": "bad_json"}, status_code=400)
+    tenant_id = body.get("tenant_id") or ""
+    task = body.get("task") or ""
+    url = body.get("url") or None
+    if not isinstance(tenant_id, str) or not tenant_id.strip():
+        return JSONResponse({"ok": False, "error": "tenant_id_required"}, status_code=400)
+    if not isinstance(task, str) or not task.strip():
+        return JSONResponse({"ok": False, "error": "task_required"}, status_code=400)
+    if len(task) > MAX_BROWSE_TASK_CHARS:
+        return JSONResponse({"ok": False, "error": "task_too_long"}, status_code=413)
+    if url is not None:
+        if not isinstance(url, str) or not _browse_url_allowed(url):
+            return JSONResponse({"ok": False, "error": "url_not_allowed"}, status_code=403)
+    max_steps = body.get("max_steps", 10)
+    if not isinstance(max_steps, int) or max_steps < 1 or max_steps > MAX_BROWSE_STEPS:
+        return JSONResponse({"ok": False, "error": "bad_max_steps"}, status_code=400)
+    if not (HUB_LLM_URL and INTERNAL_SECRET):
+        return JSONResponse({"ok": False, "error": "router_not_configured"}, status_code=503)
+    lock = _browse_lock_get()
+    if lock.locked():
+        return JSONResponse({"ok": False, "error": "browser_busy"}, status_code=429)
+    turn_id = f"browse-{int(time.time())}"
+    async with lock:
+        try:
+            result = await _run_browser_agent(
+                task.strip(), url, max_steps, tenant_id.strip(), turn_id
+            )
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "browser_use_not_installed" in msg or "langchain" in msg.lower():
+                return JSONResponse({"ok": False, "error": "browser_not_available"}, status_code=503)
+            return JSONResponse(
+                {"ok": False, "error": "agent_failed", "detail": msg[:200]}, status_code=502
+            )
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                {"ok": False, "error": "agent_failed", "detail": str(exc)[:200]}, status_code=502
+            )
+    return {"ok": True, **result}
+
+
 @app.post("/doc/scan")
 async def doc_scan(file: UploadFile = File(...)):
     """Python source -> AST static scan. Response: {ok, findings[]}.
@@ -420,4 +1219,13 @@ async def doc_scan(file: UploadFile = File(...)):
     except Exception:
         return JSONResponse({"ok": False, "error": "not_utf8"}, status_code=400)
     findings = scan_source(source)
-    return {"ok": True, "findings": findings}
+    bandit_available, bandit_findings, bandit_error = _bandit_scan(source)
+    response: dict = {
+        "ok": True,
+        "findings": findings,
+        "bandit_available": bandit_available,
+        "bandit_findings": bandit_findings,
+    }
+    if bandit_error:
+        response["bandit_error"] = bandit_error
+    return response

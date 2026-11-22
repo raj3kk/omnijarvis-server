@@ -1,0 +1,21 @@
+# OmniJarvis worker HEAVY deps — 16 GB host ONLY (HF Spaces cpu-basic
+# with PRO, or any Docker host with >=4 GB free RAM). NEVER install on a
+# 512 MB host (Render/Koyeb free): docling alone holds ~1.1 GB RSS and the
+# venv is ~1.8 GB. The worker code lazy-imports all of these and answers
+# an honest 503 when a lib is absent, so the light image serves every
+# base route without this file. Install with the CPU torch index —
+# default PyPI pulls multi-GB CUDA wheels (Track D REPORT.md §2).
+#   pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+#       -r requirements-heavy.txt
+# Pins (Track D, verified in one clean venv, `pip check` clean):
+#   mem0ai 2.2.1 allows protobuf<7 (1.0.4 pins protobuf<6, unresolvable
+#   with browser-use's google libs needing protobuf>=6.33.5).
+#   browser-use 0.7.6 needs openai>=1.99.2,<2.0.0 and
+#   portalocker>=2.7.0,<3.0.0; pydantic-settings is not pulled in by
+#   browser-use itself and must be pinned explicitly.
+docling==2.55.0
+browser-use==0.7.6
+playwright==1.55.0
+pydantic-settings==2.13.0
+openai>=1.99.2,<2.0.0
+portalocker>=2.7.0,<3.0.0

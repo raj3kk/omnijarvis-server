@@ -16,6 +16,17 @@
  * (re-run at review time) + a signature. A manifest's `code` field is the
  * scan target; a manifest without `code` is vacuous-clean (`no_code`).
  *
+ * ANTHROPIC SKILLS FORMAT (completeness #9): alongside the v1 JSON
+ * manifest, `validateSkillManifest` accepts an Anthropic SKILL.md
+ * document (YAML frontmatter `name` / `description` /
+ * `allowed-tools` + Markdown instruction body) — passed either as a
+ * raw string or as an object with `format: "anthropic"`. It is
+ * normalised to a v1 manifest: `version` defaults to "1.0.0"
+ * (Anthropic frontmatter has no version), `trigger` defaults to the
+ * skill name (the invocation name), `steps` defaults to a single
+ * `follow-skill-instructions` pointer step, and the Markdown body is
+ * kept verbatim in `instructions`. Nothing about the v1 rules changes.
+ *
  * Auth is NOT invented here: hub routes reuse docs.ts
  * authorizeDocsRequest() (internal-secret OR paired device + Ed25519).
  */
@@ -41,6 +52,10 @@ export interface SkillManifest {
   evidence?: Record<string, unknown>;
   requirements?: Record<string, unknown> | unknown[];
   code?: string;
+  /** Anthropic-format skills only: "anthropic" + normalised fields. */
+  format?: string;
+  allowed_tools?: string[];
+  instructions?: string;
   [key: string]: unknown;
 }
 
@@ -52,14 +67,24 @@ function isNonEmptyString(v: unknown): v is string {
  * Validate a submitted manifest against the frozen schema. Returns the
  * typed manifest on success; on failure the FIRST violated rule (field
  * name only — never manifest content, never logged).
+ *
+ * Accepts three shapes (completeness #9):
+ *  1. v1 JSON manifest object (frozen rules below, unchanged).
+ *  2. An Anthropic SKILL.md document as a raw string (frontmatter +
+ *     Markdown body) — parsed by parseAnthropicSkillMd.
+ *  3. An object with `format: "anthropic"` (name/description/
+ *     allowed_tools) — normalised to v1 (version/trigger/steps
+ *     defaulted, instructions kept).
  */
 export function validateSkillManifest(
   input: unknown,
 ): { ok: true; manifest: SkillManifest } | { ok: false; error: string } {
+  if (typeof input === "string") return parseAnthropicSkillMd(input);
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     return { ok: false, error: "manifest must be an object" };
   }
   const m = input as Record<string, unknown>;
+  if (m.format === "anthropic") return validateAnthropicManifest(m);
   if (!isNonEmptyString(m.name)) return { ok: false, error: "manifest.name is required" };
   if (!isNonEmptyString(m.version)) return { ok: false, error: "manifest.version is required" };
   if (!isNonEmptyString(m.trigger)) return { ok: false, error: "manifest.trigger is required" };
@@ -88,6 +113,165 @@ export function validateSkillManifest(
     return { ok: false, error: "manifest.code must be a string" };
   }
   return { ok: true, manifest: input as SkillManifest };
+}
+
+// --- Anthropic SKILL.md format (completeness #9) ---
+
+function unquoteFrontmatterValue(v: string): string {
+  const t = v.trim();
+  if (t.length >= 2 && ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")))) {
+    return t.slice(1, -1);
+  }
+  return t;
+}
+
+/**
+ * Parse the YAML frontmatter block of an Anthropic SKILL.md file.
+ * Tiny hand-rolled parser (no YAML dep): supports `key: value`
+ * lines (quoted or plain) and `allowed-tools` as either a
+ * comma-separated value or a `- item` list. Unknown keys are kept
+ * verbatim as strings. Returns the raw map + the key order seen.
+ */
+function parseSkillFrontmatter(
+  block: string,
+): { ok: true; fields: Record<string, unknown> } | { ok: false; error: string } {
+  const fields: Record<string, unknown> = {};
+  const seen = new Set<string>();
+  let listKey: string | null = null;
+  for (const rawLine of block.split("\n")) {
+    const line = rawLine.replace(/\r$/, "");
+    if (!line.trim() || line.trim().startsWith("#")) continue;
+    const listMatch = /^(\s*)-\s+(.+)$/.exec(line);
+    if (listMatch) {
+      if (!listKey) return { ok: false, error: "frontmatter list item without a key" };
+      const arr = fields[listKey] as string[];
+      const item = unquoteFrontmatterValue(listMatch[2]);
+      if (!item) return { ok: false, error: `frontmatter.${listKey} entries must be non-empty` };
+      arr.push(item);
+      continue;
+    }
+    listKey = null;
+    const kvMatch = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
+    if (!kvMatch) return { ok: false, error: "frontmatter line is not key: value" };
+    const key = kvMatch[1];
+    if (seen.has(key)) return { ok: false, error: `frontmatter duplicate key: ${key}` };
+    seen.add(key);
+    const value = kvMatch[2].trim();
+    if (value === "") {
+      // Key with no inline value: a `- item` list may follow.
+      fields[key] = [];
+      listKey = key;
+    } else {
+      fields[key] = unquoteFrontmatterValue(value);
+    }
+  }
+  return { ok: true, fields };
+}
+
+/** Normalise `allowed-tools` (string or list) to a string array. */
+function normaliseAllowedTools(
+  raw: unknown,
+): { ok: true; tools: string[] } | { ok: false; error: string } {
+  if (raw === undefined) return { ok: true, tools: [] };
+  if (typeof raw === "string") {
+    const parts = raw.split(",");
+    if (parts.some((t) => !t.trim())) {
+      return { ok: false, error: "frontmatter.allowed-tools entries must be non-empty" };
+    }
+    return { ok: true, tools: parts.map((t) => t.trim()) };
+  }
+  if (Array.isArray(raw)) {
+    if (!raw.every((t) => typeof t === "string" && t.trim())) {
+      return { ok: false, error: "frontmatter.allowed-tools entries must be non-empty strings" };
+    }
+    return { ok: true, tools: (raw as string[]).map((t) => t.trim()) };
+  }
+  return { ok: false, error: "frontmatter.allowed-tools must be a string or list" };
+}
+
+/**
+ * Validate + normalise an Anthropic-shaped manifest object
+ * (`format: "anthropic"`). Required: non-empty `name` + `description`.
+ * `allowed_tools` / `allowed-tools` (string or list) normalises to
+ * `allowed_tools: string[]`. v1-only fields default: version "1.0.0",
+ * trigger = name, steps = single follow-skill-instructions pointer.
+ * `instructions` (the Markdown body) must be a string when present.
+ */
+export function validateAnthropicManifest(
+  m: Record<string, unknown>,
+): { ok: true; manifest: SkillManifest } | { ok: false; error: string } {
+  if (!isNonEmptyString(m.name)) return { ok: false, error: "manifest.name is required" };
+  if (!isNonEmptyString(m.description)) return { ok: false, error: "manifest.description is required" };
+  const toolsRaw = m.allowed_tools !== undefined ? m.allowed_tools : m["allowed-tools"];
+  const tools = normaliseAllowedTools(toolsRaw);
+  if (!tools.ok) return { ok: false, error: tools.error };
+  if (m.instructions !== undefined && typeof m.instructions !== "string") {
+    return { ok: false, error: "manifest.instructions must be a string" };
+  }
+  if (m.version !== undefined && !isNonEmptyString(m.version)) {
+    return { ok: false, error: "manifest.version must be a non-empty string" };
+  }
+  if (m.trigger !== undefined && !isNonEmptyString(m.trigger)) {
+    return { ok: false, error: "manifest.trigger must be a non-empty string" };
+  }
+  const steps =
+    m.steps !== undefined
+      ? m.steps
+      : [{ action: "follow-skill-instructions" }];
+  if (!Array.isArray(steps) || steps.length === 0) {
+    return { ok: false, error: "manifest.steps must be a non-empty array" };
+  }
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i] as Record<string, unknown> | null;
+    if (!step || typeof step !== "object" || Array.isArray(step) || !isNonEmptyString(step.action)) {
+      return { ok: false, error: `manifest.steps[${i}].action is required` };
+    }
+  }
+  const manifest: SkillManifest = {
+    ...(m as Record<string, unknown>),
+    format: "anthropic",
+    name: (m.name as string).trim(),
+    version: isNonEmptyString(m.version) ? (m.version as string) : "1.0.0",
+    trigger: isNonEmptyString(m.trigger) ? (m.trigger as string) : (m.name as string).trim(),
+    steps: steps as Array<Record<string, unknown>>,
+    description: (m.description as string).trim(),
+    allowed_tools: tools.tools,
+  } as SkillManifest;
+  delete (manifest as Record<string, unknown>)["allowed-tools"];
+  return { ok: true, manifest };
+}
+
+/**
+ * Parse a full Anthropic SKILL.md document: `---` frontmatter block
+ * (name/description/allowed-tools) + Markdown instruction body.
+ * Malformed input (no frontmatter, missing name/description, empty
+ * body, bad frontmatter line) is rejected with a field-named error.
+ */
+export function parseAnthropicSkillMd(
+  md: string,
+): { ok: true; manifest: SkillManifest } | { ok: false; error: string } {
+  if (typeof md !== "string" || !md.trim()) {
+    return { ok: false, error: "skill file is empty" };
+  }
+  const lines = md.replace(/\r\n/g, "\n").split("\n");
+  let start = 0;
+  while (start < lines.length && !lines[start].trim()) start++;
+  if (lines[start]?.trim() !== "---") {
+    return { ok: false, error: "skill file must start with frontmatter (---)" };
+  }
+  let end = -1;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (lines[i].trim() === "---") {
+      end = i;
+      break;
+    }
+  }
+  if (end === -1) return { ok: false, error: "skill file frontmatter is not closed (---)" };
+  const parsed = parseSkillFrontmatter(lines.slice(start + 1, end).join("\n"));
+  if (!parsed.ok) return { ok: false, error: parsed.error };
+  const body = lines.slice(end + 1).join("\n").trim();
+  if (!body) return { ok: false, error: "skill file body is required" };
+  return validateAnthropicManifest({ ...parsed.fields, format: "anthropic", instructions: body });
 }
 
 /** Server-generated skill id: `skl-` + 16 hex (browser taskId pattern). */

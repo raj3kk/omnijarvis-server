@@ -498,7 +498,8 @@ export interface CapUsage {
 }
 
 /** Har cap jis par usage >= 80% ho — status response me warnings[].
- * Email send U-6 ke kaaran nahi; warning status me hona hi server-side proof hai. */
+ * Cap-warning emails are NOT sent (status-only by design); renewal
+ * reminders are the email path (Resend, src/email.ts). */
 export function capWarnings(usage: CapUsage, planTier: string): string[] {
   const limits = planLimits(planTier);
   const out: string[] = [];
@@ -600,14 +601,16 @@ export async function hashEmailVerifyToken(token: string): Promise<string> {
 export const EMAIL_VERIFY_TTL_MS = 24 * 60 * 60 * 1000;
 
 export type RequestVerifyResult =
-  | { ok: true; verification_pending: true }
+  | { ok: true; verification_pending: true; token: string }
   | { ok: false; error: "disposable_email" | "already_verified" };
 
 /**
  * Verify-email request. Token generate karo, HASH + 24h expiry store
- * karo — token response me KABHI nahi (email se jayega). Email send
- * U-6 ke kaaran abhi wired nahi hai (koi Resend/SMTP code nahi) —
- * isliye live me admin god-mode verify-email se khola jayega.
+ * karo — token HTTP response me KABHI nahi (sirf is function ke return
+ * me, caller-only: the route sends it via Resend email, never in the
+ * response body). Email send is wired in src/email.ts (Resend, #52) —
+ * when RESEND_API_KEY is unset the route reports email:"not_configured"
+ * and the token stays pending (admin god-mode verify still exists).
  * `tokenForTest` sirf vitest ke liye hai (route kabhi pass nahi karta).
  */
 export async function requestEmailVerification(
@@ -623,7 +626,7 @@ export async function requestEmailVerification(
     .prepare("UPDATE tenants SET email_verify_token_hash = ?, email_verify_expires_at = ? WHERE id = ?")
     .bind(hash, nowMs + EMAIL_VERIFY_TTL_MS, opts.tenant.id)
     .run();
-  return { ok: true, verification_pending: true };
+  return { ok: true, verification_pending: true, token };
 }
 
 export type ConfirmVerifyResult = { ok: true } | { ok: false; error: "verification_failed" };
@@ -660,8 +663,20 @@ export interface SweepResult {
   killed_runs: number;
 }
 
-/** Idempotent billing sweep (dobara tick = no-op — status check ke baad hi likho). */
-export async function runBillingSweeps(db: D1Like, nowMs = Date.now()): Promise<SweepResult> {
+/** Idempotent billing sweep (dobara tick = no-op — status check ke baad hi likho).
+ * `onReminder` (optional, hub passes it): called once per due renewal
+ * reminder AFTER the renewal_reminder trace is written (trace = the
+ * idempotency guard, one reminder per window). The callback sends the
+ * Resend email (src/email.ts) and must never throw — a throw here is
+ * swallowed so one failed email can never break the sweep. Email
+ * failures are recorded in the email_sends table by the sender. */
+export async function runBillingSweeps(
+  db: D1Like,
+  nowMs = Date.now(),
+  opts?: {
+    onReminder?: (ctx: { tenant: TenantRow; subscription: SubscriptionRow; window: "7d" | "1d" }) => Promise<void>;
+  },
+): Promise<SweepResult> {
   const result: SweepResult = { expired_pending: 0, expired_active: 0, downgrades_applied: 0, reminders: 0, killed_runs: 0 };
 
   // 1. Pending-payment expiry (24h UTR na aaye — T-U11).
@@ -716,7 +731,8 @@ export async function runBillingSweeps(db: D1Like, nowMs = Date.now()): Promise<
   }
 
   // 3. Renewal reminders (7d / 1d) — trace = reminder-due ka record;
-  // email send U-6 ke kaaran nahi (trace + status flag hi proof hai).
+  // the Resend email (when the hub passes onReminder) is best-effort
+  // on top of the trace; a failed send is recorded in email_sends.
   const activeNow = await db
     .prepare("SELECT id, tenant_id, plan_tier, billing_period, amount_paise, status, starts_at, expires_at, created_at FROM subscriptions WHERE status = ?")
     .bind("active")
@@ -733,6 +749,14 @@ export async function runBillingSweeps(db: D1Like, nowMs = Date.now()): Promise<
     if (existing) continue;
     await insertTrace(db, sub.tenant_id, "", "renewal_reminder", { subscription_id: sub.id, window });
     result.reminders++;
+    if (opts?.onReminder) {
+      try {
+        const tenant = await getTenant(db, sub.tenant_id);
+        if (tenant) await opts.onReminder({ tenant, subscription: sub, window });
+      } catch {
+        // One failed email never breaks the sweep.
+      }
+    }
   }
 
   // 4. E2B auto-kill (C4: 15-min cap — T-E1/T-M4).

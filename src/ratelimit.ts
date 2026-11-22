@@ -37,11 +37,89 @@ export const RATE_LIMITS: Record<string, { limit: number; windowMs: number }> = 
   // D3 locked (captcha-solver DESIGN §2.2): 10/min/tenant — far above
   // the 10/day solve cap, so it only bites on a runaway loop.
   captcha_solve: { limit: 10, windowMs: 60_000 },
+  googleOauthStart: { limit: 10, windowMs: 60_000 },
+  googleApi: { limit: 30, windowMs: 60_000 },
 };
 
 export interface RateLimitResult {
   allowed: boolean;
   fallback: boolean;
+}
+
+export interface UpstashOpts {
+  fetchFn?: typeof fetch;
+}
+
+/** Configured ONLY when BOTH UPSTASH_REDIS_REST_URL and TOKEN are set. */
+export function upstashStatus(env: Env): { configured: boolean } {
+  const rec = env as unknown as Record<string, string | undefined>;
+  return { configured: Boolean(rec.UPSTASH_REDIS_REST_URL && rec.UPSTASH_REDIS_REST_TOKEN) };
+}
+
+function upstashCreds(env: Env): { url: string; token: string } | null {
+  const rec = env as unknown as Record<string, string | undefined>;
+  const url = (rec.UPSTASH_REDIS_REST_URL ?? "").replace(/\/+$/, "");
+  const token = rec.UPSTASH_REDIS_REST_TOKEN ?? "";
+  return url && token ? { url, token } : null;
+}
+
+/**
+ * Live check (completeness #45): GET {url}/ping -> "PONG".
+ * `live: false` with `configured: true` means the Worker cannot reach
+ * Upstash (or the token is wrong) — checkRateLimit then falls back
+ * visibly (x-ratelimit-fallback: 1), never silently.
+ */
+export async function checkUpstashLive(
+  env: Env,
+  opts: UpstashOpts = {},
+): Promise<{ configured: boolean; live: boolean }> {
+  const creds = upstashCreds(env);
+  if (!creds) return { configured: false, live: false };
+  try {
+    const res = await (opts.fetchFn ?? fetch)(`${creds.url}/ping`, {
+      headers: { Authorization: `Bearer ${creds.token}` },
+    });
+    if (!res.ok) return { configured: true, live: false };
+    const text = (await res.text()).trim().replace(/^"|"$/g, "");
+    return { configured: true, live: text === "PONG" };
+  } catch {
+    return { configured: true, live: false };
+  }
+}
+
+/**
+ * Distributed-counter proof (completeness #45, admin diagnostic only):
+ * INCR the same probe key twice through the Upstash pipeline, then DEL
+ * it. Two sequential counts (n, n+1) prove the counter lives in
+ * Upstash, not in the isolate — a per-isolate fallback could never
+ * return a persisted second increment from a fresh pipeline call.
+ * The probe key is random per call and deleted afterwards, so it leaks
+ * no real quota state. Never throws.
+ */
+export async function probeUpstashCounter(
+  env: Env,
+  opts: UpstashOpts = {},
+): Promise<{ ok: boolean; key?: string; counts?: number[]; error?: string }> {
+  const creds = upstashCreds(env);
+  if (!creds) return { ok: false, error: "upstash_not_configured" };
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  const key = `rl:probe:${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+  try {
+    const res = await (opts.fetchFn ?? fetch)(`${creds.url}/pipeline`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${creds.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify([["INCR", key], ["INCR", key], ["DEL", key]]),
+    });
+    if (!res.ok) return { ok: false, error: "upstash_error" };
+    const data = (await res.json()) as { result?: unknown }[];
+    const counts = [Number(data?.[0]?.result ?? NaN), Number(data?.[1]?.result ?? NaN)];
+    if (!counts.every((c) => Number.isFinite(c))) return { ok: false, error: "upstash_error" };
+    if (counts[1] !== counts[0] + 1) return { ok: false, key, counts, error: "counter_not_sequential" };
+    return { ok: true, key, counts };
+  } catch {
+    return { ok: false, error: "upstash_error" };
+  }
 }
 
 // In-memory fallback store (per-isolate; v1 documented limitation).
