@@ -382,3 +382,46 @@ describe("D1 migration 0012 (1.12.0 FCM: fcm_tokens + fcm_sends)", () => {
     expect(code.toLowerCase()).not.toContain("service_account");
   });
 });
+
+const SQL13 = readFileSync(
+  new URL("../d1/migrations/0013_licence_web.sql", import.meta.url),
+  "utf8",
+);
+
+describe("D1 migration 0013 (M-I-28 licence web: users + codes + sessions)", () => {
+  it("creates licence_web_users keyed by email, no password column anywhere", () => {
+    expect(SQL13).toContain("CREATE TABLE IF NOT EXISTS licence_web_users (");
+    for (const col of ["email TEXT PRIMARY KEY", "email_verified INTEGER NOT NULL DEFAULT 0", "created_at INTEGER NOT NULL", "last_login_at INTEGER"]) {
+      expect(SQL13).toContain(col);
+    }
+    expect(SQL13.toLowerCase()).not.toContain("password_hash");
+    const usersTable = SQL13.slice(SQL13.indexOf("CREATE TABLE IF NOT EXISTS licence_web_users"), SQL13.indexOf(");", SQL13.indexOf("CREATE TABLE IF NOT EXISTS licence_web_users")));
+    expect(usersTable.toLowerCase()).not.toContain("password");
+  });
+
+  it("creates licence_email_codes keyed by (email, purpose) with hashed code + expiry + attempts", () => {
+    expect(SQL13).toContain("CREATE TABLE IF NOT EXISTS licence_email_codes (");
+    for (const col of ["email TEXT NOT NULL", "purpose TEXT NOT NULL", "code_hash TEXT NOT NULL", "expires_at INTEGER NOT NULL", "attempts INTEGER NOT NULL DEFAULT 0", "PRIMARY KEY (email, purpose)"]) {
+      expect(SQL13).toContain(col);
+    }
+    expect(SQL13).not.toContain("code TEXT");
+  });
+
+  it("creates licence_web_sessions keyed by token hash + email index", () => {
+    expect(SQL13).toContain("CREATE TABLE IF NOT EXISTS licence_web_sessions (");
+    for (const col of ["token_hash TEXT PRIMARY KEY", "email TEXT NOT NULL", "expires_at INTEGER NOT NULL", "last_seen_at INTEGER NOT NULL"]) {
+      expect(SQL13).toContain(col);
+    }
+    expect(SQL13).toContain("idx_licence_web_sessions_email");
+    expect(SQL13).not.toContain("token TEXT");
+  });
+
+  it("is non-destructive: no DROP TABLE / TRUNCATE / DELETE FROM, no secrets", () => {
+    const code = SQL13.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(code).not.toMatch(/DROP\s+TABLE/i);
+    expect(code).not.toMatch(/TRUNCATE/i);
+    expect(code).not.toMatch(/DELETE\s+FROM/i);
+    expect(code.toLowerCase()).not.toContain("licence_admin_token");
+    expect(code.toLowerCase()).not.toContain("resend_api_key");
+  });
+});

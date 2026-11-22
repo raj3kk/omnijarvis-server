@@ -43,6 +43,12 @@ export const RATE_LIMITS: Record<string, { limit: number; windowMs: number }> = 
   // internal-secret only, so 30/min only bites on a runaway trigger.
   fcm_register: { limit: 30, windowMs: 60_000 },
   fcm_send: { limit: 30, windowMs: 60_000 },
+  // M-I-28 licence web (passwordless email codes): signup/login 5/h per
+  // email + 10/h per IP; verify 10/10-min per email; generate 5/h/email.
+  licenceWebSignup: { limit: 5, windowMs: 3_600_000 },
+  licenceWebSignupIp: { limit: 10, windowMs: 3_600_000 },
+  licenceWebVerify: { limit: 10, windowMs: 600_000 },
+  licenceWebGenerate: { limit: 5, windowMs: 3_600_000 },
 };
 
 export interface RateLimitResult {

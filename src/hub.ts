@@ -108,16 +108,40 @@ export interface Env {
   B2_BUCKET?: string;
   B2_KEY_ID?: string;
   B2_APPLICATION_KEY?: string;
+  LICENCE_ADMIN_TOKEN?: string; // M-I-28: hub calls the licence Worker generate/release with this (same value as the Worker's own secret — no new secret)
+  LICENCE_WORKER_URL?: string; // M-I-28: override, default https://jarvis-licence.rajraj3kk.workers.dev
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "13"; // 13: M-I-30 in-app cron (NL->cron parse + enable/delete); 12 was Qdrant + Retry-After + B2
+const VERSION = "14"; // 14: M-I-28 self-serve licence web UI; 13 was M-I-30 in-app cron
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";
 import { handleSync, type SyncRequest } from "./sync";
 import { constantTimeEqual, handleTick, nextCronRun, type DispatchStep } from "./cron";
 import { cronLlmSystemPrompt, llmParseCronText, parseNaturalCron } from "./nl-cron";
+import {
+  LICENCE_CODE_MAX_ATTEMPTS,
+  LICENCE_CODE_TTL_MS,
+  LICENCE_SESSION_COOKIE,
+  LICENCE_SESSION_TTL_MS,
+  LICENCE_WORKER_URL_DEFAULT,
+  clearSessionCookie,
+  hashEmailCode,
+  hashSessionToken,
+  isValidEmail,
+  licenceAdminPage,
+  licenceCodeEmailContent,
+  licenceDashboardPage,
+  licenceLandingPage,
+  licenceLoginPage,
+  maskLicenceKey,
+  newEmailCode,
+  newSessionToken,
+  normalizeEmail,
+  sessionCookie,
+  verifyEmailCode,
+} from "./licence-web";
 import { checkRateLimit, checkUpstashLive, probeUpstashCounter, type RateLimitResult } from "./ratelimit";
 import { d1Batch, getDevice, getTenant, insertTrace, verifyLicenceKey } from "./db";
 import {
@@ -211,7 +235,7 @@ import {
 } from "./e2b";
 import { getMonthUsage, currentPeriod } from "./metering";
 import { planLimits } from "./router";
-import { listEmailSends, sendRenewalReminderEmail, sendVerificationEmail } from "./email";
+import { listEmailSends, sendEmail, sendRenewalReminderEmail, sendVerificationEmail } from "./email";
 import { createTenantBackup, listBackups, restoreTestBackup } from "./backup";
 import {
   GoogleError,
@@ -669,7 +693,6 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           .run();
         return json({ ok: true, billing_mode: billingMode });
       }
-      return json({ error: "not_found" }, 404);
     }
 
     // --- Doc pipeline (Phase 3, stage 3b) ---
@@ -2604,6 +2627,295 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }
     }
 
+      // --- Licence web (M-I-28) — self-serve signup/login/dashboard ---
+    // Passwordless email codes; the licence Worker stays the issuance
+    // authority (generate/release proxied with LICENCE_ADMIN_TOKEN).
+    // Licence keys are NEVER logged/traced — only the generate response
+    // to the verified owner carries a fresh key, once.
+    const licenceWorkerUrl = (env.LICENCE_WORKER_URL ?? LICENCE_WORKER_URL_DEFAULT).replace(/\/+$/, "");
+    const licenceWebSession = async (): Promise<{ email: string } | null> => {
+      const cookie = request.headers.get("cookie") ?? "";
+      const m = cookie.match(new RegExp(`(?:^|;\\s*)${LICENCE_SESSION_COOKIE}=([^;]+)`));
+      if (!m) return null;
+      const tokenHash = await hashSessionToken(m[1]);
+      const row = await env.DB.prepare("SELECT email, expires_at FROM licence_web_sessions WHERE token_hash = ?")
+        .bind(tokenHash)
+        .first<{ email: string; expires_at: number }>();
+      if (!row || row.expires_at < Date.now()) return null;
+      await env.DB.prepare("UPDATE licence_web_sessions SET last_seen_at = ? WHERE token_hash = ?")
+        .bind(Date.now(), tokenHash)
+        .run();
+      return { email: row.email };
+    };
+    const licenceWebOriginOk = (): boolean => {
+      const origin = request.headers.get("origin");
+      if (!origin) return true; // non-browser caller — the session cookie is the credential
+      try {
+        return origin === new URL(request.url).origin;
+      } catch {
+        return false;
+      }
+    };
+    const licenceWebDailyCap = async (): Promise<boolean> => {
+      // Global code-email guard: Resend free tier is 100/day; cap at 90.
+      const dayStart = Date.now() - (Date.now() % 86_400_000);
+      const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM licence_email_codes WHERE created_at >= ?")
+        .bind(dayStart)
+        .first<{ n: number }>();
+      return (row?.n ?? 0) < 90;
+    };
+    const licenceWebLicenceFor = async (email: string) => {
+      const row = await env.DB.prepare(
+        "SELECT key, user_id, device_id, status, created_at FROM licences WHERE user_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+      )
+        .bind(email)
+        .first<{ key: string; user_id: string; device_id: string | null; status: string; created_at: number }>();
+      if (!row) return null;
+      return {
+        key_masked: maskLicenceKey(row.key),
+        status: row.status,
+        device_id: row.device_id,
+        created_at: new Date(row.created_at).toISOString(),
+      };
+    };
+    const licenceWorkerCall = async (
+      p: string,
+      body: Record<string, unknown>,
+    ): Promise<{ status: number; body: Record<string, unknown> }> => {
+      let res: Response;
+      try {
+        res = await fetch(`${licenceWorkerUrl}${p}`, {
+          method: "POST",
+          headers: { "x-licence-admin-token": env.LICENCE_ADMIN_TOKEN ?? "", "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch {
+        return { status: 503, body: { error: "licence_worker_unreachable" } };
+      }
+      let parsed: Record<string, unknown> = {};
+      try {
+        parsed = (await res.json()) as Record<string, unknown>;
+      } catch {
+        parsed = {};
+      }
+      return { status: res.status, body: parsed };
+    };
+
+    if (path === "/licence" && method === "GET") {
+      return new Response(licenceLandingPage(), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+    if (path === "/licence/login" && method === "GET") {
+      return new Response(licenceLoginPage(), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+    if (path === "/licence/dashboard" && method === "GET") {
+      const sess = await licenceWebSession();
+      if (!sess) return new Response(null, { status: 302, headers: { Location: "/licence/login" } });
+      const lic = await licenceWebLicenceFor(sess.email);
+      return new Response(licenceDashboardPage(sess.email, lic), {
+        status: 200,
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    }
+    if (path === "/licence/admin" && method === "GET") {
+      return new Response(licenceAdminPage(), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+
+    if ((path === "/api/licence-web/signup" || path === "/api/licence-web/login") && method === "POST") {
+      const purpose = path.endsWith("/signup") ? "signup" : "login";
+      const body = await readJson(request);
+      const email = normalizeEmail(typeof body.email === "string" ? body.email : "");
+      const valid = isValidEmail(email);
+      if (!valid.ok) return json({ error: valid.error }, 400);
+      const rlEmail = await checkRateLimit(env, "licenceWebSignup", email);
+      if (!rlEmail.allowed) return rateLimited(rlEmail);
+      const rlIp = await checkRateLimit(env, "licenceWebSignupIp", clientIp(request));
+      if (!rlIp.allowed) return rateLimited(rlIp);
+      const user = await env.DB.prepare("SELECT email, email_verified FROM licence_web_users WHERE email = ?")
+        .bind(email)
+        .first<{ email: string; email_verified: number }>();
+      // Login for an unknown email: same 200 shape, no code, no row —
+      // no enumeration oracle.
+      if (purpose === "login" && !user) return json({ ok: true, email });
+      if (!(await licenceWebDailyCap())) return json({ error: "email_daily_cap" }, 503);
+      if (!user) {
+        await env.DB.prepare(
+          "INSERT INTO licence_web_users (email, email_verified, created_at, last_login_at) VALUES (?, 0, ?, NULL)",
+        )
+          .bind(email, Date.now())
+          .run();
+      }
+      const { code, codeHash } = await newEmailCode();
+      const nowMs = Date.now();
+      await env.DB.prepare("DELETE FROM licence_email_codes WHERE email = ? AND purpose = ?")
+        .bind(email, purpose)
+        .run();
+      await env.DB.prepare(
+        "INSERT INTO licence_email_codes (email, purpose, code_hash, expires_at, attempts, created_at) VALUES (?, ?, ?, ?, 0, ?)",
+      )
+        .bind(email, purpose, codeHash, nowMs + LICENCE_CODE_TTL_MS, nowMs)
+        .run();
+      const sent = await sendEmail(env, { to: email, ...licenceCodeEmailContent(code, purpose as "signup" | "login") });
+      if (!sent.ok) {
+        await env.DB.prepare("DELETE FROM licence_email_codes WHERE email = ? AND purpose = ?")
+          .bind(email, purpose)
+          .run();
+        return json({ error: sent.error === "not_configured" ? "email_not_configured" : "email_failed" }, 503);
+      }
+      return json({ ok: true, email });
+    }
+
+    if (path === "/api/licence-web/verify" && method === "POST") {
+      const body = await readJson(request);
+      const email = normalizeEmail(typeof body.email === "string" ? body.email : "");
+      const code = typeof body.code === "string" ? body.code : "";
+      const purpose = body.purpose === "login" ? "login" : "signup";
+      if (!email || !code) return json({ error: "bad_request" }, 400);
+      const rl = await checkRateLimit(env, "licenceWebVerify", email);
+      if (!rl.allowed) return rateLimited(rl);
+      const row = await env.DB.prepare(
+        "SELECT code_hash, expires_at, attempts FROM licence_email_codes WHERE email = ? AND purpose = ?",
+      )
+        .bind(email, purpose)
+        .first<{ code_hash: string; expires_at: number; attempts: number }>();
+      if (!row || row.expires_at < Date.now() || row.attempts >= LICENCE_CODE_MAX_ATTEMPTS) {
+        return json({ error: "verification_failed", detail: "Code galat ya expire ho gaya — naya code mangao" }, 400);
+      }
+      if (!(await verifyEmailCode(code, row.code_hash))) {
+        await env.DB.prepare("UPDATE licence_email_codes SET attempts = ? WHERE email = ? AND purpose = ?")
+          .bind(row.attempts + 1, email, purpose)
+          .run();
+        return json({ error: "verification_failed", detail: "Code galat hai — dobara try karo" }, 400);
+      }
+      await env.DB.prepare("DELETE FROM licence_email_codes WHERE email = ? AND purpose = ?")
+        .bind(email, purpose)
+        .run();
+      const user = await env.DB.prepare("SELECT email, email_verified FROM licence_web_users WHERE email = ?")
+        .bind(email)
+        .first<{ email: string; email_verified: number }>();
+      if (!user) return json({ error: "verification_failed" }, 400);
+      const nowMs = Date.now();
+      if (purpose === "signup") {
+        await env.DB.prepare("UPDATE licence_web_users SET email_verified = ?, last_login_at = ? WHERE email = ?")
+          .bind(1, nowMs, email)
+          .run();
+      } else {
+        if (user.email_verified !== 1) return json({ error: "email_not_verified" }, 403);
+        await env.DB.prepare("UPDATE licence_web_users SET last_login_at = ? WHERE email = ?")
+          .bind(nowMs, email)
+          .run();
+      }
+      const { token, tokenHash } = await newSessionToken();
+      await env.DB.prepare(
+        "INSERT INTO licence_web_sessions (token_hash, email, created_at, expires_at, last_seen_at) VALUES (?, ?, ?, ?, ?)",
+      )
+        .bind(tokenHash, email, nowMs, nowMs + LICENCE_SESSION_TTL_MS, nowMs)
+        .run();
+      await insertTrace(env.DB, email, "", "licence_web_verify", { purpose });
+      return json({ ok: true, email }, 200, { "Set-Cookie": sessionCookie(token, Math.floor(LICENCE_SESSION_TTL_MS / 1000)) });
+    }
+
+    if (path === "/api/licence-web/logout" && method === "POST") {
+      const cookie = request.headers.get("cookie") ?? "";
+      const m = cookie.match(new RegExp(`(?:^|;\\s*)${LICENCE_SESSION_COOKIE}=([^;]+)`));
+      if (m) {
+        const tokenHash = await hashSessionToken(m[1]);
+        await env.DB.prepare("DELETE FROM licence_web_sessions WHERE token_hash = ?").bind(tokenHash).run();
+      }
+      return json({ ok: true }, 200, { "Set-Cookie": clearSessionCookie() });
+    }
+
+    if (path === "/api/licence-web/me" && method === "GET") {
+      const sess = await licenceWebSession();
+      if (!sess) return json({ error: "unauthorized" }, 401);
+      const user = await env.DB.prepare("SELECT email_verified FROM licence_web_users WHERE email = ?")
+        .bind(sess.email)
+        .first<{ email_verified: number }>();
+      const lic = await licenceWebLicenceFor(sess.email);
+      return json({ ok: true, email: sess.email, verified: user?.email_verified === 1, licence: lic });
+    }
+
+    if (path === "/api/licence-web/generate" && method === "POST") {
+      if (!licenceWebOriginOk()) return json({ error: "forbidden" }, 403);
+      const sess = await licenceWebSession();
+      if (!sess) return json({ error: "unauthorized" }, 401);
+      const rl = await checkRateLimit(env, "licenceWebGenerate", sess.email);
+      if (!rl.allowed) return rateLimited(rl);
+      const user = await env.DB.prepare("SELECT email_verified FROM licence_web_users WHERE email = ?")
+        .bind(sess.email)
+        .first<{ email_verified: number }>();
+      if (!user || user.email_verified !== 1) return json({ error: "email_not_verified" }, 403);
+      if (!env.LICENCE_ADMIN_TOKEN) return json({ error: "licence_not_configured" }, 503);
+      const res = await licenceWorkerCall("/api/licence/generate", { user_id: sess.email });
+      if (res.status !== 200) return json(res.body, res.status); // 403 licence_revoked passes through verbatim
+      const lic = res.body.licence as Record<string, unknown> | undefined;
+      if (!lic) return json({ error: "generate_failed" }, 500);
+      const existing = res.body.existing === true;
+      await insertTrace(env.DB, sess.email, "", "licence_web_generate", { existing });
+      if (existing) {
+        // Existing licence: masked only — the full key is shown once,
+        // at fresh issuance, never again.
+        return json({
+          ok: true,
+          existing: true,
+          licence: {
+            key_masked: maskLicenceKey(String(lic.key ?? "")),
+            user_id: lic.user_id,
+            device_id: lic.device_id ?? null,
+            status: lic.status,
+            created_at: lic.created_at,
+          },
+        });
+      }
+      return json({ ok: true, existing: false, licence: lic });
+    }
+
+    if (path === "/api/licence-web/release" && method === "POST") {
+      if (!licenceWebOriginOk()) return json({ error: "forbidden" }, 403);
+      const sess = await licenceWebSession();
+      if (!sess) return json({ error: "unauthorized" }, 401);
+      if (!env.LICENCE_ADMIN_TOKEN) return json({ error: "licence_not_configured" }, 503);
+      const row = await env.DB.prepare("SELECT key FROM licences WHERE user_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1")
+        .bind(sess.email)
+        .first<{ key: string }>();
+      if (!row) return json({ error: "licence_not_found" }, 404);
+      const res = await licenceWorkerCall("/api/licence/release", { key: row.key });
+      if (res.status !== 200) return json(res.body, res.status);
+      await insertTrace(env.DB, sess.email, "", "licence_web_release", {});
+      return json({ ok: true, released: true });
+    }
+
+    if (path === "/api/licence-web/admin/licences" && method === "GET") {
+      if (!isBillingAdmin()) return json({ error: "unauthorized" }, 401);
+      const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") ?? "20") || 20));
+      const offset = Math.max(0, Number(url.searchParams.get("offset") ?? "0") || 0);
+      // limit/offset are clamped integers above, interpolated (not bound)
+      // because the test FakeD1 only parses literal LIMIT (no OFFSET);
+      // real D1 accepts literals identically. Never a raw user string.
+      // OFFSET is applied in JS after fetching limit+offset rows.
+      const rows = await env.DB.prepare(
+        `SELECT key, user_id, device_id, status, created_at FROM licences ORDER BY created_at DESC LIMIT ${limit + offset}`,
+      ).all<Record<string, unknown>>();
+      const all = rows.results ?? [];
+      const page = all.slice(offset, offset + limit);
+      return json({ ok: true, licences: page, count: page.length });
+    }
+
+    if (path === "/api/licence-web/admin/revoke" && method === "POST") {
+      if (!isBillingAdmin()) return json({ error: "unauthorized" }, 401);
+      const body = await readJson(request);
+      const key = typeof body.key === "string" ? body.key.trim().toUpperCase() : "";
+      if (!key) return json({ error: "bad_request" }, 400);
+      const row = await env.DB.prepare("SELECT key, user_id, status FROM licences WHERE key = ?")
+        .bind(key)
+        .first<{ key: string; user_id: string; status: string }>();
+      if (!row) return json({ error: "licence_not_found" }, 404);
+      if (row.status === "revoked") return json({ ok: true, key, revoked: true, already: true });
+      await env.DB.prepare("UPDATE licences SET status = ? WHERE key = ?").bind("revoked", key).run();
+      await insertTrace(env.DB, row.user_id, "", "licence_web_revoke", {});
+      return json({ ok: true, key, revoked: true });
+    }
+
+    return json({ error: "not_found" }, 404);
     return json({ error: "not_found" }, 404);
   } catch (e) {
     return json({ error: "server_error", detail: String((e as Error)?.message ?? e) }, 500);

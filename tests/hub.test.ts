@@ -229,9 +229,9 @@ describe("handleRequest (2a-2 routes, D1 licences)", () => {
     expect(body.key_id).toBeUndefined();
   });
 
-  it("GET / -> version 13 (M-I-30 in-app cron)", async () => {
+  it("GET / -> version 14 (M-I-28 self-serve licence web UI)", async () => {
     const body = (await route("/").json()) as Record<string, unknown>;
-    expect(body.version).toBe("13");
+    expect(body.version).toBe("14");
   });
 
   it("pairing code: derives from token", async () => {

@@ -49,6 +49,10 @@ const PK: Record<string, string[]> = {
   // 1.12.0 FCM (0012): device_id PK for tokens, TEXT id for sends.
   fcm_tokens: ["device_id"],
   fcm_sends: ["id"],
+  // M-I-28 licence web (0013): email PK, (email, purpose) PK, token-hash PK.
+  licence_web_users: ["email"],
+  licence_email_codes: ["email", "purpose"],
+  licence_web_sessions: ["token_hash"],
 };
 
 export class FakeD1 implements D1Like {
