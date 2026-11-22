@@ -79,6 +79,7 @@ export interface Env {
   FOUNDER_GEMINI_KEY?: string;
   FOUNDER_GROQ_KEY?: string; // R3: optional founder Groq key ($0 free tier) — founder_pays Groq leg only
   ROUTER_CONFIG?: string;
+  WORKER_URL?: string; // v9: doc worker URL (any host); RENDER_WORKER_URL is the legacy fallback
   RENDER_WORKER_URL?: string;
   E2B_API_KEY?: string; // Phase 4: unset = e2b_not_configured (U-4, no account yet)
   GOOGLE_OAUTH_CLIENT_ID?: string; // Track E #27: GCP OAuth client (Web app) — parent-created; unset = google_oauth_not_configured
@@ -102,7 +103,7 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "8"; // 8: open-source completeness merge (Langfuse/Sentry/Qdrant/Upstash live wiring + Anthropic SKILL.md + Resend/B2 + Google OAuth + worker Mem0/Docling/Bandit/Browser-Use + HF Spaces package); 7 was the self-extension server mirror
+const VERSION = "9"; // 9: doc worker re-pointed off Render (WORKER_URL, __WORKER_URL__ default); 8 was the open-source completeness merge
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";
@@ -233,6 +234,7 @@ import {
   insertCertificate,
   redactFields,
   redactPiiText,
+  resolveWorkerBase,
   sha256Hex,
   sha256HexBytes,
   sortedJson,
@@ -903,7 +905,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (typeof rj.pdf_base64 !== "string") {
         return json({ error: "render_error" }, 502);
       }
-      const pdfUrl = `${(env.RENDER_WORKER_URL ?? "").replace(/\/+$/, "")}/doc/certificate?hash=${hash}`;
+      const pdfUrl = `${resolveWorkerBase(env)}/doc/certificate?hash=${hash}`;
       try {
         await insertCertificate(env.DB, { tenant_id: tenantId, doc_job_id: docJobId, payload_hash: hash, pdf_url: pdfUrl });
       } catch (e) {

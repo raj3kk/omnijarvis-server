@@ -24,7 +24,7 @@ import { loadRouterConfig, routeLlm, type RouterDeps } from "./router";
 export const DOCS_RATE_LIMIT = "docs" as const;
 export const RENDER_TIMEOUT_MS = 30_000;
 export const RENDER_RETRY_DELAY_MS = 5_000;
-export const MAX_INGEST_BYTES = 5 * 1024 * 1024;
+export const MAX_INGEST_BYTES = 4 * 1024 * 1024; // v9: matches the doc worker's 4 MB cap (Vercel 4.5 MB body limit); was 5 MB
 export const MAX_EXTRACT_PAGES = 20;
 export const REDACTED = "[REDACTED]";
 
@@ -186,9 +186,33 @@ export async function getCertificateByHash(
 }
 
 // --- Render forwarding (cold-start aware, honest errors) ---
+// NOTE (v9, Render replacement): the worker no longer has to live on
+// Render. The URL now comes from WORKER_URL (preferred) with
+// RENDER_WORKER_URL kept as a legacy fallback; if neither is set, the
+// WORKER_URL_DEFAULT below is used when it holds a real URL.
 
 export interface RenderEnv {
+  WORKER_URL?: string;
   RENDER_WORKER_URL?: string;
+}
+
+/**
+ * Default doc-worker base URL. Replace __WORKER_URL__ with the real
+ * deployed worker URL (e.g. https://<host>/ — no trailing path). The
+ * placeholder is deliberately inert: it is not a URL, so until it is
+ * replaced the hub behaves exactly as if no worker were configured
+ * (503 render_not_configured), never fetching a placeholder host.
+ */
+export const WORKER_URL_DEFAULT = "__WORKER_URL__";
+
+/** Resolve the doc-worker base URL: WORKER_URL > RENDER_WORKER_URL >
+ *  WORKER_URL_DEFAULT (only when it is a real http(s) URL, else ""). */
+export function resolveWorkerBase(env: RenderEnv): string {
+  const configured = (env.WORKER_URL ?? env.RENDER_WORKER_URL ?? "").replace(/\/+$/, "");
+  if (configured) return configured;
+  return WORKER_URL_DEFAULT.startsWith("http")
+    ? WORKER_URL_DEFAULT.replace(/\/+$/, "")
+    : "";
 }
 
 export interface RenderResult {
@@ -200,11 +224,12 @@ export interface RenderResult {
 }
 
 /**
- * Forward one call to the Render worker. 30s timeout (matches the OCR
- * cap); on timeout/network error, ONE retry after 5s (Render free tier
- * cold start is ~30-60s after 15-min sleep) — then an honest error with
- * `render_warming_up` hint. RENDER_WORKER_URL unset = `render_not_configured`
- * (never a silent fail). `fetchFn` is injectable for vitest.
+ * Forward one call to the doc worker (ex-Render; any host now).
+ * 30s timeout (matches the OCR cap); on timeout/network error, ONE
+ * retry after 5s (cold start on a free host can be ~30-60s) — then an
+ * honest error with `render_warming_up` hint. No worker URL configured
+ * (see resolveWorkerBase) = `render_not_configured` (never a silent
+ * fail). `fetchFn` is injectable for vitest.
  */
 export async function forwardToRender(
   env: RenderEnv,
@@ -212,7 +237,7 @@ export async function forwardToRender(
   init: RequestInit,
   opts: { fetchFn?: typeof fetch; sleepFn?: (ms: number) => Promise<void> } = {},
 ): Promise<RenderResult> {
-  const base = (env.RENDER_WORKER_URL ?? "").replace(/\/+$/, "");
+  const base = resolveWorkerBase(env);
   if (!base) return { ok: false, status: 503, json: null, error: "render_not_configured" };
   const doFetch = opts.fetchFn ?? fetch;
   const sleep = opts.sleepFn ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
