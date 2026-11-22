@@ -64,7 +64,12 @@ function upstashCreds(env: Env): { url: string; token: string } | null {
 }
 
 /**
- * Live check (completeness #45): GET {url}/ping -> "PONG".
+ * Live check (completeness #45): GET {url}/ping -> {"result":"PONG"}.
+ * The real Upstash REST API answers a JSON OBJECT, not a bare string —
+ * the first version compared res.text() to "PONG" and could never be
+ * live (caught by the live probe 2026-11-22: configured:true,
+ * live:false while curl showed {"result":"PONG"} HTTP 200). Accept
+ * both the object shape and a bare "PONG" string.
  * `live: false` with `configured: true` means the Worker cannot reach
  * Upstash (or the token is wrong) — checkRateLimit then falls back
  * visibly (x-ratelimit-fallback: 1), never silently.
@@ -80,8 +85,17 @@ export async function checkUpstashLive(
       headers: { Authorization: `Bearer ${creds.token}` },
     });
     if (!res.ok) return { configured: true, live: false };
-    const text = (await res.text()).trim().replace(/^"|"$/g, "");
-    return { configured: true, live: text === "PONG" };
+    const raw = (await res.text()).trim();
+    let live = false;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (typeof parsed === "string") live = parsed === "PONG";
+      else if (parsed && typeof parsed === "object")
+        live = (parsed as { result?: unknown }).result === "PONG";
+    } catch {
+      live = raw.replace(/^"|"$/g, "") === "PONG";
+    }
+    return { configured: true, live };
   } catch {
     return { configured: true, live: false };
   }

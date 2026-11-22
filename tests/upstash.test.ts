@@ -37,6 +37,13 @@ describe("upstashStatus / checkUpstashLive", () => {
     expect(upstashStatus(ENV)).toEqual({ configured: true });
     const pongFetch = (async () => jsonResp("PONG")) as unknown as typeof fetch;
     expect(await checkUpstashLive(ENV, { fetchFn: pongFetch })).toEqual({ configured: true, live: true });
+    // Real Upstash REST shape: {"result":"PONG"} (JSON object, not a
+    // bare string). Regression: the first version compared res.text()
+    // to "PONG" and could never be live against the real API.
+    const objFetch = (async () => jsonResp({ result: "PONG" })) as unknown as typeof fetch;
+    expect(await checkUpstashLive(ENV, { fetchFn: objFetch })).toEqual({ configured: true, live: true });
+    const wrongFetch = (async () => jsonResp({ result: "ERR" })) as unknown as typeof fetch;
+    expect(await checkUpstashLive(ENV, { fetchFn: wrongFetch })).toEqual({ configured: true, live: false });
     const errFetch = (async () => new Response("no", { status: 401 })) as unknown as typeof fetch;
     expect(await checkUpstashLive(ENV, { fetchFn: errFetch })).toEqual({ configured: true, live: false });
     const throwFetch = (async () => {
