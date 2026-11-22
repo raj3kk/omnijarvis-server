@@ -390,27 +390,39 @@ describe("UTR submit + approve/reject (T-U1–T-U5)", () => {
 
 describe("renew / upgrade / downgrade (T-U6–T-U9)", () => {
   it("T-U8: Pro mid-cycle → Business upgrade is pro-rated (exact paise) + approve supersedes old", async () => {
-    const db = new FakeD1();
-    await seedTenant(db, "t-1", "free", 1);
-    await setVpa(db);
-    const { subscription_id: oldId } = await happyPath(db, "t-1", "pro", "monthly");
-    // Fake the old subscription to mid-cycle: starts 15d ago, expires in 15d.
-    const start = Date.now() - 15 * 24 * 60 * 60 * 1000;
-    const end = Date.now() + 15 * 24 * 60 * 60 * 1000;
-    await db.prepare("UPDATE subscriptions SET starts_at = ?, expires_at = ? WHERE id = ?").bind(new Date(start).toISOString(), new Date(end).toISOString(), oldId).run();
-    const up = await call(db, "POST", "/api/billing/upgrade", { tenant_id: "t-1", to_tier: "business" });
-    expect(up.status).toBe(200);
-    expect(up.body.remaining_paise).toBe(49950);
-    expect(up.body.prorated_amount_paise).toBe(249950);
-    const utr = await call(db, "POST", "/api/billing/utr", { subscription_id: String(up.body.subscription_id), utr: "400000000011" });
-    expect(utr.status).toBe(200);
-    const appr = await callAdmin(db, "POST", "/api/billing/admin/approve", { payment_id: String(utr.body.payment_id) });
-    expect(appr.status).toBe(200);
-    expect(appr.body.plan_tier).toBe("business");
-    const old = await db.prepare("SELECT status FROM subscriptions WHERE id = ?").bind(oldId).first<{ status: string }>();
-    expect(old?.status).toBe("expired");
-    const tenant = await db.prepare("SELECT plan_tier FROM tenants WHERE id = ?").bind("t-1").first<{ plan_tier: string }>();
-    expect(tenant?.plan_tier).toBe("business");
+    // Clock flake fix (R3, 2026-11-22): proratedUpgradeCharge floors
+    // 99900 * remainingMs/totalMs. With a live clock the milliseconds
+    // between seeding start/end and the upgrade call make remainingMs
+    // < 15d, so the test got 49949 instead of 49950 (CI run 44981852822,
+    // the only failure on that run). Freeze time so setup and handler
+    // see the same instant — exact assertions unchanged, no prod change.
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    try {
+      const db = new FakeD1();
+      await seedTenant(db, "t-1", "free", 1);
+      await setVpa(db);
+      const { subscription_id: oldId } = await happyPath(db, "t-1", "pro", "monthly");
+      // Fake the old subscription to mid-cycle: starts 15d ago, expires in 15d.
+      const start = Date.now() - 15 * 24 * 60 * 60 * 1000;
+      const end = Date.now() + 15 * 24 * 60 * 60 * 1000;
+      await db.prepare("UPDATE subscriptions SET starts_at = ?, expires_at = ? WHERE id = ?").bind(new Date(start).toISOString(), new Date(end).toISOString(), oldId).run();
+      const up = await call(db, "POST", "/api/billing/upgrade", { tenant_id: "t-1", to_tier: "business" });
+      expect(up.status).toBe(200);
+      expect(up.body.remaining_paise).toBe(49950);
+      expect(up.body.prorated_amount_paise).toBe(249950);
+      const utr = await call(db, "POST", "/api/billing/utr", { subscription_id: String(up.body.subscription_id), utr: "400000000011" });
+      expect(utr.status).toBe(200);
+      const appr = await callAdmin(db, "POST", "/api/billing/admin/approve", { payment_id: String(utr.body.payment_id) });
+      expect(appr.status).toBe(200);
+      expect(appr.body.plan_tier).toBe("business");
+      const old = await db.prepare("SELECT status FROM subscriptions WHERE id = ?").bind(oldId).first<{ status: string }>();
+      expect(old?.status).toBe("expired");
+      const tenant = await db.prepare("SELECT plan_tier FROM tenants WHERE id = ?").bind("t-1").first<{ plan_tier: string }>();
+      expect(tenant?.plan_tier).toBe("business");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("upgrade without an active Pro sub → 409 subscription_not_active", async () => {
