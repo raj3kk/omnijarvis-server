@@ -8,6 +8,10 @@
  * R-T20–R-T26 Groq free fallback leg (R3, 2026-11-22): gpt-oss-120b serves
  * after both Gemini legs fail; skipped with no key; 401/usage/config-guard;
  * hub groq-key routes. OpenRouter is NOT a leg (D8 still OPEN).
+ * R-T27–R-T32 captcha_solve kind (D3 LOCKED, 2026-11-22): vision chain
+ * 3.5 -> 3.1 -> qwen3.8-27b; gpt-oss-120b (text-only) never called;
+ * image parts (Gemini inlineData / Groq image_url); usage_metadata_missing
+ * still fails; no recordReply on solve; founder-pays chain order.
  * gemini-2.5-flash-lite is RETIRED (P0 fix 2026-11-21) — it appears nowhere
  * in this file except this note and the R-T19 guard test.
  * Gemini upstream is MOCKED (no real key in CI). Live happy-path proof
@@ -20,6 +24,7 @@ import {
   MODEL_31,
   MODEL_35,
   MODEL_GROQ,
+  MODEL_GROQ_VISION,
   RETIRED_MODELS,
   completeTurn,
   loadRouterConfig,
@@ -168,7 +173,7 @@ function baseDeps(db: FakeD1, masterB64: string, fetchFn: typeof fetch, extra: P
   };
 }
 
-function req(tenantId: string, turnId: string, kind: "agent_plan" | "quick_command" | "casual_chat" | "search_grounding" | "live" | "doc_extraction" | "embeddings" = "quick_command", messages: ChatMessage[] = [{ role: "user", text: "hello" }]) {
+function req(tenantId: string, turnId: string, kind: "agent_plan" | "quick_command" | "casual_chat" | "search_grounding" | "live" | "doc_extraction" | "embeddings" | "captcha_solve" = "quick_command", messages: ChatMessage[] = [{ role: "user", text: "hello" }]) {
   return { tenant_id: tenantId, turn_id: turnId, kind, messages };
 }
 
@@ -472,7 +477,7 @@ describe("router P0 fix (R-T18–R-T19)", () => {
       ).toThrow(/retired/);
     }
     const defaults = loadRouterConfig({});
-    const allowed = new Set([MODEL_31, MODEL_35, MODEL_GROQ, "gemini-embedding-001", "gemini-2.5-flash-native-audio-dialog"]);
+    const allowed = new Set([MODEL_31, MODEL_35, MODEL_GROQ, MODEL_GROQ_VISION, "gemini-embedding-001", "gemini-2.5-flash-native-audio-dialog"]);
     for (const [mode, kinds] of Object.entries(defaults.chains)) {
       for (const [kind, chain] of Object.entries(kinds)) {
         for (const model of chain as string[]) {
@@ -637,6 +642,131 @@ describe("router Groq free leg (R-T20–R-T25)", () => {
     expect(res.cost_usd_micro).toBe(0);
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toContain("api.groq.com");
+  });
+});
+
+describe("router captcha_solve kind (R-T27–R-T32, D3 LOCKED)", () => {
+  const IMG_B64 = Buffer.from("fake-captcha-png-bytes").toString("base64");
+  const TILES_JSON = JSON.stringify({ kind: "tiles", grid_rows: 3, grid_cols: 3, tiles: [0, 4, 7], confidence: 0.87 });
+
+  function captchaReq(tenantId: string, turnId: string) {
+    return {
+      ...req(tenantId, turnId, "captcha_solve", [{ role: "user", text: "solve this grid" } as ChatMessage]),
+      image_b64: IMG_B64,
+    };
+  }
+
+  it("R-T27 BYOK chain order: 3.5 -> 3.1 -> qwen3.8-27b; gpt-oss-120b never called", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    await seedTenantWithKeys(db, "t-27", master);
+    const { fetchFn, calls } = makeDualMockFetch(
+      (model) => (model === MODEL_35 ? errResp(429, "Resource exhausted") : errResp(500, "boom")),
+      () => okGroq(TILES_JSON, 100, 20),
+    );
+    const res = await routeLlm(baseDeps(db, master, fetchFn), captchaReq("t-27", "turn-27"));
+    expect(res.ok).toBe(true);
+    expect(res.model).toBe(MODEL_GROQ_VISION);
+    expect(res.attempted_models).toEqual([MODEL_35, MODEL_31, MODEL_GROQ_VISION]);
+    expect(calls.map((c) => c.model)).toEqual([MODEL_35, MODEL_31, MODEL_GROQ_VISION]);
+    expect(calls.map((c) => c.model)).not.toContain(MODEL_GROQ);
+    expect(res.text).toBe(TILES_JSON);
+  });
+
+  it("R-T28 gpt-oss-120b in a captcha_solve chain is skipped (text-only), never fetched", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    await seedTenantWithKeys(db, "t-28", master);
+    const config = loadRouterConfig({
+      ROUTER_CONFIG: JSON.stringify({ chains: { byok: { captcha_solve: [MODEL_GROQ, MODEL_35] } } }),
+    });
+    const { fetchFn, calls } = makeDualMockFetch(
+      () => okText(TILES_JSON, 100, 20),
+      () => okGroq("should never serve", 100, 20),
+    );
+    const res = await routeLlm(baseDeps(db, master, fetchFn, { config }), captchaReq("t-28", "turn-28"));
+    expect(res.ok).toBe(true);
+    expect(res.model).toBe(MODEL_35);
+    expect(res.attempted_models).toEqual([MODEL_35]);
+    expect(calls.map((c) => c.model)).toEqual([MODEL_35]);
+    const traces = await traceRows(db);
+    expect(
+      traces.some((t) => t.kind === "router_groq_skipped" && String(t.detail).includes("text_only_model")),
+    ).toBe(true);
+  });
+
+  it("R-T29 image parts: Gemini inlineData + Groq image_url data part carry the challenge image", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    await seedTenantWithKeys(db, "t-29", master);
+    const { fetchFn, calls } = makeDualMockFetch(
+      (model) => (model === MODEL_35 ? errResp(429, "Resource exhausted") : errResp(500, "boom")),
+      () => okGroq(TILES_JSON, 100, 20),
+    );
+    const res = await routeLlm(baseDeps(db, master, fetchFn), captchaReq("t-29", "turn-29"));
+    expect(res.ok).toBe(true);
+    const geminiBody = JSON.parse(calls[0].body) as { contents: { parts: Record<string, unknown>[] }[] };
+    const parts = geminiBody.contents[geminiBody.contents.length - 1].parts;
+    expect(parts.some((p) => (p.inlineData as { mimeType?: string } | undefined)?.mimeType === "image/png")).toBe(true);
+    expect(parts.some((p) => (p.inlineData as { data?: string } | undefined)?.data === IMG_B64)).toBe(true);
+    const groqBody = JSON.parse(calls[2].body) as { messages: { content: unknown }[] };
+    expect(JSON.stringify(groqBody.messages[groqBody.messages.length - 1].content)).toContain(
+      `data:image/png;base64,${IMG_B64}`,
+    );
+  });
+
+  it("R-T30 usage_metadata_missing still fails captcha_solve (never billed on estimate)", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    await seedTenantWithKeys(db, "t-30", master);
+    const noUsage = () =>
+      new Response(
+        JSON.stringify({ candidates: [{ content: { parts: [{ text: TILES_JSON }] }, finishReason: "STOP" }] }),
+        { status: 200 },
+      );
+    const { fetchFn } = makeDualMockFetch(() => noUsage(), () => noUsage());
+    const res = await routeLlm(baseDeps(db, master, fetchFn), captchaReq("t-30", "turn-30"));
+    expect(res.ok).toBe(false);
+    expect(res.error_code).toBe("usage_metadata_missing");
+    const rows = await usageRows(db);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe("failed");
+    expect(rows[0].cost_usd_micro).toBe(0);
+  });
+
+  it("R-T31 a solve meters llm_usage but does NOT count a reply (D3 Q2 locked)", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    await seedTenantWithKeys(db, "t-31", master);
+    const { fetchFn } = makeDualMockFetch(() => okText(TILES_JSON, 100, 20), () => okGroq(TILES_JSON, 100, 20));
+    const res = await routeLlm(baseDeps(db, master, fetchFn), captchaReq("t-31", "turn-31"));
+    expect(res.ok).toBe(true);
+    const rows = await usageRows(db);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].model).toBe(MODEL_35);
+    const counters = await db
+      .prepare("SELECT replies FROM usage_counters WHERE tenant_id = ? AND period = ?")
+      .bind("t-31", PERIOD)
+      .first<{ replies: number }>();
+    expect(counters?.replies ?? 0).toBe(0);
+  });
+
+  it("R-T32 founder-pays chain order: 3.1 -> 3.5 -> qwen3.8-27b", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    await seedTenant(db, { id: "t-32", billingMode: "founder_pays" });
+    const { fetchFn, calls } = makeDualMockFetch(
+      (model) => (model === MODEL_31 ? errResp(429, "Resource exhausted") : okText(TILES_JSON, 100, 20)),
+      () => okGroq(TILES_JSON, 100, 20),
+    );
+    const res = await routeLlm(
+      baseDeps(db, master, fetchFn, { founderKey: "FOUNDER-TEST-KEY" }),
+      captchaReq("t-32", "turn-32"),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.model).toBe(MODEL_35);
+    expect(res.attempted_models).toEqual([MODEL_31, MODEL_35]);
+    expect(calls.map((c) => c.model)).toEqual([MODEL_31, MODEL_35]);
   });
 });
 

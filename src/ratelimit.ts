@@ -34,6 +34,9 @@ export const RATE_LIMITS: Record<string, { limit: number; windowMs: number }> = 
   billing: { limit: 30, windowMs: 60_000 },
   billingAdmin: { limit: 30, windowMs: 60_000 },
   e2b: { limit: 30, windowMs: 60_000 },
+  // D3 locked (captcha-solver DESIGN §2.2): 10/min/tenant — far above
+  // the 10/day solve cap, so it only bites on a runaway loop.
+  captcha_solve: { limit: 10, windowMs: 60_000 },
 };
 
 export interface RateLimitResult {

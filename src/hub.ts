@@ -24,6 +24,11 @@
  * - /api/browser/*: x-internal-secret (3c); device reports captcha
  *   via signed WS messages (DO), not these routes. Executor default
  *   PhoneWebView; E2B gated, Render refuses (hosting proof FAIL).
+ * - /api/captcha/solve: paired device + Ed25519 signature (docs-style
+ *   authorizeDocsRequest); D3 LOCKED auto-solver (Gemini/Groq vision
+ *   only, caps 2/task + 10/day, audit table captcha_solves). byok_required
+ *   is HTTP 402 with ok:false + fallback human_assist; cap_reached is
+ *   200 ok:false (a normal outcome, not an HTTP error).
  * - /api/skills/submit: paired device + Ed25519 signature (docs-style)
  *   or x-internal-secret; ALWAYS quarantined, never auto-approved (3d).
  * - /api/skills/review: x-admin-token (LLM_ADMIN_TOKEN); approve needs
@@ -172,6 +177,7 @@ import {
 } from "./e2b";
 import { getMonthUsage, currentPeriod } from "./metering";
 import { planLimits } from "./router";
+import { solveCaptcha, validateSolveRequest } from "./captcha";
 import {
   MAX_INGEST_BYTES,
   authorizeDocsRequest,
@@ -949,6 +955,63 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         }),
       );
       return json({ ok: true, task_id: taskId, status: res.status });
+    }
+
+    // --- Captcha auto-solve (D3 LOCKED 2026-11-22, DESIGN §2) ---
+    // Device-signed (same pattern as /api/docs/*): the device initiates
+    // this call, so x-internal-secret is NOT accepted as the auth —
+    // authorizeDocsRequest accepts it for agent callers, and the
+    // device path requires the Ed25519 signature. A request without a
+    // valid device signature is 401; an unpaired device is 403.
+    // The hub runs the vision chain and returns the answer; the device
+    // applies it to the live page (the hub never sees a solution token).
+    if (path === "/api/captcha/solve" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const rl = await checkRateLimit(env, "captcha_solve", tenantId);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      const validated = validateSolveRequest(body);
+      if (!validated.ok) return json({ error: "bad_request" }, 400);
+      let config;
+      try {
+        config = loadRouterConfig(env);
+      } catch {
+        return json({ error: "router_config_error" }, 500);
+      }
+      const result = await solveCaptcha(
+        {
+          db: env.DB,
+          masterKeyB64: env.KEY_ENC_SECRET,
+          founderKey: env.FOUNDER_GEMINI_KEY,
+          founderGroqKey: env.FOUNDER_GROQ_KEY,
+          config,
+        },
+        {
+          tenant_id: tenantId,
+          device_id: auth.device_id ?? "",
+          task_id: validated.value.task_id,
+          site: validated.value.site,
+          challenge_type: validated.value.challenge_type,
+          image_b64: validated.value.image_b64,
+        },
+      );
+      // byok_required is the one failure that is also an HTTP error
+      // (402, DESIGN §2.4) — the body still carries ok:false +
+      // fallback human_assist so the client treats it as a normal
+      // fallback. Every other failure is 200 ok:false.
+      if (!result.ok && result.error === "byok_required") return json(result, 402);
+      return json(result);
     }
 
     // --- Skill registry + memory (Phase 3, stage 3d) ---

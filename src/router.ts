@@ -64,6 +64,10 @@ export const MODEL_LIVE = "gemini-2.5-flash-native-audio-dialog";
  * Llama chat ids (llama-3.3-70b-versatile, llama-3.1-8b-instant) are DEAD on
  * Groq free/developer tiers since 2026-08-16 — never use them. */
 export const MODEL_GROQ = "openai/gpt-oss-120b";
+/** Groq vision leg for captcha_solve (D3 locked): qwen3.8-27b is the
+ * ONLY Groq model that can see images. gpt-oss-120b is TEXT-ONLY and
+ * must never be called for captcha_solve (routeLlm skips it, traced). */
+export const MODEL_GROQ_VISION = "qwen/qwen3.8-27b";
 /** Other Groq free-tier chat models a ROUTER_CONFIG chain may name. */
 export const GROQ_MODELS = [MODEL_GROQ, "openai/gpt-oss-20b", "qwen/qwen3.8-27b"] as const;
 export const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
@@ -95,7 +99,8 @@ export type RequestKind =
   | "search_grounding"
   | "live"
   | "doc_extraction"
-  | "embeddings";
+  | "embeddings"
+  | "captcha_solve";
 
 const DEFAULT_CHAINS: Record<string, Record<RequestKind, string[]>> = {
   byok: {
@@ -106,6 +111,9 @@ const DEFAULT_CHAINS: Record<string, Record<RequestKind, string[]>> = {
     live: [MODEL_LIVE],
     doc_extraction: [MODEL_35, MODEL_31],
     embeddings: [MODEL_EMBED],
+    // D3 locked (captcha-solver DESIGN §2.2): vision chain, BYOK
+    // quality-first. Groq leg is qwen3.8-27b (vision) — NEVER gpt-oss-120b.
+    captcha_solve: [MODEL_35, MODEL_31, MODEL_GROQ_VISION],
   },
   founder_pays: {
     agent_plan: [MODEL_31, MODEL_35, MODEL_GROQ],
@@ -115,6 +123,7 @@ const DEFAULT_CHAINS: Record<string, Record<RequestKind, string[]>> = {
     live: [MODEL_LIVE],
     doc_extraction: [MODEL_31, MODEL_35],
     embeddings: [MODEL_EMBED],
+    captcha_solve: [MODEL_31, MODEL_35, MODEL_GROQ_VISION],
   },
 };
 
@@ -213,6 +222,9 @@ export interface RouteRequest {
   messages: ChatMessage[];
   system?: string;
   response_schema?: Record<string, unknown>;
+  /** Vision input (captcha_solve only): base64 PNG, decoded <= 200 KB.
+   * Sent as Gemini inlineData / Groq image_url parts — never logged. */
+  image_b64?: string;
 }
 
 export interface RouteResult {
@@ -313,8 +325,20 @@ export function truncateMessages(messages: ChatMessage[], system?: string): { me
   return { messages: kept, truncated };
 }
 
-function toGeminiContents(messages: ChatMessage[]): { role: string; parts: { text: string }[] }[] {
-  return messages.map((m) => ({ role: m.role, parts: [{ text: m.text }] }));
+function toGeminiContents(
+  messages: ChatMessage[],
+  imageB64?: string,
+): { role: string; parts: ({ text: string } | { inlineData: { mimeType: string; data: string } })[] }[] {
+  const contents = messages.map((m) => ({ role: m.role, parts: [{ text: m.text }] as ({ text: string } | { inlineData: { mimeType: string; data: string } })[] }));
+  // Vision (captcha_solve): the challenge image rides as an inlineData
+  // part on the LAST user message — the model reads the instruction
+  // text rendered in the image itself. No page content is ever sent.
+  if (imageB64 && contents.length > 0) {
+    contents[contents.length - 1].parts.push({
+      inlineData: { mimeType: "image/png", data: imageB64 },
+    });
+  }
+  return contents;
 }
 
 interface LlmCallOutcome {
@@ -365,7 +389,7 @@ async function callGemini(
         outputTokens: 0,
       };
     }
-    const body: Record<string, unknown> = { contents: toGeminiContents(messages) };
+    const body: Record<string, unknown> = { contents: toGeminiContents(messages, req.image_b64) };
     if (req.system) body.systemInstruction = { parts: [{ text: req.system }] };
     if (req.response_schema) {
       body.generationConfig = { responseMimeType: "application/json", responseSchema: req.response_schema };
@@ -444,11 +468,36 @@ function classifyError(status: number, bodyText: string): LlmCallOutcome {
 /** Groq chat completions (OpenAI-compatible). Same outcome contract as
  * callGemini: usage tokens are the source of truth — without them the call
  * fails as usage_metadata_missing, never billed on an estimate. The key
- * travels only in the Authorization header — never in a URL, log, or response. */
-function toGroqMessages(messages: ChatMessage[], system?: string): { role: string; content: string }[] {
-  const out: { role: string; content: string }[] = [];
+ * travels only in the Authorization header — never in a URL, log, or response.
+ * Vision (captcha_solve): the image rides as an image_url data part on the
+ * last user message — only the qwen vision leg ever receives one. */
+type GroqContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
+function toGroqMessages(
+  messages: ChatMessage[],
+  system?: string,
+  imageB64?: string,
+): { role: string; content: string | GroqContentPart[] }[] {
+  const out: { role: string; content: string | GroqContentPart[] }[] = [];
   if (system) out.push({ role: "system", content: system });
   for (const m of messages) out.push({ role: m.role === "model" ? "assistant" : "user", content: m.text });
+  if (imageB64 && out.length > 0) {
+    // Last user message becomes a parts array: text + image_url.
+    for (let i = out.length - 1; i >= 0; i--) {
+      if (out[i].role === "user" && typeof out[i].content === "string") {
+        out[i] = {
+          role: "user",
+          content: [
+            { type: "text", text: out[i].content as string },
+            { type: "image_url", image_url: { url: `data:image/png;base64,${imageB64}` } },
+          ],
+        };
+        break;
+      }
+    }
+  }
   return out;
 }
 
@@ -466,7 +515,7 @@ async function callGroq(
     const res = await (deps.fetchFn ?? fetch)(GROQ_API_URL, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model, messages: toGroqMessages(messages, req.system) }),
+      body: JSON.stringify({ model, messages: toGroqMessages(messages, req.system, req.image_b64) }),
       signal: ctrl.signal,
     });
     if (!res.ok) return classifyError(res.status, await safeText(res));
@@ -556,6 +605,12 @@ export async function routeLlm(deps: RouterDeps, req: RouteRequest): Promise<Rou
   if (!tenantId || !req.turn_id || !req.messages || req.messages.length === 0) {
     return failResult([], "bad_request", "tenant_id, turn_id aur messages chahiye", ms());
   }
+  // captcha_solve is a vision kind: no image, no route. The image is
+  // validated for size by the captcha module before this call; this
+  // guard stops any other caller routing a text-only request here.
+  if (req.kind === "captcha_solve" && !req.image_b64) {
+    return failResult([], "bad_request", "captcha_solve needs an image_b64 challenge image", ms());
+  }
 
   const tenant = await getTenant(deps.db, tenantId);
   if (!tenant) return failResult([], "tenant_not_found", "tenant nahi mila", ms());
@@ -641,6 +696,19 @@ export async function routeLlm(deps: RouterDeps, req: RouteRequest): Promise<Rou
     }
     // Groq leg: skip (traced) when the tenant has no usable Groq key —
     // the Gemini-only path behaves exactly as before.
+    // captcha_solve vision guard: gpt-oss-120b is TEXT-ONLY — it cannot
+    // see the challenge image. Only qwen3.8-27b may serve a Groq vision
+    // leg; any other Groq model in a captcha_solve chain is skipped
+    // (traced), never called. A config naming gpt-oss-120b for this
+    // kind therefore degrades to Gemini-only, never to a blind call.
+    if (req.kind === "captcha_solve" && isGroqModel(model) && model !== MODEL_GROQ_VISION) {
+      await insertTrace(deps.db, tenantId, deviceId, "router_groq_skipped", {
+        turn_id: req.turn_id,
+        model,
+        reason: "text_only_model",
+      });
+      continue;
+    }
     let groqApiKey: string | null = null;
     if (isGroqModel(model)) {
       if (!groqResolved) {

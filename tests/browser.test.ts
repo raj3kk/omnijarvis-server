@@ -120,13 +120,23 @@ describe("captcha detection (recognise only — never solve)", () => {
     });
   });
 
-  it("every challenge type resolves to human-assist (C-T7: no auto-solve path)", () => {
+  it("every challenge type resolves to human-assist by default (C-T7: no auto-solve without the flag + caps)", () => {
     for (const type of ["turnstile", "recaptcha", "hcaptcha", "unknown"] as const) {
       expect(resolveCaptcha(type, "example.com").action).toBe("human_assist");
     }
+    // Flag off (or caps hit) keeps grids human-only even after D3 lock.
+    expect(resolveCaptcha("recaptcha", "example.com", { autoSolveAllowed: false, capsOk: true }).action).toBe("human_assist");
+    expect(resolveCaptcha("hcaptcha", "example.com", { autoSolveAllowed: true, capsOk: false }).action).toBe("human_assist");
     // Turnstile on an allowlisted-looking site still human-assists:
     // the allowlist is empty and no solver is installed (D3 gated).
     expect(resolveCaptcha("turnstile", "flow99.in").action).toBe("human_assist");
+  });
+
+  it("D3 LOCKED: flag on + caps ok routes grids to auto_solve; audio/v3/turnstile/unknown stay human-only", () => {
+    expect(resolveCaptcha("recaptcha", "example.com", { autoSolveAllowed: true, capsOk: true }).action).toBe("auto_solve");
+    expect(resolveCaptcha("hcaptcha", "example.com", { autoSolveAllowed: true, capsOk: true }).action).toBe("auto_solve");
+    expect(resolveCaptcha("turnstile", "example.com", { autoSolveAllowed: true, capsOk: true }).action).toBe("human_assist");
+    expect(resolveCaptcha("unknown", "example.com", { autoSolveAllowed: true, capsOk: true }).action).toBe("human_assist");
   });
 
   it("Turnstile allowlist is empty — auto-solve is impossible (C-T6)", () => {
@@ -135,11 +145,15 @@ describe("captcha detection (recognise only — never solve)", () => {
     expect(isTurnstileAutoSolveAllowed(null)).toBe(false);
   });
 
-  it("banned types are banned (D3 §5 hard ban)", () => {
-    expect(BANNED_AUTO_SOLVE_TYPES).toEqual(
-      expect.arrayContaining(["recaptcha_v2", "recaptcha_v3", "hcaptcha", "image_grid", "audio", "distorted_text"]),
-    );
+  it("banned types are banned (D3 §5 hard ban, narrowed by the D3 LOCKED auto-solver)", () => {
+    // Only audio + recaptcha_v3 stay banned; grids/distorted-text moved
+    // to the gated auto_solve branch (DESIGN §6) — the list remains the
+    // enforcement point.
+    expect(BANNED_AUTO_SOLVE_TYPES).toEqual(["audio", "recaptcha_v3"]);
     for (const t of BANNED_AUTO_SOLVE_TYPES) expect(isAutoSolveBanned(t)).toBe(true);
+    for (const t of ["recaptcha_v2", "hcaptcha", "image_grid", "distorted_text"]) {
+      expect(isAutoSolveBanned(t)).toBe(false);
+    }
   });
 
   it("countdown is 60s — timeout is a pause window, not a fail", () => {

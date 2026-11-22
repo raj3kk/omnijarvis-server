@@ -28,6 +28,8 @@ const PK: Record<string, string[]> = {
   doc_jobs: ["id"],
   certificates: ["id"],
   browser_tasks: ["id"],
+  // D3 locked (captcha-solver DESIGN §4.1, migration 0009).
+  captcha_solves: ["id"],
   skill_reviews: ["id"],
   skill_signatures: ["skill_id"],
   memories: ["id"],

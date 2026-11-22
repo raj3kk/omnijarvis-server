@@ -254,3 +254,44 @@ describe("D1 migration 0007 (billing ledger: subscriptions + payments + refunds 
     expect(code.toLowerCase()).not.toContain("razorpay");
   });
 });
+
+const SQL9 = readFileSync(
+  new URL("../d1/migrations/0009_captcha_solves.sql", import.meta.url),
+  "utf8",
+);
+
+describe("D1 migration 0009 (captcha auto-solve audit: captcha_solves)", () => {
+  it("creates captcha_solves with the DESIGN §4.1 columns + outcome CHECK", () => {
+    expect(SQL9).toContain("CREATE TABLE IF NOT EXISTS captcha_solves (");
+    for (const col of ["id TEXT PRIMARY KEY", "tenant_id TEXT NOT NULL", "device_id TEXT NOT NULL", "task_id TEXT NOT NULL", "site TEXT", "challenge_type TEXT NOT NULL", "model TEXT", "confidence REAL", "outcome TEXT NOT NULL", "attempts INTEGER NOT NULL", "latency_ms INTEGER", "flag_asserted INTEGER NOT NULL", "image_sha256 TEXT", "created_at INTEGER NOT NULL"]) {
+      expect(SQL9).toContain(col);
+    }
+    for (const outcome of ["submitted", "submitted_ok", "submitted_wrong", "low_confidence", "parse_failed", "safety_blocked", "cap_reached", "not_allowed", "byok_required"]) {
+      expect(SQL9).toContain(`'${outcome}'`);
+    }
+    expect(SQL9).toContain("idx_captcha_solves_tenant ON captcha_solves(tenant_id, created_at)");
+    expect(SQL9).toContain("idx_captcha_solves_task ON captcha_solves(task_id, created_at)");
+    expect(SQL9).toContain("idx_captcha_solves_outcome ON captcha_solves(outcome, created_at)");
+  });
+
+  it("carries NO answer/solution/token/image column (DESIGN §4.3)", () => {
+    // Column names only — a substring search false-positives on the
+    // outcome value 'answered' (which contains "answer").
+    const tableSql = SQL9.slice(SQL9.indexOf("CREATE TABLE"), SQL9.indexOf(");"));
+    const colNames = [...tableSql.matchAll(/^\s{2}(\w+)\s/mg)].map((m) => m[1].toLowerCase());
+    expect(colNames.length).toBeGreaterThan(0);
+    for (const forbidden of ["answer", "solution", "token", "image_b64", "image_bytes"]) {
+      expect(colNames).not.toContain(forbidden);
+    }
+    // Only the image hash is retained (audit/dedup).
+    expect(SQL9).toContain("image_sha256 TEXT");
+  });
+
+  it("is non-destructive: no DROP TABLE / TRUNCATE / DELETE FROM, no Supabase refs", () => {
+    const code = SQL9.replace(/--[^\\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(code).not.toMatch(/DROP\s+TABLE/i);
+    expect(code).not.toMatch(/TRUNCATE/i);
+    expect(code).not.toMatch(/DELETE\s+FROM/i);
+    expect(code.toLowerCase()).not.toContain("supabase");
+  });
+});

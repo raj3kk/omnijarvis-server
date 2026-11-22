@@ -10,11 +10,13 @@
  * gated stub only until an E2B account exists (U-4, parent-side).
  * **No stage may claim "server browser works" until E2B is live.**
  *
- * Captcha scope (D3 brief, human-assist-first ONLY):
+ * Captcha scope (D3 brief, human-assist-first ONLY — until the D3 LOCKED
+ * auto-solver, 2026-11-22):
  * - Detection only recognises a challenge (known selectors + iframes);
- *   it NEVER solves one. There is no solver import, no solver call,
- *   no auto-solve code path anywhere in this module — `resolveCaptcha`
- *   returns `human_assist` for EVERY challenge type.
+ *   it NEVER solves one. There is no solver import, no solver call in
+ *   this module — `resolveCaptcha` returns `human_assist` for every
+ *   challenge type EXCEPT the single gated `auto_solve` branch
+ *   (flag on + type in scope + caps ok, D3 locked 2026-11-22).
  * - Turnstile auto-solve is GATED (explicit D3 decision + user-owned
  *   sites only). The allowlist is EMPTY by design; `isTurnstileAllowed`
  *   therefore always returns false until a decision changes it.
@@ -24,6 +26,19 @@
  *   auto-resume. Max 3 assist requests per task; the 4th auto-pauses
  *   the task. A captcha solution/token value is NEVER stored, logged,
  *   or traced — traces carry only {task_id, site, solved, duration_s}.
+ *
+ * D3 LOCKED auto-solve (2026-11-22, captcha-solver DESIGN §5/§6) —
+ * the ban list below is NARROWED, not deleted, and remains the
+ * enforcement point:
+ * - `audio` and `recaptcha_v3` stay banned, always human-only.
+ * - `recaptcha_v2` / `hcaptcha` / `image_grid` / `distorted_text` move
+ *   to auto-solve allowed ONLY when the device asserts the §1
+ *   one-time flag AND the §3 caps allow AND the type is in scope.
+ *   The single gated branch lives in `resolveCaptcha()` (flag + caps
+ *   passed in by the caller); everything else routes human_assist
+ *   exactly as before. The solver itself lives in src/captcha.ts
+ *   (Gemini/Groq vision only — no third-party solver service, no
+ *   audio solving, no fingerprint spoofing, no proxy rotation).
  *
  * Task state lives in D1 `browser_tasks` (migration 0005). Status
  * `awaiting_user` is the server-side AWAITING_USER state (app-side
@@ -157,15 +172,12 @@ export function detectCaptcha(html: string): CaptchaDetection {
   return { detected: false, type: "unknown" };
 }
 
-/** Types that may NEVER be auto-solved (D3 §5 hard ban). */
-export const BANNED_AUTO_SOLVE_TYPES: readonly string[] = [
-  "recaptcha_v2",
-  "recaptcha_v3",
-  "hcaptcha",
-  "image_grid",
-  "audio",
-  "distorted_text",
-];
+/** Types that may NEVER be auto-solved (D3 §5 hard ban, narrowed by the
+ * D3 LOCKED auto-solver 2026-11-22 — DESIGN §6: only `audio` and
+ * `recaptcha_v3` stay banned. recaptcha_v2 / hcaptcha / image_grid /
+ * distorted_text moved to the gated auto_solve branch in resolveCaptcha
+ * below; the ban list remains the enforcement point. */
+export const BANNED_AUTO_SOLVE_TYPES: readonly string[] = ["audio", "recaptcha_v3"];
 
 export function isAutoSolveBanned(challengeType: string): boolean {
   return (BANNED_AUTO_SOLVE_TYPES as readonly string[]).includes(challengeType);
@@ -181,20 +193,46 @@ export function isTurnstileAutoSolveAllowed(site: string | null): boolean {
   return TURNSTILE_ALLOWLIST.includes(site.toLowerCase());
 }
 
-export type CaptchaResolution = { action: "human_assist"; reason: string };
+export type CaptchaResolution = { action: "human_assist" | "auto_solve"; reason: string };
 
 /**
- * The ONLY resolution this build knows: human-assist. Every challenge
- * type — Turnstile included — routes here while the allowlist is
- * empty and no D3 Turnstile decision exists. There is deliberately
- * no `auto_solve` branch to audit.
+ * The resolution for a detected challenge (D3 LOCKED auto-solver,
+ * DESIGN §6). The single gated branch: a grid challenge (reCAPTCHA v2
+ * / hCaptcha — the detection types `recaptcha` / `hcaptcha`) routes to
+ * `auto_solve` ONLY when the caller passes the device flag
+ * (autoSolveAllowed — the §1 one-time "always allow", re-read per
+ * challenge) AND capsOk (the §3 per-task/per-day caps, counted from
+ * captcha_solves). Everything else — flag off, caps hit, audio,
+ * Turnstile, v3, unknown — routes to `human_assist` exactly as before.
+ * The flag + cap state are caller inputs: this function decides the
+ * routing, it never reads D1 or the flag store itself.
  */
-export function resolveCaptcha(type: CaptchaChallengeType, site: string | null): CaptchaResolution {
+export function resolveCaptcha(
+  type: CaptchaChallengeType,
+  site: string | null,
+  opts: { autoSolveAllowed?: boolean; capsOk?: boolean } = {},
+): CaptchaResolution {
   if (type === "turnstile" && isTurnstileAutoSolveAllowed(site)) {
     // Unreachable while TURNSTILE_ALLOWLIST is empty; kept as the
     // single gated branch so a future decision changes ONE list,
     // not the control flow. (No solver code lives behind it today.)
     return { action: "human_assist", reason: "turnstile allowlist hit but no solver is installed (D3 gated)" };
+  }
+  if (
+    (type === "recaptcha" || type === "hcaptcha") &&
+    opts.autoSolveAllowed === true &&
+    opts.capsOk === true
+  ) {
+    return {
+      action: "auto_solve",
+      reason: `${type} auto-solve allowed (D3 locked, flag on, caps ok) — Gemini/Groq vision`,
+    };
+  }
+  if (type === "recaptcha" || type === "hcaptcha") {
+    return {
+      action: "human_assist",
+      reason: `${type} auto-solve needs the device flag + caps (D3 locked) — human-assist`,
+    };
   }
   return {
     action: "human_assist",
