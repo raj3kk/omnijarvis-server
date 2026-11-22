@@ -608,7 +608,11 @@ describe("rate-limit budget (DESIGN §2.2)", () => {
     for (let i = 0; i < 10; i++) {
       expect((await checkRateLimit(env, "captcha_solve", "t-rl")).allowed).toBe(true);
     }
-    expect((await checkRateLimit(env, "captcha_solve", "t-rl")).allowed).toBe(false);
+    const refused = await checkRateLimit(env, "captcha_solve", "t-rl");
+    expect(refused.allowed).toBe(false);
+    // M-I-4 follow-up: the refusal carries the window so the caller
+    // can send Retry-After (60 s for every route today).
+    expect(refused.retryAfterSec).toBe(60);
     // A different tenant is unaffected.
     expect((await checkRateLimit(env, "captcha_solve", "t-other")).allowed).toBe(true);
   });
@@ -732,6 +736,32 @@ describe("POST /api/captcha/solve route matrix (DESIGN §8.1/§8.4)", () => {
     expect(body.ok).toBe(false);
     expect(body.error).toBe("cap_reached");
     expect(body.fallback).toBe("human_assist");
+  });
+
+  it("11th solve in a minute -> 429 rate_limited WITH Retry-After: 60 (M-I-4 follow-up)", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    // Key-less tenant: the first 10 pass the limiter and 402 at
+    // byok_required (exactly the M-I-4 live shape), the 11th 429s.
+    await seedTenantWithKeys(db, "t-429", master, { geminiKey: null, groqKey: null });
+    const key = await genDeviceKey();
+    await seedDevice(db, "dev-429", "t-429", key.publicKeyB64);
+    for (let i = 0; i < 10; i++) {
+      const res = await signedSolve(db, key, solveBody({ task_id: `bt-429-${i}` }), {
+        deviceId: "dev-429",
+        masterB64: master,
+      });
+      expect(res.status).toBe(402);
+    }
+    const limited = await signedSolve(db, key, solveBody({ task_id: "bt-429-10" }), {
+      deviceId: "dev-429",
+      masterB64: master,
+    });
+    expect(limited.status).toBe(429);
+    expect(((await limited.json()) as Record<string, unknown>).error).toBe("rate_limited");
+    expect(limited.headers.get("Retry-After")).toBe("60");
+    // No Upstash in the test env, so the in-memory fallback enforced it.
+    expect(limited.headers.get("x-ratelimit-fallback")).toBe("1");
   });
 });
 

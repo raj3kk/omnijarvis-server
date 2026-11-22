@@ -117,7 +117,7 @@ import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken,
 import { getHubPublicKey, importPrivateKey } from "./crypto";
 import { handleSync, type SyncRequest } from "./sync";
 import { constantTimeEqual, handleTick, type DispatchStep } from "./cron";
-import { checkRateLimit, checkUpstashLive, probeUpstashCounter } from "./ratelimit";
+import { checkRateLimit, checkUpstashLive, probeUpstashCounter, type RateLimitResult } from "./ratelimit";
 import { d1Batch, getDevice, getTenant, insertTrace, verifyLicenceKey } from "./db";
 import {
   buildCaptchaAssistEvent,
@@ -269,6 +269,21 @@ function json(body: unknown, status = 200, extraHeaders: Record<string, string> 
   return new Response(JSON.stringify(body), {
     status,
     headers: { "Content-Type": "application/json", ...extraHeaders },
+  });
+}
+
+/**
+ * Shared 429 for every `checkRateLimit` refusal (M-I-4 follow-up,
+ * 2026-11-22): the captcha 429s carried NO Retry-After header, so
+ * clients had to guess the 60 s window. Every rate-limited response
+ * now carries `Retry-After: <window seconds>` (60 today) plus the
+ * existing `x-ratelimit-fallback: 1` marker when the per-isolate
+ * fallback enforced it. One helper, all 27+ call sites.
+ */
+function rateLimited(rl: RateLimitResult): Response {
+  return json({ error: "rate_limited" }, 429, {
+    "Retry-After": String(rl.retryAfterSec ?? 60),
+    ...(rl.fallback ? { "x-ratelimit-fallback": "1" } : {}),
   });
 }
 
@@ -430,7 +445,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // Pairing: init (licence-verified, rate-limited).
     if (path === "/api/pairing/init" && method === "POST") {
       const rl = await checkRateLimit(env, "pairingInit", clientIp(request));
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const body = await readJson(request);
       const deviceId = typeof body.device_id === "string" ? body.device_id : "";
       const tenantId = typeof body.tenant_id === "string" ? body.tenant_id : "";
@@ -455,7 +470,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // Pairing: register (one-time token + public key).
     if (path === "/api/pairing/register" && method === "POST") {
       const rl = await checkRateLimit(env, "pairingRegister", clientIp(request));
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const body = await readJson(request);
       const token = typeof body.token === "string" ? body.token : "";
       const deviceId = typeof body.device_id === "string" ? body.device_id : "";
@@ -511,7 +526,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const body = await readJson(request);
       const deviceId = typeof body.device_id === "string" ? body.device_id : "";
       const rl = await checkRateLimit(env, "sync", deviceId || clientIp(request));
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const syncReq = body as unknown as SyncRequest;
       if (!deviceId || !syncReq.table || !Array.isArray(syncReq.rows)) {
         return json({ error: "bad_request" }, 400);
@@ -542,7 +557,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const body = await readJson(request);
       const tenantId = typeof body.tenant_id === "string" ? body.tenant_id : "";
       const rl = await checkRateLimit(env, "llmRoute", tenantId || clientIp(request));
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       let config;
       try {
         config = loadRouterConfig(env);
@@ -706,7 +721,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         return json({ error: allowed.error ?? "plan_docs_not_allowed" }, allowed.error === "tenant_not_found" ? 404 : 403);
       }
       const rl = await checkRateLimit(env, "docs", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const isPdf =
         (file.name ?? "").toLowerCase().endsWith(".pdf") ||
         (fileBytes[0] === 0x25 && fileBytes[1] === 0x50 && fileBytes[2] === 0x44 && fileBytes[3] === 0x46);
@@ -764,7 +779,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         return json({ error: allowed.error ?? "plan_docs_not_allowed" }, allowed.error === "tenant_not_found" ? 404 : 403);
       }
       const rl = await checkRateLimit(env, "docs", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const schema = body.schema && typeof body.schema === "object" ? (body.schema as Record<string, unknown>) : { properties: {} };
       let text = typeof body.text === "string" ? body.text : "";
       const docJobId = typeof body.doc_job_id === "number" ? body.doc_job_id : null;
@@ -869,7 +884,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         return json({ error: allowed.error ?? "plan_docs_not_allowed" }, allowed.error === "tenant_not_found" ? 404 : 403);
       }
       const rl = await checkRateLimit(env, "docs", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const job = await getDocJob(env.DB, docJobId);
       if (!job) return json({ error: "doc_job_not_found" }, 404);
       if (job.tenant_id !== tenantId) return json({ error: "forbidden" }, 403);
@@ -948,7 +963,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const device = await getDevice(env.DB, deviceId);
       if (!device || device.enabled === 0) return json({ error: "device_not_paired" }, 403);
       const rl = await checkRateLimit(env, "browser", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const result = await executeBrowserTask(env.DB, {
         tenant_id: tenantId,
         device_id: deviceId,
@@ -971,7 +986,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const task = await getBrowserTask(env.DB, taskId);
       if (!task) return json({ error: "task_not_found" }, 404);
       const rl = await checkRateLimit(env, "browser", task.tenant_id);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const assist = await requestCaptchaAssist(env.DB, taskId);
       if (!assist.ok) {
         if (assist.error === "task_not_found") return json({ error: "task_not_found" }, 404);
@@ -1062,7 +1077,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
       if (!tenantId) return json({ error: "bad_request" }, 400);
       const rl = await checkRateLimit(env, "captcha_solve", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const validated = validateSolveRequest(body);
       if (!validated.ok) return json({ error: "bad_request" }, 400);
       let config;
@@ -1116,7 +1131,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const token = typeof body.fcm_token === "string" ? body.fcm_token : "";
       if (!deviceId || !token || token.length > 4096) return json({ error: "bad_request" }, 400);
       const rl = await checkRateLimit(env, "fcm_register", deviceId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const device = await getDevice(env.DB, deviceId);
       if (!device) return json({ error: "device_not_paired" }, 403);
       await registerFcmToken(env.DB, deviceId, device.tenant_id, token);
@@ -1142,7 +1157,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const device = await getDevice(env.DB, deviceId);
       if (!device || device.enabled === 0) return json({ error: "device_not_paired" }, 403);
       const rl = await checkRateLimit(env, "fcm_send", deviceId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const data =
         body.data && typeof body.data === "object" && !Array.isArray(body.data)
           ? (body.data as Record<string, unknown>)
@@ -1230,7 +1245,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         return json({ error: "code_too_large" }, 400);
       }
       const rl = await checkRateLimit(env, "skills", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const skillId = newSkillId();
       const nowMs = Date.now();
       await insertSkill(env.DB, {
@@ -1268,7 +1283,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         return json({ error: "reason_required" }, 400);
       }
       const rl = await checkRateLimit(env, "skills", "admin");
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const skill = await getSkill(env.DB, skillId);
       if (!skill) return json({ error: "skill_not_found" }, 404);
       if (skill.status !== "quarantined") {
@@ -1371,7 +1386,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const tenant = await getTenant(env.DB, resolvedTenant);
       if (!tenant) return json({ error: "tenant_not_found" }, 404);
       const rl = await checkRateLimit(env, "skills", resolvedTenant);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const approved = await listApprovedSkills(env.DB);
       // D2 plan cap: Free = first 1 approved skill; Pro/Business = library.
       const capped = tenant.plan_tier === "free" ? approved.slice(0, 1) : approved;
@@ -1417,7 +1432,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const tenant = await getTenant(env.DB, tenantId);
       if (!tenant) return json({ error: "tenant_not_found" }, 404);
       const rl = await checkRateLimit(env, "memory", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const emb = await embedText(
         {
           db: env.DB,
@@ -1469,7 +1484,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const tenant = await getTenant(env.DB, tenantId);
       if (!tenant) return json({ error: "tenant_not_found" }, 404);
       const rl = await checkRateLimit(env, "memory", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const emb = await embedText(
         {
           db: env.DB,
@@ -1511,7 +1526,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const tenant = await getTenant(env.DB, tenantId);
       if (!tenant) return json({ error: "tenant_not_found" }, 404);
       const rl = await checkRateLimit(env, "memory", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const deleted = await wipeMemories(env.DB, tenantId);
       const q = qdrantStatus(env);
       return json({ ok: true, deleted, qdrant: q.configured ? "configured" : "not_configured" });
@@ -1543,7 +1558,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const tenant = await getTenant(env.DB, tenantId);
       if (!tenant) return json({ error: "tenant_not_found" }, 404);
       const rl = await checkRateLimit(env, "billing", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       if (tenant.email_verified !== 1) return json({ error: "email_not_verified" }, 403);
       const planTier = typeof body.plan_tier === "string" ? body.plan_tier : "";
       const period = typeof body.billing_period === "string" ? body.billing_period : "";
@@ -1590,7 +1605,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const tenantId = auth.tenant_id ?? sub.tenant_id;
       if (auth.tenant_id && auth.tenant_id !== sub.tenant_id) return json({ error: "forbidden" }, 403);
       const rl = await checkRateLimit(env, "billing", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const res = await submitUtr(env.DB, {
         subscription: sub,
         utr,
@@ -1615,7 +1630,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const sub = await getSubscription(env.DB, payment.subscription_id);
       if (!sub) return json({ error: "subscription_not_found" }, 404);
       const rl = await checkRateLimit(env, "billingAdmin", "admin");
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const res = await approvePayment(env.DB, { payment, subscription: sub, admin });
       if (!res.ok) return json({ error: res.error }, 409);
       if (res.already) {
@@ -2177,7 +2192,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const tenant = await getTenant(env.DB, tenantId);
       if (!tenant) return json({ error: "tenant_not_found" }, 404);
       const rl = await checkRateLimit(env, "billing", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const res = await createCronJob(env.DB, { tenant, device_id: deviceId, cron_expr: cronExpr, command });
       if (!res.ok) {
         return json(
@@ -2236,7 +2251,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const tenant = await getTenant(env.DB, tenantId);
       if (!tenant) return json({ error: "tenant_not_found" }, 404);
       const rl = await checkRateLimit(env, "e2b", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const hobbyExhausted = (await getAdminSetting(env.DB, "e2b_hobby_exhausted")) === "1";
       const res = await requestE2BRun(env.DB, {
         tenant_id: tenantId,
@@ -2327,7 +2342,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         return json({ error: "google_oauth_not_configured", detail: "GCP OAuth client not set up on the hub — parent step (see Track E REPORT.md)" }, 503);
       }
       const rl = await checkRateLimit(env, "googleOauthStart", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       const state = await issueOAuthState(env.DB, tenantId, auth.device_id ?? deviceId);
       return json({ ok: true, auth_url: buildAuthUrl(env, new URL(request.url).origin, state), redirect_uri: googleRedirectUri(new URL(request.url).origin) });
     }
@@ -2399,7 +2414,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (!to || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return json({ error: "bad_request", detail: "valid 'to' email required" }, 400);
       if (text.length > 100_000) return json({ error: "bad_request", detail: "body too large (100k chars)" }, 400);
       const rl = await checkRateLimit(env, "googleApi", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       try {
         const sent = await gmailSend({ db: env.DB, env, tenantId }, { to, subject, body: text });
         return json({ ok: true, id: sent.id });
@@ -2424,7 +2439,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const tenantId = auth.tenant_id ?? url.searchParams.get("tenant_id") ?? "";
       if (!tenantId) return json({ error: "bad_request" }, 400);
       const rl = await checkRateLimit(env, "googleApi", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       try {
         const messages = await gmailListMessages(
           { db: env.DB, env, tenantId },
@@ -2454,7 +2469,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const tenantId = auth.tenant_id ?? url.searchParams.get("tenant_id") ?? "";
       if (!tenantId) return json({ error: "bad_request" }, 400);
       const rl = await checkRateLimit(env, "googleApi", tenantId);
-      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      if (!rl.allowed) return rateLimited(rl);
       try {
         const file = await driveReadFile({ db: env.DB, env, tenantId }, fileId);
         return json({ ok: true, file });

@@ -48,6 +48,13 @@ export const RATE_LIMITS: Record<string, { limit: number; windowMs: number }> = 
 export interface RateLimitResult {
   allowed: boolean;
   fallback: boolean;
+  /** Seconds a client should wait before retrying (RFC 9110 Retry-After).
+   * The limiter exposes no per-key remaining window (Upstash INCR +
+   * PEXPIRE-NX gives no TTL read, the fallback keeps no expiry), so
+   * this is the route's full window in seconds — 60 for every route
+   * today (M-I-4 proof, 2026-11-22: captcha 429s carried no
+   * Retry-After at all). Callers send it as the Retry-After header. */
+  retryAfterSec: number;
 }
 
 export interface UpstashOpts {
@@ -169,10 +176,11 @@ export async function checkRateLimit(
 ): Promise<RateLimitResult> {
   const budget = RATE_LIMITS[route];
   const key = `rl:${route}:${identifier}`;
+  const retryAfterSec = Math.ceil(budget.windowMs / 1000);
   const url = (env as unknown as Record<string, string | undefined>).UPSTASH_REDIS_REST_URL;
   const token = (env as unknown as Record<string, string | undefined>).UPSTASH_REDIS_REST_TOKEN;
   if (!url || !token) {
-    return { allowed: fallbackCheck(key, budget.limit, budget.windowMs, Date.now()), fallback: true };
+    return { allowed: fallbackCheck(key, budget.limit, budget.windowMs, Date.now()), fallback: true, retryAfterSec };
   }
   try {
     const res = await fetch(`${url}/pipeline`, {
@@ -186,8 +194,8 @@ export async function checkRateLimit(
     if (!res.ok) throw new Error(`upstash:${res.status}`);
     const data = (await res.json()) as { result?: unknown[] }[];
     const count = Number(data?.[0]?.result ?? 0);
-    return { allowed: count <= budget.limit, fallback: false };
+    return { allowed: count <= budget.limit, fallback: false, retryAfterSec };
   } catch {
-    return { allowed: fallbackCheck(key, budget.limit, budget.windowMs, Date.now()), fallback: true };
+    return { allowed: fallbackCheck(key, budget.limit, budget.windowMs, Date.now()), fallback: true, retryAfterSec };
   }
 }

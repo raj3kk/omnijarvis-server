@@ -227,6 +227,15 @@ function qdrantHeaders(env: QdrantEnv): Record<string, string> {
  * Ensure the collection exists with the embedding's vector size
  * (Cosine distance). GET 200 = exists; GET 404 = PUT-create; any
  * other status / network failure = false (caller returns qdrant_error).
+ * R-15 live proof (2026-11-22): the cluster runs strict mode
+ * (`unindexed_filtering_retrieve:false`), so a tenant-filtered search
+ * 400s ("Index required but not found for tenant_id") unless the
+ * `tenant_id` keyword payload index exists — NOTHING created it before.
+ * This function now also ensures that index: on an existing collection
+ * it reads `payload_schema` from the GET and creates the index only
+ * when missing; on a fresh collection it creates the index right
+ * after the PUT. Index-create failure = false (fail closed — an
+ * upsert that can never be searched is not a success).
  */
 export async function qdrantEnsureCollection(
   env: QdrantEnv,
@@ -239,21 +248,68 @@ export async function qdrantEnsureCollection(
     const get = await fetchFn(`${base}/collections/${QDRANT_COLLECTION}`, {
       headers: qdrantHeaders(env),
     });
-    if (get.ok) return true;
+    if (get.ok) {
+      let schema: Record<string, unknown> | null = null;
+      try {
+        const data = (await get.json()) as { result?: { payload_schema?: Record<string, unknown> } };
+        schema = data?.result?.payload_schema ?? null;
+      } catch {
+        schema = null; // unparseable body: attempt the index PUT, fail closed if it errors
+      }
+      return qdrantEnsureTenantIndex(env, base, fetchFn, schema);
+    }
     if (get.status !== 404) return false;
     const put = await fetchFn(`${base}/collections/${QDRANT_COLLECTION}`, {
       method: "PUT",
       headers: qdrantHeaders(env),
       body: JSON.stringify({ vectors: { size: vectorSize, distance: "Cosine" } }),
     });
-    return put.ok;
+    if (!put.ok) return false;
+    // Fresh collection has no payload indexes at all.
+    return qdrantEnsureTenantIndex(env, base, fetchFn, {});
   } catch {
     return false;
   }
 }
 
-function qdrantPointId(tenantId: string, memoryId: number): string {
-  return `${tenantId}:${memoryId}`;
+/**
+ * Ensure the `tenant_id` keyword payload index exists. When the
+ * collection's `payload_schema` is known and already lists tenant_id,
+ * no request is made. Otherwise PUT the index (R-15 proof: this exact
+ * call — `{field_name:"tenant_id",field_schema:"keyword"}` — turned a
+ * 400 filtered search into a 200 with score 1.0000001).
+ */
+async function qdrantEnsureTenantIndex(
+  env: QdrantEnv,
+  base: string,
+  fetchFn: typeof fetch,
+  payloadSchema: Record<string, unknown> | null,
+): Promise<boolean> {
+  if (payloadSchema && "tenant_id" in payloadSchema) return true;
+  try {
+    const res = await fetchFn(`${base}/collections/${QDRANT_COLLECTION}/index`, {
+      method: "PUT",
+      headers: qdrantHeaders(env),
+      body: JSON.stringify({ field_name: "tenant_id", field_schema: "keyword" }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Qdrant point id = the D1 memory id, as an unsigned integer.
+ * R-15 live proof (2026-11-22): the old `"${tenantId}:${memoryId}"`
+ * STRING id 400s on upsert ("not a valid point ID, valid values are
+ * either an unsigned integer or a UUID"); integer 9001 upserted 200
+ * acknowledged. The integer is safe across tenants: `memories.id` is
+ * `INTEGER PRIMARY KEY AUTOINCREMENT`, globally unique per table, and
+ * the tenant is carried in the payload (`tenant_id`) which the search
+ * filter matches on — the id itself never needs to encode the tenant.
+ */
+function qdrantPointId(memoryId: number): number {
+  return memoryId;
 }
 
 /**
@@ -286,7 +342,7 @@ export async function qdrantUpsert(
       body: JSON.stringify({
         points: [
           {
-            id: qdrantPointId(tenantId, memoryId),
+            id: qdrantPointId(memoryId),
             vector: embedding,
             payload: {
               tenant_id: tenantId,

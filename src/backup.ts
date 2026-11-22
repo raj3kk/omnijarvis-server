@@ -48,7 +48,15 @@ export interface B2Env {
 
 export function b2Region(env: B2Env): string | null {
   if (env.B2_REGION) return env.B2_REGION;
-  const m = (env.B2_ENDPOINT ?? "").match(/^https?:\/\/s3\.([^.]+)\.backblazeb2\.com/i);
+  // R-6 live proof (2026-11-22): B2_S3_ENDPOINT is stored as a BARE
+  // HOSTNAME (`s3.us-west-002.backblazeb2.com`, no scheme) — the old
+  // regex required `^https?://`, so the region derived to null and
+  // isB2Configured() was false → 503 b2_not_configured with all four
+  // secrets set. Prepend https:// when no scheme is present, then
+  // match as before. Full URLs, bare hosts, and trailing paths all work.
+  const endpoint = (env.B2_ENDPOINT ?? "").trim();
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(endpoint) ? endpoint : `https://${endpoint}`;
+  const m = withScheme.match(/^https?:\/\/s3\.([^.]+)\.backblazeb2\.com/i);
   return m ? m[1] : null;
 }
 

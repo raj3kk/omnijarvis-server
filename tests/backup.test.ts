@@ -17,6 +17,7 @@ import { sha256Hex } from "../src/docs";
 import { decryptTenantKey, importMasterKey } from "../src/keyvault";
 import { insertTrace } from "../src/db";
 import {
+  b2Region,
   b2Status,
   createTenantBackup,
   exportTenantData,
@@ -120,6 +121,18 @@ describe("b2Status / region derivation", () => {
     // Endpoint without a region in the host and no B2_REGION.
     expect(b2Status({ ...B2, B2_ENDPOINT: "https://s3.example.com" })).toBe("not_configured");
     expect(b2Status({ ...B2, B2_ENDPOINT: "https://s3.example.com", B2_REGION: "eu-central-003" })).toBe("configured");
+  });
+
+  it("bare hostname endpoint derives the region too (R-6: signups.env stores it scheme-less)", () => {
+    // Exactly how B2_S3_ENDPOINT is stored: no scheme at all.
+    expect(b2Region({ B2_ENDPOINT: "s3.us-west-002.backblazeb2.com" })).toBe("us-west-002");
+    expect(b2Status({ ...B2, B2_ENDPOINT: "s3.us-west-002.backblazeb2.com" })).toBe("configured");
+    // Full URL still works, as does a trailing slash.
+    expect(b2Region({ B2_ENDPOINT: "https://s3.eu-central-003.backblazeb2.com" })).toBe("eu-central-003");
+    expect(b2Region({ B2_ENDPOINT: "s3.eu-central-003.backblazeb2.com/" })).toBe("eu-central-003");
+    // A bare non-B2 host still derives nothing.
+    expect(b2Region({ B2_ENDPOINT: "s3.example.com" })).toBeNull();
+    expect(b2Status({ ...B2, B2_ENDPOINT: "s3.example.com" })).toBe("not_configured");
   });
 });
 
