@@ -46,6 +46,9 @@ const PK: Record<string, string[]> = {
   // Track C (0009 email + B2): TEXT ids.
   email_sends: ["id"],
   backups: ["id"],
+  // 1.12.0 FCM (0012): device_id PK for tokens, TEXT id for sends.
+  fcm_tokens: ["device_id"],
+  fcm_sends: ["id"],
 };
 
 export class FakeD1 implements D1Like {

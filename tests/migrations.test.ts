@@ -346,3 +346,39 @@ describe("D1 migration 0011 (Track C: Resend email log + B2 backup records)", ()
     expect(code.toLowerCase()).not.toContain("application_key");
   });
 });
+
+const SQL12 = readFileSync(
+  new URL("../d1/migrations/0012_fcm.sql", import.meta.url),
+  "utf8",
+);
+
+describe("D1 migration 0012 (1.12.0 FCM: fcm_tokens + fcm_sends)", () => {
+  it("creates fcm_tokens keyed by device_id + tenant index", () => {
+    expect(SQL12).toContain("CREATE TABLE IF NOT EXISTS fcm_tokens (");
+    for (const col of ["device_id TEXT PRIMARY KEY", "tenant_id TEXT NOT NULL", "token TEXT NOT NULL", "updated_at INTEGER NOT NULL"]) {
+      expect(SQL12).toContain(col);
+    }
+    expect(SQL12).toContain("idx_fcm_tokens_tenant ON fcm_tokens(tenant_id)");
+  });
+
+  it("creates fcm_sends with the four honest statuses + tenant index, no title/body columns", () => {
+    expect(SQL12).toContain("CREATE TABLE IF NOT EXISTS fcm_sends (");
+    for (const col of ["id TEXT PRIMARY KEY", "tenant_id TEXT NOT NULL", "device_id TEXT NOT NULL", "kind TEXT NOT NULL", "status TEXT NOT NULL", "fcm_message_id TEXT", "error TEXT", "created_at INTEGER NOT NULL"]) {
+      expect(SQL12).toContain(col);
+    }
+    expect(SQL12).toContain("CHECK (status IN ('sent', 'failed', 'not_configured', 'no_token'))");
+    expect(SQL12).toContain("idx_fcm_sends_tenant_time ON fcm_sends(tenant_id, created_at)");
+    const tableSql = SQL12.slice(SQL12.indexOf("CREATE TABLE IF NOT EXISTS fcm_sends"), SQL12.indexOf(");", SQL12.indexOf("CREATE TABLE IF NOT EXISTS fcm_sends")));
+    expect(tableSql).not.toContain("title");
+    expect(tableSql).not.toContain("body");
+  });
+
+  it("is non-destructive: no DROP TABLE / TRUNCATE / DELETE FROM, no secrets", () => {
+    const code = SQL12.replace(/--[^\\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(code).not.toMatch(/DROP\s+TABLE/i);
+    expect(code).not.toMatch(/TRUNCATE/i);
+    expect(code).not.toMatch(/DELETE\s+FROM/i);
+    expect(code.toLowerCase()).not.toContain("private_key");
+    expect(code.toLowerCase()).not.toContain("service_account");
+  });
+});

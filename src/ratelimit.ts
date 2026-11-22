@@ -39,6 +39,10 @@ export const RATE_LIMITS: Record<string, { limit: number; windowMs: number }> = 
   captcha_solve: { limit: 10, windowMs: 60_000 },
   googleOauthStart: { limit: 10, windowMs: 60_000 },
   googleApi: { limit: 30, windowMs: 60_000 },
+  // 1.12.0 FCM: register is rare (token fetch/refresh); send is
+  // internal-secret only, so 30/min only bites on a runaway trigger.
+  fcm_register: { limit: 30, windowMs: 60_000 },
+  fcm_send: { limit: 30, windowMs: 60_000 },
 };
 
 export interface RateLimitResult {

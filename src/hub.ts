@@ -29,6 +29,13 @@
  *   only, caps 2/task + 10/day, audit table captcha_solves). byok_required
  *   is HTTP 402 with ok:false + fallback human_assist; cap_reached is
  *   200 ok:false (a normal outcome, not an HTTP error).
+ * - /api/fcm/* (1.12.0): register — paired device + Ed25519 signature
+ *   (docs-style authorizeDocsRequest), token upsert into fcm_tokens;
+ *   send — x-internal-secret ONLY (admin/cron trigger), service-account
+ *   JWT -> FCM v1, audit table fcm_sends; status — x-internal-secret
+ *   ONLY, reports whether a device has a token. No device-triggered
+ *   send in v1 (no legit use case yet). unset service-account key =
+ *   honest not_configured, never a faked send.
  * - /api/skills/submit: paired device + Ed25519 signature (docs-style)
  *   or x-internal-secret; ALWAYS quarantined, never auto-approved (3d).
  * - /api/skills/review: x-admin-token (LLM_ADMIN_TOKEN); approve needs
@@ -95,6 +102,7 @@ export interface Env {
   RESEND_FROM?: string; // sender, e.g. "OmniJarvis <noreply@flow99.in>"
   RESEND_VERIFY_URL_BASE?: string; // base for verification links (default: live hub host)
   RESEND_DAILY_CAP?: string; // local daily sent cap, default 100 (free tier)
+  FIREBASE_SERVICE_ACCOUNT_JSON?: string; // 1.12.0 FCM: whole service-account JSON as one secret — unset = push not_configured (never faked)
   B2_ENDPOINT?: string; // #49: S3 endpoint, e.g. https://s3.us-west-002.backblazeb2.com
   B2_REGION?: string; // e.g. us-west-002 (derived from endpoint when possible)
   B2_BUCKET?: string;
@@ -103,7 +111,7 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "9"; // 9: doc worker re-pointed off Render (WORKER_URL, __WORKER_URL__ default); 8 was the open-source completeness merge
+const VERSION = "10"; // 10: FCM push (fcm_tokens + fcm_sends, service-account JWT -> FCM v1); 9 was the doc-worker re-point
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";
@@ -221,6 +229,7 @@ import {
   storeGoogleTokens,
 } from "./google";
 import { solveCaptcha, validateSolveRequest } from "./captcha";
+import { getFcmRegistration, registerFcmToken, sendFcm } from "./fcm";
 import {
   MAX_INGEST_BYTES,
   authorizeDocsRequest,
@@ -1085,6 +1094,89 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       // fallback. Every other failure is 200 ok:false.
       if (!result.ok && result.error === "byok_required") return json(result, 402);
       return json(result);
+    }
+
+    // --- FCM push (1.12.0) ---
+    // Register: the app sends its Firebase registration token after
+    // pairing (device-signed, same pattern as captcha/solve). The
+    // token is a push address — never logged, never returned.
+    if (path === "/api/fcm/register" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const deviceId = auth.device_id ?? "";
+      const token = typeof body.fcm_token === "string" ? body.fcm_token : "";
+      if (!deviceId || !token || token.length > 4096) return json({ error: "bad_request" }, 400);
+      const rl = await checkRateLimit(env, "fcm_register", deviceId);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      const device = await getDevice(env.DB, deviceId);
+      if (!device) return json({ error: "device_not_paired" }, 403);
+      await registerFcmToken(env.DB, deviceId, device.tenant_id, token);
+      return json({ ok: true, registered: true });
+    }
+
+    // Send: internal-secret ONLY (admin test + future cron/job
+    // triggers). Device-triggered sends are NOT in v1. Every outcome
+    // is 200 ok:false except auth/unpaired/bad-request — a failed
+    // send is a normal outcome with a D1 audit row, never a crash.
+    if (path === "/api/fcm/send" && method === "POST") {
+      if (!env.INTERNAL_SECRET || request.headers.get("x-internal-secret") !== env.INTERNAL_SECRET) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const body = await readJson(request);
+      const deviceId = typeof body.device_id === "string" ? body.device_id : "";
+      const title = typeof body.title === "string" ? body.title : "";
+      const text = typeof body.body === "string" ? body.body : "";
+      const kind = typeof body.kind === "string" ? body.kind : "test";
+      if (!deviceId || !title || title.length > 500 || text.length > 500) {
+        return json({ error: "bad_request" }, 400);
+      }
+      const device = await getDevice(env.DB, deviceId);
+      if (!device || device.enabled === 0) return json({ error: "device_not_paired" }, 403);
+      const rl = await checkRateLimit(env, "fcm_send", deviceId);
+      if (!rl.allowed) return json({ error: "rate_limited" }, 429, rl.fallback ? { "x-ratelimit-fallback": "1" } : {});
+      const data =
+        body.data && typeof body.data === "object" && !Array.isArray(body.data)
+          ? (body.data as Record<string, unknown>)
+          : {};
+      const dataStrings: Record<string, string> = {};
+      for (const [k, v] of Object.entries(data)) {
+        if (typeof v === "string" && k.length <= 64 && v.length <= 500) dataStrings[k] = v;
+      }
+      const result = await sendFcm(env, env.DB, {
+        tenantId: device.tenant_id,
+        deviceId,
+        title,
+        body: text,
+        kind,
+        data: dataStrings,
+      });
+      return json(result);
+    }
+
+    // Status: internal-secret ONLY — has this device registered a
+    // token yet? (Parent-side check before attempting a live send.)
+    if (path === "/api/fcm/status" && method === "GET") {
+      if (!env.INTERNAL_SECRET || request.headers.get("x-internal-secret") !== env.INTERNAL_SECRET) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const deviceId = url.searchParams.get("device_id") ?? "";
+      if (!deviceId) return json({ error: "bad_request" }, 400);
+      const reg = await getFcmRegistration(env.DB, deviceId);
+      return json({
+        ok: true,
+        device_id: deviceId,
+        registered: reg !== null,
+        updated_at: reg?.updated_at ?? null,
+      });
     }
 
     // --- Skill registry + memory (Phase 3, stage 3d) ---
