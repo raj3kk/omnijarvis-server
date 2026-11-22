@@ -114,7 +114,7 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "15"; // 15: M-I-28 service binding (workers.dev subrequest 1042 fix); 14 was the licence web UI
+const VERSION = "16"; // 16: malformed llm message shape -> 400 (was 500); 15 was the licence Worker service binding
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";

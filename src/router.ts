@@ -611,6 +611,15 @@ export async function routeLlm(deps: RouterDeps, req: RouteRequest): Promise<Rou
   if (!tenantId || !req.turn_id || !req.messages || req.messages.length === 0) {
     return failResult([], "bad_request", "tenant_id, turn_id aur messages chahiye", ms());
   }
+  // Malformed message shape (e.g. {"role","content"} instead of
+  // {"role","text"}) used to 500 inside truncateMessages/estimateTokens
+  // (m.text undefined — "Cannot read properties of undefined (reading
+  // 'length')"). Fail closed with 400 BEFORE anything reads .text, before
+  // the tenant lookup: no upstream call, no usage row. The app sends the
+  // right shape; this guards any other caller.
+  if (!req.messages.every((m) => m != null && typeof (m as { text?: unknown }).text === "string")) {
+    return failResult([], "bad_request", "har message me string text chahiye", ms());
+  }
   // captcha_solve is a vision kind: no image, no route. The image is
   // validated for size by the captcha module before this call; this
   // guard stops any other caller routing a text-only request here.

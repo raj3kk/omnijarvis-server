@@ -843,6 +843,54 @@ describe("hub LLM routes (R-T14, R-T16)", () => {
     expect(((await byok.json()) as Record<string, unknown>).error).toBe("byok_required");
   });
 
+  it("micro-fix (2026-11-22): malformed message shape -> 400 bad_request, no upstream call, no usage row", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    await seedTenantWithKey(db, "t-mf", master);
+    const { fetchFn, calls } = makeDualMockFetch(
+      () => errResp(500, "Gemini must never be called"),
+      () => okGroq("groq must never be called"),
+    );
+    // {"role","content"} instead of {"role","text"} — the shape that used
+    // to 500 inside truncateMessages/estimateTokens (m.text undefined).
+    const bad1 = await routeLlm(baseDeps(db, master, fetchFn), {
+      tenant_id: "t-mf",
+      turn_id: "turn-mf-1",
+      kind: "quick_command",
+      messages: [{ role: "user", content: "hi" } as unknown as ChatMessage],
+    });
+    expect(bad1.ok).toBe(false);
+    expect(bad1.error_code).toBe("bad_request");
+    // Non-string text, and a null entry, fail the same way.
+    const badShapes: ChatMessage[][] = [
+      [{ role: "user", text: 42 }] as unknown as ChatMessage[],
+      [null as unknown as ChatMessage],
+    ];
+    for (const messages of badShapes) {
+      const res = await routeLlm(baseDeps(db, master, fetchFn), {
+        tenant_id: "t-mf",
+        turn_id: "turn-mf-2",
+        kind: "quick_command",
+        messages,
+      });
+      expect(res.ok).toBe(false);
+      expect(res.error_code).toBe("bad_request");
+    }
+    expect(calls).toHaveLength(0);
+    expect(await usageRows(db)).toHaveLength(0);
+  });
+
+  it("micro-fix (2026-11-22): hub /api/llm/route maps the malformed shape to HTTP 400", async () => {
+    const db = new FakeD1();
+    await seedTenant(db, { id: "t-mf2" });
+    const res = await handleRequest(
+      new Request("https://hub/api/llm/route", { method: "POST", headers: { "Content-Type": "application/json", "x-internal-secret": "test-internal" }, body: JSON.stringify({ tenant_id: "t-mf2", turn_id: "turn-mf2", kind: "quick_command", messages: [{ role: "user", content: "hi" }] }) }),
+      fakeEnv(db),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as Record<string, unknown>).error).toBe("bad_request");
+  });
+
   it("R-T26 hub groq-key: 401 without token; invalid -> 400; valid -> 200, key never echoed, envelope decrypts; DELETE clears", async () => {
     const db = new FakeD1();
     const master = await makeMasterKeyB64();

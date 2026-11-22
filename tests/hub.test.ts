@@ -229,9 +229,9 @@ describe("handleRequest (2a-2 routes, D1 licences)", () => {
     expect(body.key_id).toBeUndefined();
   });
 
-  it("GET / -> version 15 (M-I-28 licence Worker service binding)", async () => {
+  it("GET / -> version 16 (malformed llm message shape -> 400)", async () => {
     const body = (await route("/").json()) as Record<string, unknown>;
-    expect(body.version).toBe("15");
+    expect(body.version).toBe("16");
   });
 
   it("pairing code: derives from token", async () => {
