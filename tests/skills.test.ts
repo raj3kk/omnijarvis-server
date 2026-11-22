@@ -18,7 +18,10 @@ import { canonicalString } from "../src/crypto";
 import { sortedJson } from "../src/docs";
 import { RATE_LIMITS } from "../src/ratelimit";
 import {
+  classifySkillClass,
   manifestHash,
+  selfExtendedTemplateHasUserContent,
+  validateResearchCandidate,
   validateSkillManifest,
   verifySkillSignature,
   type SkillManifest,
@@ -610,5 +613,396 @@ describe("skills rate-limit budget", () => {
   it("skills = 30/min/tenant, memory = 60/min/tenant", () => {
     expect(RATE_LIMITS.skills).toEqual({ limit: 30, windowMs: 60_000 });
     expect(RATE_LIMITS.memory).toEqual({ limit: 60, windowMs: 60_000 });
+  });
+});
+
+// --- Self-extension (DESIGN §6.2, §8.2): candidate validation,
+// server classification mirror, template strip-check ---
+
+function validCandidate(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    name: "pdfbox",
+    sourceUrl: "https://github.com/apache/pdfbox",
+    licence: "Apache-2.0",
+    licenceUrl: "https://raw.githubusercontent.com/apache/pdfbox/trunk/LICENSE.txt",
+    costUsd: "$0",
+    needsCard: false,
+    needsAccount: false,
+    needsNetwork: false,
+    kind: "STEP",
+    sources: ["https://github.com/apache/pdfbox"],
+    evidence: ["Apache License Version 2.0"],
+    lastUpdated: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+/** A self-added STEP template: action names only, no targets/inputs. */
+function selfExtendedManifest(
+  overrides: Record<string, unknown> = {},
+  candidateOverrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    name: "convert-pdf-to-text",
+    version: "1.0.0",
+    trigger: "convert pdf",
+    steps: [{ action: "OPEN_APP" }, { action: "WAIT" }],
+    origin: "self_extended",
+    researchCandidate: validCandidate(candidateOverrides),
+    ...overrides,
+  };
+}
+
+describe("validateResearchCandidate (§3.2 shape)", () => {
+  it("accepts a clean candidate", () => {
+    const r = validateResearchCandidate(validCandidate());
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.candidate.name).toBe("pdfbox");
+  });
+
+  it("rejects non-objects", () => {
+    expect(validateResearchCandidate(null)).toMatchObject({ ok: false });
+    expect(validateResearchCandidate("pdfbox")).toMatchObject({ ok: false });
+    expect(validateResearchCandidate([validCandidate()])).toMatchObject({ ok: false });
+  });
+
+  it("rejects a bad licence (proprietary / empty / non-string)", () => {
+    expect(validateResearchCandidate(validCandidate({ licence: "proprietary" }))).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("licence"),
+    });
+    expect(validateResearchCandidate(validCandidate({ licence: "" }))).toMatchObject({ ok: false });
+    expect(validateResearchCandidate(validCandidate({ licence: 42 }))).toMatchObject({ ok: false });
+    // UNKNOWN is a valid licence value (classification rejects it later).
+    expect(validateResearchCandidate(validCandidate({ licence: "UNKNOWN" })).ok).toBe(true);
+  });
+
+  it("rejects non-allowlisted URLs (sourceUrl, licenceUrl, sources)", () => {
+    expect(
+      validateResearchCandidate(validCandidate({ sourceUrl: "https://evil.example.com/x" })),
+    ).toMatchObject({ ok: false });
+    expect(
+      validateResearchCandidate(validCandidate({ licenceUrl: "https://blog.example.com/lic" })),
+    ).toMatchObject({ ok: false });
+    expect(
+      validateResearchCandidate(
+        validCandidate({ sources: ["https://github.com/a/b", "https://ads.example.com/x"] }),
+      ),
+    ).toMatchObject({ ok: false });
+    // Subdomains of the allowlisted licence hosts are fine.
+    expect(
+      validateResearchCandidate(validCandidate({ sourceUrl: "https://www.apache.org/licenses/" }))
+        .ok,
+    ).toBe(true);
+    expect(
+      validateResearchCandidate(validCandidate({ sourceUrl: "ftp://github.com/a/b" })),
+    ).toMatchObject({ ok: false });
+  });
+
+  it("rejects >5 sources", () => {
+    const sources = Array.from({ length: 6 }, (_, i) => `https://github.com/a/b${i}`);
+    expect(validateResearchCandidate(validCandidate({ sources }))).toMatchObject({ ok: false });
+    expect(
+      validateResearchCandidate(
+        validCandidate({ sources: sources.slice(0, 5) }),
+      ).ok,
+    ).toBe(true);
+  });
+
+  it("rejects a missing cost", () => {
+    const { costUsd: _dropped, ...noCost } = validCandidate();
+    expect(validateResearchCandidate(noCost)).toMatchObject({ ok: false });
+    expect(validateResearchCandidate(validCandidate({ costUsd: "" }))).toMatchObject({ ok: false });
+  });
+
+  it("rejects code > 512 KB", () => {
+    expect(validateResearchCandidate(validCandidate({ code: "x".repeat(512 * 1024 + 1) }))).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("512 KB"),
+    });
+    expect(validateResearchCandidate(validCandidate({ code: "x = 1" })).ok).toBe(true);
+  });
+
+  it("rejects wrong-typed booleans / kind / evidence", () => {
+    expect(validateResearchCandidate(validCandidate({ needsCard: "no" }))).toMatchObject({ ok: false });
+    expect(validateResearchCandidate(validCandidate({ kind: "PLUGIN" }))).toMatchObject({ ok: false });
+    expect(
+      validateResearchCandidate(validCandidate({ evidence: ["ok", "x".repeat(201)] })),
+    ).toMatchObject({ ok: false });
+  });
+});
+
+describe("classifySkillClass — server mirror of the app decision table (§8.2)", () => {
+  it("clean local STEP -> AUTO (the only AUTO shape)", () => {
+    const r = classifySkillClass(selfExtendedManifest() as unknown as SkillManifest);
+    expect(r).toEqual({ classification: "AUTO", reason: "clean_local_step", kind: "STEP" });
+  });
+
+  it("paid / card-required -> REJECT paid_or_card_required", () => {
+    expect(
+      classifySkillClass(
+        selfExtendedManifest({}, { costUsd: "$9" }) as unknown as SkillManifest,
+      ).classification,
+    ).toBe("REJECT");
+    expect(
+      classifySkillClass(
+        selfExtendedManifest({}, { costUsd: "$9" }) as unknown as SkillManifest,
+      ).reason,
+    ).toBe("paid_or_card_required");
+    expect(
+      classifySkillClass(
+        selfExtendedManifest({}, { needsCard: true }) as unknown as SkillManifest,
+      ),
+    ).toMatchObject({ classification: "REJECT", reason: "paid_or_card_required" });
+  });
+
+  it("closed-source / unknown licence -> REJECT", () => {
+    expect(
+      classifySkillClass(
+        selfExtendedManifest({}, { licence: "proprietary" }) as unknown as SkillManifest,
+      ),
+    ).toMatchObject({ classification: "REJECT", reason: "closed_source" });
+    expect(
+      classifySkillClass(
+        selfExtendedManifest({}, { licence: "UNKNOWN" }) as unknown as SkillManifest,
+      ),
+    ).toMatchObject({ classification: "REJECT", reason: "unknown_licence" });
+    expect(
+      classifySkillClass(
+        selfExtendedManifest(
+          { researchCandidate: validCandidate({ licence: "UNKNOWN" }), provenance: undefined },
+          {},
+        ) as unknown as SkillManifest,
+      ).classification,
+    ).toBe("REJECT");
+  });
+
+  it("account / credential signals -> APPROVAL, never AUTO", () => {
+    expect(
+      classifySkillClass(
+        selfExtendedManifest({}, { needsAccount: true }) as unknown as SkillManifest,
+      ),
+    ).toMatchObject({ classification: "APPROVAL", reason: "needs_account_or_credential" });
+    const withEmail = selfExtendedManifest({ steps: [{ action: "TYPE_TEXT", input: "a@b.com" }] });
+    expect(classifySkillClass(withEmail as unknown as SkillManifest)).toMatchObject({
+      classification: "APPROVAL",
+      reason: "needs_account_or_credential",
+    });
+    const withKey = selfExtendedManifest({ steps: [{ action: "TYPE_TEXT", input: "api_key=abc" }] });
+    expect(classifySkillClass(withKey as unknown as SkillManifest).classification).toBe("APPROVAL");
+  });
+
+  it("network signals -> APPROVAL network_or_exfil_risk", () => {
+    expect(
+      classifySkillClass(
+        selfExtendedManifest({}, { needsNetwork: true }) as unknown as SkillManifest,
+      ),
+    ).toMatchObject({ classification: "APPROVAL", reason: "network_or_exfil_risk" });
+    const yt = selfExtendedManifest({ steps: [{ action: "YOUTUBE_SEARCH" }] });
+    expect(classifySkillClass(yt as unknown as SkillManifest)).toMatchObject({
+      classification: "APPROVAL",
+      reason: "network_or_exfil_risk",
+    });
+  });
+
+  it("sensitive (send/pay/buy/delete) actions -> APPROVAL sensitive_action", () => {
+    const pay = selfExtendedManifest({ steps: [{ action: "PAYMENT" }] });
+    expect(classifySkillClass(pay as unknown as SkillManifest)).toMatchObject({
+      classification: "APPROVAL",
+      reason: "sensitive_action",
+    });
+    const tapPay = selfExtendedManifest({ steps: [{ action: "TAP_NODE", target: "pay now" }] });
+    expect(classifySkillClass(tapPay as unknown as SkillManifest)).toMatchObject({
+      classification: "APPROVAL",
+      reason: "sensitive_action",
+    });
+  });
+
+  it("copyleft licence -> APPROVAL copyleft_needs_review, never AUTO", () => {
+    expect(
+      classifySkillClass(
+        selfExtendedManifest({}, { licence: "GPL-3.0" }) as unknown as SkillManifest,
+      ),
+    ).toMatchObject({ classification: "APPROVAL", reason: "copyleft_needs_review" });
+    expect(
+      classifySkillClass(
+        selfExtendedManifest({}, { licence: "AGPL-3.0" }) as unknown as SkillManifest,
+      ).classification,
+    ).toBe("APPROVAL");
+  });
+
+  it("CODE kind / unknown action -> APPROVAL code_needs_review, never AUTO", () => {
+    expect(
+      classifySkillClass(
+        selfExtendedManifest({}, { kind: "CODE" }) as unknown as SkillManifest,
+      ),
+    ).toMatchObject({ classification: "APPROVAL", reason: "code_needs_review", kind: "CODE" });
+    const unknownAction = selfExtendedManifest({ steps: [{ action: "DOWNLOAD_AND_RUN" }] });
+    expect(classifySkillClass(unknownAction as unknown as SkillManifest)).toMatchObject({
+      classification: "APPROVAL",
+      kind: "CODE",
+    });
+    const withCode = selfExtendedManifest({ code: "x = 1" }, { kind: "CODE" });
+    expect(classifySkillClass(withCode as unknown as SkillManifest).classification).toBe("APPROVAL");
+  });
+
+  it("scan hit (eval/exec/os.system) -> REJECT scan_hit:*", () => {
+    const dirty = selfExtendedManifest({ code: "x = eval(y)" }, { kind: "CODE" });
+    expect(classifySkillClass(dirty as unknown as SkillManifest)).toMatchObject({
+      classification: "REJECT",
+      reason: "scan_hit:eval(",
+    });
+    const dirtyStep = selfExtendedManifest({
+      steps: [{ action: "TYPE_TEXT", input: "os.system('id')" }],
+    });
+    expect(classifySkillClass(dirtyStep as unknown as SkillManifest).classification).toBe("REJECT");
+  });
+
+  it("oversize STEP (21 steps) -> REJECT oversize", () => {
+    const many = selfExtendedManifest({
+      steps: Array.from({ length: 21 }, () => ({ action: "WAIT" })),
+    });
+    expect(classifySkillClass(many as unknown as SkillManifest)).toMatchObject({
+      classification: "REJECT",
+      reason: "oversize",
+    });
+  });
+
+  it("unknown maintenance (null / >24-month-old lastUpdated) -> APPROVAL", () => {
+    expect(
+      classifySkillClass(
+        selfExtendedManifest({}, { lastUpdated: null }) as unknown as SkillManifest,
+      ),
+    ).toMatchObject({ classification: "APPROVAL", reason: "unmaintained_unknown" });
+    expect(
+      classifySkillClass(
+        selfExtendedManifest({}, { lastUpdated: "2020-01-01T00:00:00.000Z" }) as unknown as SkillManifest,
+      ),
+    ).toMatchObject({ classification: "APPROVAL", reason: "unmaintained_unknown" });
+  });
+
+  it("no research metadata -> APPROVAL (fail-closed, never AUTO)", () => {
+    expect(classifySkillClass(validManifest() as unknown as SkillManifest)).toMatchObject({
+      classification: "APPROVAL",
+      reason: "no_research_metadata",
+    });
+  });
+
+  it("incomplete research signals -> APPROVAL, never AUTO", () => {
+    const provOnly = selfExtendedManifest({
+      researchCandidate: undefined,
+      provenance: { licence: "MIT", costUsd: "$0", autoAdded: true },
+    });
+    expect(classifySkillClass(provOnly as unknown as SkillManifest)).toMatchObject({
+      classification: "APPROVAL",
+      reason: "incomplete_research_signals",
+    });
+  });
+
+  it("selfExtendedTemplateHasUserContent keys on origin only", () => {
+    expect(
+      selfExtendedTemplateHasUserContent(
+        selfExtendedManifest({ steps: [{ action: "TAP_NODE", target: "x" }] }) as unknown as SkillManifest,
+      ),
+    ).toBe(true);
+    expect(
+      selfExtendedTemplateHasUserContent(
+        selfExtendedManifest({ steps: [{ action: "TYPE_TEXT", input: "hi" }] }) as unknown as SkillManifest,
+      ),
+    ).toBe(true);
+    expect(
+      selfExtendedTemplateHasUserContent(selfExtendedManifest() as unknown as SkillManifest),
+    ).toBe(false);
+    // Learned skills keep their targets/inputs: no strip-check.
+    expect(
+      selfExtendedTemplateHasUserContent(
+        validManifest({ steps: [{ action: "reply", target: "x", input: "y" }] }) as unknown as SkillManifest,
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("S-T13 self-extension submit: strip-check + classification echo", () => {
+  async function setup(): Promise<{ db: FakeD1; env: Env; key: DeviceKey }> {
+    const db = new FakeD1();
+    await seedTenant(db, { id: "t-1" });
+    const key = await genDeviceKey();
+    await seedDevice(db, "dev-1", "t-1", key.publicKeyB64);
+    return { db, env: fakeEnv(db), key };
+  }
+
+  it("self_extended step with target/input -> 400 contains_user_content, nothing stored", async () => {
+    const { db, env, key } = await setup();
+    const res = await submitSigned(
+      db,
+      env,
+      key,
+      selfExtendedManifest({ steps: [{ action: "TAP_NODE", target: "pay now" }] }),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as Record<string, unknown>).error).toBe("contains_user_content");
+    const count = await db
+      .prepare("SELECT COUNT(*) AS n FROM global_skills")
+      .first<{ n: number }>();
+    expect(count?.n).toBe(0);
+  });
+
+  it("action-only self_extended template -> 200 quarantined, classification AUTO echoed", async () => {
+    const { db, env, key } = await setup();
+    const res = await submitSigned(db, env, key, selfExtendedManifest());
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    // Quarantine invariant: even an AUTO-classified submission is
+    // quarantined — there is no auto-approve path.
+    expect(body.status).toBe("quarantined");
+    expect(body.classification).toEqual({
+      classification: "AUTO",
+      reason: "clean_local_step",
+      kind: "STEP",
+    });
+    const row = await db
+      .prepare("SELECT status FROM global_skills WHERE id = ?")
+      .bind(body.skill_id as string)
+      .first<{ status: string }>();
+    expect(row?.status).toBe("quarantined");
+  });
+
+  it("self_extended template with a forbidden class -> 200 quarantined, classification echoed", async () => {
+    const { db, env, key } = await setup();
+    const res = await submitSigned(
+      db,
+      env,
+      key,
+      selfExtendedManifest({}, { licence: "GPL-3.0" }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.status).toBe("quarantined");
+    expect(body.classification).toMatchObject({
+      classification: "APPROVAL",
+      reason: "copyleft_needs_review",
+    });
+  });
+
+  it("learned skill with target/input still submits (strip-check keys on origin)", async () => {
+    const { db, env, key } = await setup();
+    const res = await submitSigned(
+      db,
+      env,
+      key,
+      validManifest({ steps: [{ action: "reply", target: "x", input: "y" }] }),
+    );
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as Record<string, unknown>).status).toBe("quarantined");
+  });
+
+  it("carried research candidate that fails validation -> 400 bad_research_candidate", async () => {
+    const { db, env, key } = await setup();
+    const bad = selfExtendedManifest({
+      researchCandidate: validCandidate({ sourceUrl: "https://evil.example.com/x" }),
+    });
+    const res = await submitSigned(db, env, key, bad);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as Record<string, unknown>).error).toBe("bad_research_candidate");
   });
 });

@@ -73,7 +73,7 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "6"; // 6: R3 Groq free fallback leg (gpt-oss-120b, BYOK groq_key_enc; D8 OpenRouter still gated)
+const VERSION = "7"; // 7: self-extension server mirror (validateResearchCandidate + classifySkillClass + self_extended template strip-check; submit still always quarantined)
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";
@@ -105,8 +105,11 @@ import {
   manifestHash,
   newSkillId,
   scanSkillCode,
+  selfExtendedTemplateHasUserContent,
   setSkillStatus,
   signSkill,
+  classifySkillClass,
+  validateResearchCandidate,
   validateSkillManifest,
   type SkillManifest,
 } from "./skills";
@@ -974,6 +977,24 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const validated = validateSkillManifest(body.manifest);
       if (!validated.ok) return json({ error: "bad_manifest", detail: validated.error }, 400);
       const manifest = validated.manifest;
+      // Self-extension (§6.2): template-only strip-check. A self-added
+      // skill template may carry step ACTION names only — a step with a
+      // target/input is user content and is rejected, never stored.
+      if (selfExtendedTemplateHasUserContent(manifest)) {
+        return json({ error: "contains_user_content" }, 400);
+      }
+      // Self-extension (§6.2): validate a carried research candidate.
+      const candidateRaw = (manifest as unknown as Record<string, unknown>).researchCandidate;
+      if (candidateRaw !== undefined) {
+        const candidate = validateResearchCandidate(candidateRaw);
+        if (!candidate.ok) {
+          return json({ error: "bad_research_candidate", detail: candidate.error }, 400);
+        }
+      }
+      // Self-extension (§6.2): server-side classification mirror, echoed
+      // for the audit trail. It is NEVER trusted for approval — submit
+      // always lands quarantined below, whatever it says.
+      const classification = classifySkillClass(manifest);
       if (
         typeof manifest.code === "string" &&
         new TextEncoder().encode(manifest.code).byteLength > MAX_SKILL_CODE_BYTES
@@ -996,8 +1017,10 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         skill_id: skillId,
         scan_status: scan.status,
         findings_count: scan.findings.length,
+        classification: classification.classification,
+        classification_reason: classification.reason,
       });
-      return json({ ok: true, skill_id: skillId, status: "quarantined", scan });
+      return json({ ok: true, skill_id: skillId, status: "quarantined", scan, classification });
     }
 
     if (path === "/api/skills/review" && method === "POST") {
