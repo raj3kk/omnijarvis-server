@@ -111,7 +111,7 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "10"; // 10: FCM push (fcm_tokens + fcm_sends, service-account JWT -> FCM v1); 9 was the doc-worker re-point
+const VERSION = "11"; // 11: M-I-3 Groq-only tenant path (router: Gemini key no longer required when a Groq key exists); 10 was FCM push
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";

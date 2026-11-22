@@ -5,7 +5,13 @@
  * a few-hundred-KB module inside omnijarvis-hub. It enforces, in order:
  *   1. tenant exists + plan limits (D2 pricing)
  *   2. BYOK key present + decryptable (founder key is NEVER a silent
- *      fallback — founder quota never burns for a customer)
+ *      fallback — founder quota never burns for a customer). M-I-3
+ *      (2026-11-22): a BYOK tenant with NO Gemini key may still route
+ *      when a Groq key exists (tenant groq_key_enc, or FOUNDER_GROQ_KEY
+ *      — Groq is $0, so no founder quota burns). Gemini legs are then
+ *      skipped (traced) and only Groq legs run. `byok_required` fires
+ *      only when NEITHER key exists, or when the kind has no Groq leg
+ *      (embeddings / doc_extraction are Gemini-only).
  *   3. replies/mo cap + 5 calls/turn cap (hard refuse, no charge)
  *   4. 5,000 input-token cap (truncate oldest-first, system + last 2 turns kept)
  *   5. fallback chain (retryable failures only) + circuit breaker
@@ -631,25 +637,66 @@ export async function routeLlm(deps: RouterDeps, req: RouteRequest): Promise<Rou
     return { ...failResult([], "plan_docs_not_allowed", "Doc extraction Pro plan me hai", ms()), status: "refused_cap" };
   }
 
-  // BYOK key (or founder key in founder-pays mode). Never a silent fallback.
+  // Chain for this kind (needed by the M-I-3 Groq-only gate below).
+  const chain = (config.chains[billingMode]?.[req.kind] ?? config.chains.byok[req.kind] ?? []) as string[];
+  if (chain.length === 0) return failResult([], "no_route", "Is request kind ke liye koi route nahi", ms());
+
+  // BYOK key (or founder key in founder-pays mode). Never a silent fallback
+  // for PAID keys — but Groq is $0, so a Groq key never burns founder quota.
   let apiKey: string | null = null;
+  // M-I-3: pre-resolved Groq key for the Groq-only path (no Gemini key).
+  let groqKeyPre: string | null = null;
+  let groqPreResolved = false;
   if (billingMode === "byok") {
-    if (!tenant.gemini_key_enc) {
-      await recordUsage(deps.db, {
-        tenant_id: tenantId, turn_id: req.turn_id, model: "", attempted_models: [],
-        input_tokens: 0, output_tokens: 0, cost_usd_micro: 0,
-        billing_mode: billingMode, status: "refused_cap",
-      }, now, false);
-      return { ...failResult([], "byok_required", "Server AI ke liye apni Gemini key jodo — AI Brain → Keys", ms()), status: "refused_cap" };
-    }
-    if (!deps.masterKeyB64) {
-      return failResult([], "key_vault_not_configured", "Server key vault setup nahi hai", ms());
-    }
-    try {
-      const master = await importMasterKey(deps.masterKeyB64);
-      apiKey = await decryptTenantKey(master, tenant.gemini_key_enc);
-    } catch {
-      return failResult([], "key_decrypt_failed", "Saved key khul nahi rahi — key dobara dalo", ms());
+    if (tenant.gemini_key_enc) {
+      if (!deps.masterKeyB64) {
+        return failResult([], "key_vault_not_configured", "Server key vault setup nahi hai", ms());
+      }
+      try {
+        const master = await importMasterKey(deps.masterKeyB64);
+        apiKey = await decryptTenantKey(master, tenant.gemini_key_enc);
+      } catch {
+        return failResult([], "key_decrypt_failed", "Saved key khul nahi rahi — key dobara dalo", ms());
+      }
+    } else {
+      // M-I-3 Groq-only tenant: no Gemini key is OK when a Groq key
+      // exists — tenant BYOK groq_key_enc first, else FOUNDER_GROQ_KEY
+      // ($0, no founder quota burns). A corrupt Groq envelope fails
+      // closed here (key_decrypt_failed) instead of routing into a
+      // chain that can only skip every leg.
+      if (tenant.groq_key_enc) {
+        if (!deps.masterKeyB64) {
+          return failResult([], "key_vault_not_configured", "Server key vault setup nahi hai", ms());
+        }
+        try {
+          const master = await importMasterKey(deps.masterKeyB64);
+          groqKeyPre = await decryptTenantKey(master, tenant.groq_key_enc);
+          groqPreResolved = true;
+        } catch {
+          return failResult([], "key_decrypt_failed", "Saved key khul nahi rahi — key dobara dalo", ms());
+        }
+      } else if (deps.founderGroqKey) {
+        groqKeyPre = deps.founderGroqKey;
+        groqPreResolved = true;
+      }
+      if (!groqPreResolved) {
+        await recordUsage(deps.db, {
+          tenant_id: tenantId, turn_id: req.turn_id, model: "", attempted_models: [],
+          input_tokens: 0, output_tokens: 0, cost_usd_micro: 0,
+          billing_mode: billingMode, status: "refused_cap",
+        }, now, false);
+        return { ...failResult([], "byok_required", "Server AI ke liye apni Gemini key jodo — AI Brain → Keys", ms()), status: "refused_cap" };
+      }
+      // Kinds with no Groq leg (embeddings, doc_extraction) cannot route
+      // Groq-only — refuse with the same byok_required the caller knows.
+      if (!chain.some((m) => isGroqModel(m))) {
+        await recordUsage(deps.db, {
+          tenant_id: tenantId, turn_id: req.turn_id, model: "", attempted_models: [],
+          input_tokens: 0, output_tokens: 0, cost_usd_micro: 0,
+          billing_mode: billingMode, status: "refused_cap",
+        }, now, false);
+        return { ...failResult([], "byok_required", "Is kaam ke liye Gemini key chahiye — Groq se nahi hota", ms()), status: "refused_cap" };
+      }
     }
   } else {
     if (!deps.founderKey) {
@@ -673,15 +720,14 @@ export async function routeLlm(deps: RouterDeps, req: RouteRequest): Promise<Rou
     return { ...failResult([], "turn_calls_cap", "Is turn me 5 calls ho chuke — aage badhaun ya rukun?", ms()), status: "refused_cap" };
   }
 
-  const chain = (config.chains[billingMode]?.[req.kind] ?? config.chains.byok[req.kind] ?? []) as string[];
-  if (chain.length === 0) return failResult([], "no_route", "Is request kind ke liye koi route nahi", ms());
   const { messages, truncated } = truncateMessages(req.messages, req.system);
   const attempted: string[] = [];
   const sleep = deps.sleepFn ?? sleepDefault;
   let lastError: LlmCallOutcome | null = null;
-  // Groq key resolves lazily, once, at the first Groq leg (A5).
-  let groqKey: string | null = null;
-  let groqResolved = false;
+  // Groq key resolves lazily, once, at the first Groq leg (A5) — unless
+  // the M-I-3 Groq-only gate already resolved it above.
+  let groqKey: string | null = groqKeyPre;
+  let groqResolved = groqPreResolved;
   let groqSkipReason = "no_key";
 
   for (let i = 0; i < chain.length; i++) {
@@ -691,6 +737,16 @@ export async function routeLlm(deps: RouterDeps, req: RouteRequest): Promise<Rou
         turn_id: req.turn_id,
         model,
         skipped: true,
+      });
+      continue;
+    }
+    // M-I-3 Groq-only tenant: Gemini legs have no key to call with —
+    // skip (traced), never call Gemini with a null key.
+    if (!isGroqModel(model) && !apiKey) {
+      await insertTrace(deps.db, tenantId, deviceId, "router_gemini_skipped", {
+        turn_id: req.turn_id,
+        model,
+        reason: "no_gemini_key",
       });
       continue;
     }

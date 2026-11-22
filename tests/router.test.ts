@@ -12,6 +12,9 @@
  * 3.5 -> 3.1 -> qwen3.8-27b; gpt-oss-120b (text-only) never called;
  * image parts (Gemini inlineData / Groq image_url); usage_metadata_missing
  * still fails; no recordReply on solve; founder-pays chain order.
+ * M-I-3 (2026-11-22): Groq-only tenant routes (T33–T37) — Gemini key
+ * not required when a Groq key exists; byok_required only when NEITHER
+ * key exists, or the kind has no Groq leg (embeddings/doc_extraction).
  * gemini-2.5-flash-lite is RETIRED (P0 fix 2026-11-21) — it appears nowhere
  * in this file except this note and the R-T19 guard test.
  * Gemini upstream is MOCKED (no real key in CI). Live happy-path proof
@@ -879,5 +882,94 @@ describe("hub LLM routes (R-T14, R-T16)", () => {
     expect(del.status).toBe(200);
     const after = await db.prepare("SELECT groq_key_enc FROM tenants WHERE id = ?").bind("t-26").first<{ groq_key_enc: string | null }>();
     expect(after?.groq_key_enc).toBeNull();
+  });
+});
+
+describe("router Groq-only tenant path (M-I-3, 2026-11-22)", () => {
+  it("M-I-3/T33 Groq-only tenant routes: Gemini legs skipped (traced), Groq serves at $0", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    await seedTenantWithKeys(db, "t-33", master, { geminiKey: null, groqKey: "gsk_only_groq" });
+    const { fetchFn, calls } = makeDualMockFetch(
+      () => errResp(500, "Gemini must never be called"),
+      () => okGroq("from groq only", 100, 20),
+    );
+    const res = await routeLlm(baseDeps(db, master, fetchFn), req("t-33", "turn-33"));
+    expect(res.ok).toBe(true);
+    expect(res.model).toBe(MODEL_GROQ);
+    expect(res.attempted_models).toEqual([MODEL_GROQ]); // Gemini legs never attempted
+    expect(res.cost_usd_micro).toBe(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain("api.groq.com");
+    const traces = await traceRows(db);
+    expect(traces.filter((t) => t.kind === "router_gemini_skipped")).toHaveLength(2);
+    expect(traces.some((t) => t.kind === "router_gemini_skipped" && String(t.detail).includes("no_gemini_key"))).toBe(true);
+    const rows = await usageRows(db);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].model).toBe(MODEL_GROQ);
+  });
+
+  it("M-I-3/T34 no-key tenant (neither Gemini nor Groq) still byok_required, zero upstream calls", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    await seedTenantWithKeys(db, "t-34", master, { geminiKey: null, groqKey: null });
+    const { fetchFn, calls } = makeDualMockFetch(
+      () => okText("x"),
+      () => okGroq("x"),
+    );
+    const res = await routeLlm(baseDeps(db, master, fetchFn), req("t-34", "turn-34"));
+    expect(res.ok).toBe(false);
+    expect(res.error_code).toBe("byok_required");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("M-I-3/T35 no-key tenant + FOUNDER_GROQ_KEY routes via founder Groq ($0, no quota burns)", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    await seedTenantWithKeys(db, "t-35", master, { geminiKey: null, groqKey: null });
+    const { fetchFn, calls } = makeDualMockFetch(
+      () => errResp(500, "Gemini must never be called"),
+      () => okGroq("from founder groq", 50, 10),
+    );
+    const res = await routeLlm(baseDeps(db, master, fetchFn, { founderGroqKey: "gsk_founder_groq" }), req("t-35", "turn-35"));
+    expect(res.ok).toBe(true);
+    expect(res.model).toBe(MODEL_GROQ);
+    expect(res.attempted_models).toEqual([MODEL_GROQ]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].headers).toContain("gsk_founder_groq");
+  });
+
+  it("M-I-3/T36 Groq-only tenant + Gemini-only kind (embeddings / doc_extraction) -> byok_required", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    await seedTenantWithKeys(db, "t-36", master, { geminiKey: null, groqKey: "gsk_only_groq" });
+    const { fetchFn, calls } = makeDualMockFetch(
+      () => okText("x"),
+      () => okGroq("x"),
+    );
+    const emb = await routeLlm(baseDeps(db, master, fetchFn), req("t-36", "turn-36-emb", "embeddings", [{ role: "user", text: "x" }]));
+    expect(emb.ok).toBe(false);
+    expect(emb.error_code).toBe("byok_required");
+    const doc = await routeLlm(baseDeps(db, master, fetchFn), req("t-36", "turn-36-doc", "doc_extraction", [{ role: "user", text: "x" }]));
+    expect(doc.ok).toBe(false);
+    expect(doc.error_code).toBe("byok_required");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("M-I-3/T37 Gemini+Groq order unchanged: Gemini serves first, Groq never called", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    await seedTenantWithKeys(db, "t-37", master);
+    const { fetchFn, calls } = makeDualMockFetch(
+      () => okText("from 3.5", 100, 20),
+      () => okGroq("should never serve"),
+    );
+    const res = await routeLlm(baseDeps(db, master, fetchFn), req("t-37", "turn-37"));
+    expect(res.ok).toBe(true);
+    expect(res.model).toBe(MODEL_35);
+    expect(res.attempted_models).toEqual([MODEL_35]);
+    expect(res.status).toBe("ok");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).not.toContain("api.groq.com");
   });
 });
