@@ -19,3 +19,14 @@ playwright==1.55.0
 pydantic-settings==2.13.0
 openai>=1.99.2,<2.0.0
 portalocker>=2.7.0,<3.0.0
+# MOVED HERE from the light requirements.txt (rewrite merge 2026-11-22):
+# bandit + mem0ai are lazy-imported and optional, but their transitive
+# deps (openai + qdrant-client + grpcio + sqlalchemy + posthog, ~110 MB)
+# push the LIGHT install to ~574 MB — over Vercel's 500 MB function
+# limit (measured). The light worker degrades honestly without them
+# (/mem/extract → rule-based fallback; /doc/scan → AST-only,
+# bandit_available=false). Install this file on heavy hosts only
+# (HF Spaces Docker / 16 GB host), never on the Vercel light deploy.
+# Pins as verified by Track D (see requirements.txt comment history).
+bandit==1.8.6
+mem0ai==2.2.1

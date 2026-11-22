@@ -1,15 +1,21 @@
 """OmniJarvis Render light worker (Phase 3, stage 3b) — doc pipeline.
 
+REWRITE (2026-11-22, DESIGN.md render-replacement/rewrite): pure-Python
+stack, no system binaries — runs on Vercel Python serverless (Hobby).
+Tesseract + poppler + WeasyPrint are GONE; same API contract kept.
+
 Endpoints:
 - GET /health -> {"ok": true, ...}
 - POST /smoke/pdf -> pdfplumber sample/upload extract (2a-5, untouched).
-- POST /doc/ocr -> Tesseract OCR (image PNG/JPG, or PDF page-by-page).
-  Caps: 5 MB, 10 pages, 30s. Response: {ok, pages, text, confidence}
-  (per-page mean word confidence; empty page -> confidence 0, text "").
+- POST /doc/ocr -> RapidOCR (image PNG/JPG, or PDF page-by-page via
+  pypdfium2 at 150 dpi). Caps: 4 MB, 10 pages, 30s. Response:
+  {ok, pages, text, confidence} (per-box mean score x100; empty page ->
+  confidence 0, text ""). per_page[].source: "rapidocr" (real OCR) /
+  "text_layer" (embedded-text fallback).
 - POST /doc/extract -> PDF -> pdfplumber text + tables, max 20 pages.
   Response: {ok, pages, text, tables}.
-- POST /doc/certificate -> HTML -> WeasyPrint PDF (300 DPI, A4) + segno
-  QR (verification URL + SHA-256 hash of canonical payload).
+- POST /doc/certificate -> HTML -> xhtml2pdf PDF (A4) + segno QR (PNG
+  data-URI; verification URL + SHA-256 hash of canonical payload).
   Caps: 2 MB HTML, 10 pages. Response: {ok, hash, pdf_base64, pages}.
 - POST /doc/scan -> Python source -> AST static scan (deterministic,
   no LLM): dangerous patterns -> {ok, findings[]}. Bandit (Apache 2.0)
@@ -30,13 +36,22 @@ Endpoints:
   allowlist, step cap; LLM via the hub router; see BROWSER_USE.md).
   503 `browser_not_available` when disabled or libs are missing.
 
-RAM discipline (free tier 512 MB): one page / one doc at a time, no
-model loads (Tesseract binary + tessdata ~50 MB). No state on Render
-(ephemeral filesystem, 15-min sleep — demo/smoke + doc jobs only).
+OCR engine: ONE global lazily-loaded RapidOCR instance, created on the
+FIRST /doc/ocr call only — never at import, never on /health. Models are
+BUNDLED under render/worker/models/ (PP-OCRv5 det + Devanagari PP-OCRv5
+rec + PP-OCRv5 cls + Devanagari dict) and passed as explicit local
+paths — no download at runtime. The classifier is DISABLED
+(Global.use_cls=False): the v5 cls model (trained for Chinese text
+orientation) mis-rotates Devanagari crops and destroys Hindi reads
+(verified 2026-11-22: "chalana"->"E2", "dhan'yavad"->"blbhh" with cls on;
+both read at 1.00 with cls off). Docs here are upright; orientation
+classification is not needed.
+
+RAM discipline (Vercel 2 GB): one page / one doc at a time, 150 dpi
+renders, pixmaps freed explicitly. No state on disk (in-memory BytesIO).
 Heavy optional deps (docling, mem0ai, bandit, browser-use) are LAZY
 imports inside their endpoints, so the base worker starts and serves
-the original routes even when none of them is installed. On HF Spaces
-(2 vCPU/16 GB, Track B deploy) the same worker runs with them enabled.
+the original routes even when none of them is installed.
 """
 
 import ast
@@ -48,6 +63,7 @@ import os
 import re
 import time
 import urllib.request
+from pathlib import Path
 
 import pdfplumber
 from fastapi import FastAPI, File, Form, Request, UploadFile
@@ -56,9 +72,9 @@ from fastapi.responses import JSONResponse
 app = FastAPI(title="omnijarvis-render")
 SERVICE = "omnijarvis-render"
 VERSION = "3b"
-MAX_PDF_BYTES = 5 * 1024 * 1024
+MAX_PDF_BYTES = 4 * 1024 * 1024
 MAX_PAGES = 20
-MAX_OCR_BYTES = 5 * 1024 * 1024
+MAX_OCR_BYTES = 4 * 1024 * 1024
 MAX_OCR_PAGES = 10
 MAX_OCR_SECONDS = 30
 MAX_HTML_BYTES = 2 * 1024 * 1024
@@ -79,6 +95,15 @@ BROWSER_ALLOWLIST = {
 }
 MAX_BROWSE_STEPS = 25
 MAX_BROWSE_TASK_CHARS = 1000
+
+_WORKER_DIR = Path(__file__).resolve().parent
+_MODELS_DIR = _WORKER_DIR / "models"
+_FONTS_DIR = _WORKER_DIR / "fonts"
+# 150 dpi: A4 -> ~1240x1754 px; one benchmark measured 548 MB peak for a
+# single A4 @300 dpi under RapidOCR, so 300 dpi is not used.
+_OCR_DPI = 150
+
+_OCR_ENGINE = None
 
 
 def sample_pdf_bytes() -> bytes:
@@ -117,58 +142,114 @@ def extract(pdf_bytes: bytes) -> dict:
     return {"pages": len(pages), "chars": len(text), "text_preview": text[:500]}
 
 
+def _get_ocr_engine():
+    """Lazily create the single global RapidOCR engine (first OCR call
+    only). Explicit bundled model paths — rapidocr>=3.10 downloads a
+    model ONLY when model_path is None, so this never touches the
+    network at request time. PP-OCRv5 det + PP-OCRv5 Devanagari rec,
+    never mixed versions. Enum-typed params are required by
+    rapidocr 3.10 (plain strings raise TypeError)."""
+    global _OCR_ENGINE
+    if _OCR_ENGINE is not None:
+        return _OCR_ENGINE
+    from rapidocr import (
+        EngineType,
+        LangCls,
+        LangDet,
+        LangRec,
+        ModelType,
+        OCRVersion,
+        RapidOCR,
+    )
+
+    models = _MODELS_DIR
+    det = models / "ch_PP-OCRv5_det_mobile.onnx"
+    rec = models / "devanagari_PP-OCRv5_rec_mobile.onnx"
+    cls = models / "ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx"
+    rec_keys = models / "ppocrv5_devanagari_dict.txt"
+    for p in (det, rec, cls, rec_keys):
+        if not p.is_file():
+            raise FileNotFoundError(f"bundled OCR model missing: {p}")
+    _OCR_ENGINE = RapidOCR(
+        params={
+            "Global.log_level": "warning",
+            # Classifier OFF: the v5 cls model mis-rotates Devanagari
+            # crops (see module docstring) — upright docs don't need it.
+            "Global.use_cls": False,
+            "Det.engine_type": EngineType.ONNXRUNTIME,
+            "Det.ocr_version": OCRVersion.PPOCRV5,
+            "Det.model_type": ModelType.MOBILE,
+            "Det.lang_type": LangDet.MULTI,
+            "Det.model_path": str(det),
+            "Cls.engine_type": EngineType.ONNXRUNTIME,
+            "Cls.ocr_version": OCRVersion.PPOCRV5,
+            "Cls.model_type": ModelType.MOBILE,
+            "Cls.lang_type": LangCls.CH,
+            "Cls.model_path": str(cls),
+            "Rec.engine_type": EngineType.ONNXRUNTIME,
+            "Rec.ocr_version": OCRVersion.PPOCRV5,
+            "Rec.model_type": ModelType.MOBILE,
+            "Rec.lang_type": LangRec.DEVANAGARI,
+            "Rec.model_path": str(rec),
+            # ONNX models carry an inner character list, so the dict is
+            # a belt-and-braces explicit path (never downloaded).
+            "Rec.rec_keys_path": str(rec_keys),
+        }
+    )
+    return _OCR_ENGINE
+
+
 def _ocr_image_bytes(img_bytes: bytes) -> tuple[str, float]:
-    """OCR one image (bytes) -> (text, mean word confidence 0-100).
-    Words with conf -1 (no text) are excluded; empty image -> ("", 0)."""
-    import pytesseract
+    """OCR one image (bytes) -> (text, mean box score 0-100).
+    Empty image -> ("", 0). RapidOCR returns per-box scores 0-1."""
+    import numpy as np
     from PIL import Image
 
     img = Image.open(io.BytesIO(img_bytes))
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
-    # Hindi+English mix docs: try eng+hin first (needs tesseract-ocr-hin
-    # + a Devanagari font — CI + Render apt lines install both); fall
-    # back to eng when hin tessdata is absent (local dev without apt).
+    # Bound memory on huge uploads: RapidOCR downscales to max side
+    # 2000 internally, but cap here first so the numpy array stays small.
+    max_side = max(img.size)
+    if max_side > 2000:
+        scale = 2000 / max_side
+        img = img.resize(
+            (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+            Image.LANCZOS,
+        )
+    out = _get_ocr_engine()(np.array(img))
+    txts = out.txts or ()
+    scores = out.scores or ()
+    text = "\n".join(txts)
+    conf = round(sum(scores) / len(scores) * 100, 2) if scores else 0.0
+    return text, conf
+
+
+def _ocr_pdf_page_with_pypdfium2(pdf_bytes: bytes, page_index: int) -> tuple[str, float] | None:
+    """Render one PDF page to PNG with pypdfium2 (in-process, no poppler)
+    at 150 dpi and OCR it. Returns None when the page fails to render —
+    caller falls back to the embedded text layer (honest `source` field
+    in the response)."""
+    import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument(io.BytesIO(pdf_bytes))
     try:
-        data = pytesseract.image_to_data(img, lang="eng+hin", output_type=pytesseract.Output.DICT)
-        text = pytesseract.image_to_string(img, lang="eng+hin") or ""
-    except Exception:
-        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
-        text = pytesseract.image_to_string(img) or ""
-    confs = [float(c) for c in data.get("conf", []) if float(c) >= 0]
-    mean_conf = sum(confs) / len(confs) if confs else 0.0
-    return text, round(mean_conf, 2)
-
-
-def _ocr_pdf_page_with_pdftoppm(pdf_bytes: bytes, page_index: int) -> tuple[str, float] | None:
-    """Render one PDF page to PNG with poppler `pdftoppm` (apt) and OCR it.
-    Returns None when pdftoppm is unavailable — caller falls back to the
-    embedded text layer (honest `source` field in the response)."""
-    import os
-    import shutil
-    import subprocess
-    import tempfile
-
-    if not shutil.which("pdftoppm"):
-        return None
-    with tempfile.TemporaryDirectory() as td:
-        src = os.path.join(td, "doc.pdf")
-        with open(src, "wb") as f:
-            f.write(pdf_bytes)
-        prefix = os.path.join(td, "page")
+        page = doc[page_index]
         try:
-            subprocess.run(
-                ["pdftoppm", "-png", "-r", "200", "-f", str(page_index + 1),
-                 "-l", str(page_index + 1), src, prefix],
-                check=True, timeout=20, capture_output=True,
-            )
-        except Exception:
-            return None
-        pngs = sorted(p for p in os.listdir(td) if p.endswith(".png"))
-        if not pngs:
-            return None
-        with open(os.path.join(td, pngs[0]), "rb") as f:
-            return _ocr_image_bytes(f.read())
+            bitmap = page.render(scale=_OCR_DPI / 72)
+            try:
+                pil_img = bitmap.to_pil()
+                buf = io.BytesIO()
+                pil_img.save(buf, format="PNG")
+                return _ocr_image_bytes(buf.getvalue())
+            finally:
+                bitmap.close()
+        finally:
+            page.close()
+    except Exception:
+        return None
+    finally:
+        doc.close()
     return None
 
 
@@ -199,8 +280,8 @@ async def smoke_pdf(file: UploadFile | None = File(default=None)):
 
 @app.post("/doc/ocr")
 async def doc_ocr(file: UploadFile = File(...)):
-    """Tesseract OCR: image (PNG/JPG) upload, or PDF (page-by-page).
-    Caps: 5 MB, 10 pages, 30s wall-clock.
+    """RapidOCR: image (PNG/JPG) upload, or PDF (page-by-page).
+    Caps: 4 MB, 10 pages, 30s wall-clock.
     Response: {ok, pages, text, confidence, per_page}."""
     started = time.monotonic()
     data = await file.read()
@@ -209,9 +290,10 @@ async def doc_ocr(file: UploadFile = File(...)):
     name = (file.filename or "").lower()
     try:
         if name.endswith(".pdf") or data[:4] == b"%PDF":
-            # PDF: one page at a time — pdftoppm render + real Tesseract
-            # OCR; pdftoppm missing ho to embedded text layer (source
-            # field me saaf likha — silent empty text kabhi nahi).
+            # PDF: one page at a time — pypdfium2 render + real RapidOCR;
+            # a page that fails to render falls back to the embedded text
+            # layer (source field me saaf likha — silent empty text
+            # kabhi nahi).
             with pdfplumber.open(io.BytesIO(data)) as pdf:
                 pages = pdf.pages[:MAX_OCR_PAGES]
                 texts: list[str] = []
@@ -221,12 +303,12 @@ async def doc_ocr(file: UploadFile = File(...)):
                         return JSONResponse(
                             {"ok": False, "error": "ocr_timeout"}, status_code=504
                         )
-                    rendered = _ocr_pdf_page_with_pdftoppm(data, idx)
+                    rendered = _ocr_pdf_page_with_pypdfium2(data, idx)
                     if rendered is not None:
                         t, c = rendered
                         texts.append(t)
                         per_page.append(
-                            {"page": idx + 1, "confidence": c, "source": "tesseract"}
+                            {"page": idx + 1, "confidence": c, "source": "rapidocr"}
                         )
                     else:
                         t = p.extract_text() or ""
@@ -248,7 +330,7 @@ async def doc_ocr(file: UploadFile = File(...)):
                 "confidence": conf,
                 "per_page": per_page,
             }
-        # Image path: real Tesseract.
+        # Image path: real RapidOCR.
         text, conf = _ocr_image_bytes(data)
         if time.monotonic() - started > MAX_OCR_SECONDS:
             return JSONResponse({"ok": False, "error": "ocr_timeout"}, status_code=504)
@@ -257,7 +339,7 @@ async def doc_ocr(file: UploadFile = File(...)):
             "pages": 1,
             "text": text,
             "confidence": conf,
-            "per_page": [{"page": 1, "confidence": conf, "source": "tesseract"}],
+            "per_page": [{"page": 1, "confidence": conf, "source": "rapidocr"}],
         }
     except Exception as exc:  # noqa: BLE001 — report, don't crash
         return JSONResponse(
@@ -303,13 +385,23 @@ def canonical_payload(payload: dict) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _cert_font_path() -> Path:
+    """Bundled Noto Sans Devanagari (OFL) for certificates. Raises if the
+    file is missing — a silent Helvetica fallback would render every
+    Devanagari char as 'n' (verified 2026-11-22), so fail loudly."""
+    path = _FONTS_DIR / "NotoSansDevanagari-Regular.ttf"
+    if not path.is_file():
+        raise FileNotFoundError(f"bundled certificate font missing: {path}")
+    return path
+
+
 @app.post("/doc/certificate")
 async def doc_certificate(
     html: str = Form(...),
     payload: str = Form(default="{}"),
     verify_url: str = Form(default=""),
 ):
-    """HTML -> WeasyPrint PDF (300 DPI, A4) + segno QR.
+    """HTML -> xhtml2pdf PDF (A4) + segno QR (PNG data-URI).
     hash = SHA-256 of canonical payload JSON. Caps: 2 MB HTML, 10 pages.
     Response: {ok, hash, pdf_base64, pages, bytes}."""
     html_bytes = html.encode("utf-8")
@@ -324,18 +416,73 @@ async def doc_certificate(
     digest = hashlib.sha256(canonical_payload(payload_obj).encode("utf-8")).hexdigest()
     try:
         import segno
-        from weasyprint import HTML
+        from xhtml2pdf import pisa
 
+        _cert_font_path()
         qr_target = f"{verify_url}?hash={digest}" if verify_url else digest
         qr = segno.make(qr_target, error="m")
-        qr_svg = io.BytesIO()
-        qr.save(qr_svg, kind="svg", scale=4)
-        qr_b64 = base64.b64encode(qr_svg.getvalue()).decode("ascii")
+        qr_png = io.BytesIO()
+        qr.save(qr_png, kind="png", scale=4, border=1)
+        qr_b64 = base64.b64encode(qr_png.getvalue()).decode("ascii")
         html_with_qr = html.replace(
             "{{QR}}",
-            f'<img src="data:image/svg+xml;base64,{qr_b64}" alt="verification QR" />',
+            f'<img src="data:image/png;base64,{qr_b64}" alt="verification QR" />',
         )
-        pdf_bytes = HTML(string=html_with_qr).write_pdf()
+        # Default body font = bundled Devanagari font (covers Latin too)
+        # so Hindi names render even when the hub HTML names no font.
+        # A <style> the caller supplies wins over this prelude (it comes
+        # later in the document) — their explicit choice is respected.
+        # The font MUST come via @font-face with a path relative to the
+        # fonts dir (passed as pisa's `path`): a global
+        # pdfmetrics.registerFont is invisible to xhtml2pdf's per-document
+        # fontList, and an absolute src is denied by xhtml2pdf 0.2.28's
+        # resource policy (reads escaping the document dir are blocked).
+        # The <meta charset> is REQUIRED: without it html5lib sniffs the
+        # UTF-8 bytes as windows-1252 and every Devanagari char becomes
+        # latin-1 mojibake before any font is consulted (verified
+        # 2026-11-22: 'प्रमाण पत्र' rendered as 'à¤ªà¥...').
+        # reportlab has no HarfBuzz shaping — Devanagari conjuncts may
+        # shape imperfectly; measured, not claimed (see LOCAL_VERIFY.md).
+        style_prelude = (
+            "<style>"
+            "@font-face { font-family: NotoSansDevanagari; "
+            "src: url(NotoSansDevanagari-Regular.ttf); }"
+            "* { font-family: NotoSansDevanagari, Helvetica, sans-serif; }"
+            "</style>"
+        )
+        meta_charset = '<meta charset="utf-8" />'
+        html_with_meta = html_with_qr
+        lower = html_with_meta.lower()
+        head_at = lower.find("<head>")
+        if head_at != -1:
+            html_with_meta = (
+                html_with_meta[: head_at + len("<head>")]
+                + meta_charset
+                + html_with_meta[head_at + len("<head>") :]
+            )
+        elif "<html>" in lower:
+            html_at = lower.find("<html>") + len("<html>")
+            html_with_meta = (
+                html_with_meta[:html_at]
+                + "<head>" + meta_charset + "</head>"
+                + html_with_meta[html_at:]
+            )
+        else:
+            html_with_meta = "<head>" + meta_charset + "</head>" + html_with_meta
+        html_final = style_prelude + html_with_meta
+        pdf_buf = io.BytesIO()
+        status = pisa.CreatePDF(
+            io.BytesIO(html_final.encode("utf-8")),
+            dest=pdf_buf,
+            # Document base = fonts dir, so the relative @font-face src
+            # above resolves inside it (see comment at style_prelude).
+            path=str(_FONTS_DIR / "index.html"),
+        )
+        if status.err:
+            raise RuntimeError(f"xhtml2pdf render failed (err={status.err})")
+        pdf_bytes = pdf_buf.getvalue()
+        if pdf_bytes[:4] != b"%PDF":
+            raise RuntimeError("xhtml2pdf did not produce a PDF")
         # Page count: count "/Type /Page" markers (not /Pages).
         pages = pdf_bytes.count(b"/Type /Page") - pdf_bytes.count(b"/Type /Pages")
         pages = max(pages, 1)

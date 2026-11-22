@@ -1,10 +1,13 @@
 """Render worker smoke check (CI render-smoke job + local).
 
+REWRITE (2026-11-22): RapidOCR + xhtml2pdf stack, caps 4 MB.
 Usage: python smoke_check.py [base_url] [worker_pid]
 Starts nothing itself — CI starts uvicorn first, then runs this.
 Checks: /health, /smoke/pdf, /doc/extract, /doc/ocr (generated PNG),
-/doc/certificate (WeasyPrint + QR hash), /doc/scan (clean + dirty).
-Also reads the worker's peak RSS (VmHWM) and asserts < 512 MB (free tier).
+/doc/ocr (PDF), /doc/certificate (xhtml2pdf + QR hash + QR decode +
+Hindi-name cert), /doc/scan (clean + dirty).
+Also reads the worker's peak RSS (VmHWM): gate is < 2048 MB (Vercel
+2 GB budget); the old < 512 MB Render gate is reported alongside.
 Exits non-zero on any failure; prints RSS_MB=... for the audit.
 """
 import base64
@@ -104,20 +107,23 @@ def main() -> int:
     check("doc/extract tables shape", isinstance(ext.get("tables"), list)
           and ext["tables"][0]["page"] == 1, "")
 
-    # /doc/ocr on a generated image (real Tesseract path).
+    # /doc/ocr on a generated image (real RapidOCR path).
     png = make_ocr_png()
     ocr = http_multipart("/doc/ocr", {"file": ("invoice.png", png, "image/png")})
     check("doc/ocr image", ocr.get("ok") is True and ocr.get("pages") == 1
           and ocr.get("confidence", 0) >= 0, str(ocr)[:300])
     check("doc/ocr reads text", "INVOICE" in ocr.get("text", "").upper(),
           repr(ocr.get("text", ""))[:200])
+    check("doc/ocr image source rapidocr",
+          ocr.get("per_page", [{}])[0].get("source") == "rapidocr",
+          str(ocr.get("per_page"))[:200])
 
-    # /doc/ocr on a PDF (pdftoppm + Tesseract, or text-layer fallback).
+    # /doc/ocr on a PDF (pypdfium2 + RapidOCR, or text-layer fallback).
     ocr_pdf = http_multipart("/doc/ocr", {"file": ("sample.pdf", sample, "application/pdf")})
     check("doc/ocr pdf", ocr_pdf.get("ok") is True and ocr_pdf.get("pages") == 1
           and "Hello OmniJarvis" in ocr_pdf.get("text", ""), str(ocr_pdf)[:300])
 
-    # /doc/certificate: WeasyPrint + segno QR hash.
+    # /doc/certificate: xhtml2pdf + segno QR hash.
     cert = http_form("/doc/certificate", {
         "html": "<html><body><h1>Certificate</h1><p>Test Person</p>{{QR}}</body></html>",
         "payload": json.dumps({"name": "Test Person", "course": "Demo"}),
@@ -133,6 +139,42 @@ def main() -> int:
                    sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     check("doc/certificate hash = sha256(canonical payload)",
           cert.get("hash") == expect_hash, cert.get("hash", ""))
+    # QR in the PDF decodes to the expected verify URL (cv2 detector on
+    # a pypdfium2 render of page 1).
+    expect_url = ("https://omnijarvis-hub.rajraj3kk.workers.dev/api/docs/verify"
+                  f"?hash={expect_hash}")
+    try:
+        import cv2
+        import pypdfium2 as pdfium
+        doc = pdfium.PdfDocument(io.BytesIO(pdf))
+        page = doc[0]
+        bitmap = page.render(scale=2)
+        pil_img = bitmap.to_pil()
+        import numpy as np
+        arr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        decoded, _, _ = cv2.QRCodeDetector().detectAndDecode(arr)
+        bitmap.close(); page.close(); doc.close()
+        check("doc/certificate QR decodes to verify URL",
+              decoded == expect_url, f"decoded={decoded!r}")
+    except Exception as exc:  # noqa: BLE001
+        check("doc/certificate QR decodes to verify URL", False, f"{exc}")
+
+    # Hindi-name certificate: renders + text extracts (Devanagari font).
+    cert_hi = http_form("/doc/certificate", {
+        "html": "<html><body><h1>प्रमाण पत्र</h1><p>राहुल गुप्ता</p>{{QR}}</body></html>",
+        "payload": json.dumps({"name": "राहुल गुप्ता", "course": "Demo"}),
+        "verify_url": "https://example.invalid/verify",
+    })
+    check("doc/certificate hindi ok", cert_hi.get("ok") is True, str(cert_hi)[:200])
+    pdf_hi = base64.b64decode(cert_hi.get("pdf_base64", ""))
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(pdf_hi)) as pdoc:
+            hi_text = "\n".join((p.extract_text() or "") for p in pdoc.pages)
+        check("doc/certificate hindi name extracts",
+              "राहुल" in hi_text and "गुप्ता" in hi_text, repr(hi_text)[:200])
+    except Exception as exc:  # noqa: BLE001
+        check("doc/certificate hindi name extracts", False, f"{exc}")
 
     # /doc/scan: clean source -> no findings; dirty -> findings.
     clean = http_multipart("/doc/scan", {"file": ("s.py", b"x = 1\nprint(x)\n", "text/x-python")})
@@ -148,7 +190,7 @@ def main() -> int:
     check("doc/scan flags eval", any(f.get("pattern") == "eval"
           for f in evil_eval.get("findings", [])), str(evil_eval)[:200])
 
-    # Caps: oversize PDF -> 413.
+    # Caps: oversize PDF -> 413 (cap is now 4 MB, was 5 MB).
     try:
         big = http_multipart("/doc/extract",
                              {"file": ("big.pdf", b"%PDF" + b"0" * (6 * 1024 * 1024),
@@ -156,6 +198,14 @@ def main() -> int:
         check("doc/extract oversize -> 413", False, f"got {str(big)[:100]}")
     except urllib.error.HTTPError as e:
         check("doc/extract oversize -> 413", e.code == 413, f"http {e.code}")
+    # 4 MB boundary: 4 MB + 1 byte -> 413 on /doc/ocr; a small file passes.
+    try:
+        over = http_multipart("/doc/ocr",
+                              {"file": ("over.png", b"\x89PNG" + b"0" * (4 * 1024 * 1024 + 1),
+                                       "image/png")})
+        check("doc/ocr 4MB+1B -> 413", False, f"got {str(over)[:100]}")
+    except urllib.error.HTTPError as e:
+        check("doc/ocr 4MB+1B -> 413", e.code == 413, f"http {e.code}")
 
     # RSS: peak resident set of the worker process (VmHWM).
     rss_mb = None
@@ -170,7 +220,11 @@ def main() -> int:
             print(f"RSS read failed: {exc}")
     if rss_mb is not None:
         print(f"RSS_PEAK_MB={rss_mb:.1f}")
-        check("worker peak RSS < 512 MB (free tier)", rss_mb < 512, f"{rss_mb:.1f} MB")
+        check("worker peak RSS < 2048 MB (Vercel 2 GB budget)", rss_mb < 2048,
+              f"{rss_mb:.1f} MB")
+        print(("INFO " if rss_mb < 512 else "NOTE ")
+              + f"old Render 512 MB gate: {'PASS' if rss_mb < 512 else 'OVER'} "
+              f"({rss_mb:.1f} MB)")
     else:
         print("RSS_PEAK_MB=unknown (no pid given)")
 

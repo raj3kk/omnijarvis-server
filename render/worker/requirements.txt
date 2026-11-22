@@ -1,31 +1,70 @@
-# OmniJarvis Render light worker (3b) — doc pipeline stack.
-# Light stack (audit V2: the only combo that fits Render free 512 MB).
-# Pinned to major versions for reproducible deploys.
-fastapi>=0.115,<1
-uvicorn>=0.30,<1
-pdfplumber>=0.11,<1
-python-multipart>=0.0.9,<1
-pytesseract>=0.3,<1
-weasyprint>=60,<62
-# pydyf PINNED: WeasyPrint 61.x calls pydyf.PDF(version, identifier) —
-# pydyf >=0.11 changed the PDF() signature (TypeError) and breaks
-# write_pdf. Verified 2026-11-21: 61.2 + pydyf 0.10.0 = PDF OK.
-pydyf>=0.10,<0.11
-segno>=1.6,<2
-# Track D (2026-11-22) — optional, LAZY-imported in main.py: the base
-# worker starts and serves the original routes without them. Pinned
-# exact: these versions were installed + measured in the track work.
-# bandit 1.8.6: /doc/scan sidecar (Apache 2.0). mem0ai 2.2.1: /mem/extract
-# (Apache 2.0 library only; Platform never used; LLM via hub router).
-# 2.2.1 (not 1.0.4): 1.0.4 pins protobuf<6 but browser-use's google libs
-# need protobuf>=6.33.5 — unresolvable in one venv; 2.2.1 allows
-# protobuf<7 and the adapter was verified against both 1.0.4 and 2.2.1
-# (2.x changed add() to a single additive-extraction call returning a
-# list; the adapter sniffs the prompt and accepts both result shapes).
-# bandit 1.8.6: /doc/scan sidecar (Apache 2.0). mem0ai 2.2.1: /mem/extract
-# (Apache 2.0 library only; Platform never used; LLM via hub router).
-# Heavy deps live in requirements-heavy.txt (16 GB host only — see that
-# file): docling, browser-use/playwright. NOT added: paddleocr
-# (evidence-gated NOT APPLICABLE — see Track D REPORT.md §3).
-bandit==1.8.6
-mem0ai==2.2.1
+# OmniJarvis light worker — REWRITE stack (2026-11-22, DESIGN.md).
+# Pure pip-only deps, no system binaries (no Tesseract, no poppler,
+# no WeasyPrint). NO PyMuPDF (AGPL — forbidden for this stack).
+# Pinned to the EXACT versions resolved 2026-11-22 in a clean
+# Python 3.12.3 venv (pip freeze). Direct deps first, then transitive.
+fastapi==0.165.0
+uvicorn==0.54.0
+pdfplumber==0.11.11
+python-multipart==0.0.34
+rapidocr==3.10.0
+onnxruntime==1.32.0
+# opencv 4.11 (not 5.1): 50 MB wheel vs 64 MB, ~40 MB smaller installed —
+# the 5.1.0.95 install pushed the Vercel bundle to the edge of 500 MB.
+# Verified compatible with rapidocr 3.10.0 (see LOCAL_VERIFY.md).
+opencv-python-headless==4.11.0.86
+pypdfium2==5.15.2
+xhtml2pdf==0.2.28
+reportlab==5.1.0
+segno==1.6.6
+Pillow==13.0.0
+numpy==2.5.5
+# --- transitive pins (exact resolved set) ---
+PyYAML==6.0.4
+annotated-doc==0.0.7
+annotated-types==0.8.0
+anyio==4.16.0
+arabic-reshaper==3.1.0
+certifi==2026.11.20
+cffi==2.1.1
+charset-normalizer==3.5.2
+click==8.5.1
+colorlog==6.12.0
+cryptography==50.0.2
+cssselect2==0.10.1
+flatbuffers==25.12.19
+h11==0.16.0
+html5lib==1.1
+idna==3.20
+lxml==6.1.3
+omegaconf==2.4.0
+opentelemetry-api==1.45.2
+packaging==26.3
+pdfminer.six==20260107
+protobuf==7.36.2
+pyclipper==1.4.0
+pycparser==3.12
+pydantic==2.14.4
+pydantic_core==2.50.5
+pypdf==7.1.1
+requests==2.34.2
+shapely==2.2.0
+six==1.17.0
+starlette==1.10.0
+svglib==2.4.0
+tinycss2==1.5.1
+tqdm==4.70.1
+typing-inspection==0.4.5
+typing_extensions==4.16.0
+urllib3==2.8.0
+webencodings==0.6.1
+# NOTE (rewrite merge 2026-11-22): bandit + mem0ai were here (Track D,
+# light file) but are MOVED to requirements-heavy.txt. Measured reason:
+# the merged light install with them is ~574 MB — over Vercel's 500 MB
+# function-bundle limit (they pull openai + qdrant-client + grpcio +
+# sqlalchemy + posthog, ~110 MB). The worker lazy-imports both and
+# degrades honestly without them (/mem/extract falls back to the
+# rule-based extractor; /doc/scan stays AST-only with
+# bandit_available=false), so the light worker loses nothing it
+# cannot honestly report. The protobuf pin also returns to ==7.36.2
+# (mem0ai needed protobuf<7 — ResolutionImpossible with the light set).

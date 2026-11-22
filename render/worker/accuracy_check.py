@@ -1,13 +1,19 @@
 """3b accuracy measurement: 10 synthetic docs, field-level accuracy.
 
+REWRITE (2026-11-22): OCR is RapidOCR (Devanagari PP-OCRv5 rec).
 Reads fixtures/manifest.json, OCRs each PNG via main._ocr_image_bytes
-(real Tesseract) and extracts each PDF via main.extract (pdfplumber),
-then checks every expected field value appears in the recognised text
-(normalised: lowercase, non-alphanumerics stripped).
+and extracts each PDF via main.extract (pdfplumber), then checks every
+expected field value appears in the recognised text.
+
+Normalizer is Devanagari-aware: it keeps U+0900–U+097F, so Hindi fields
+are genuinely tested (the old [^a-z0-9] norm stripped Hindi to "" and
+passed vacuously). Hindi fields are reported separately with the same
+>= 0.85 bar.
 
 Exit gate (Pehle-Jaanch 3b §2c): aggregate field accuracy >= 0.85 AND
-every per-doc accuracy >= 0.85. The gate is OCR-only (image path);
-PDF-extract accuracy is reported separately, never a rescue for OCR.
+every per-doc accuracy >= 0.85 AND Hindi field accuracy >= 0.85.
+The gate is OCR-only (image path); PDF-extract accuracy is reported
+separately, never a rescue for OCR.
 Usage: python accuracy_check.py  (run from render/worker/)
 """
 import json
@@ -24,7 +30,12 @@ THRESHOLD = 0.85
 
 
 def norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", s.lower())
+    # Devanagari-aware: keep U+0900-U+097F (Hindi) alongside a-z0-9.
+    return re.sub(r"[^a-z0-9\u0900-\u097f]", "", s.lower())
+
+
+def is_devanagari(s: str) -> bool:
+    return any("\u0900" <= ch <= "\u097f" for ch in s)
 
 
 def main() -> int:
@@ -32,6 +43,7 @@ def main() -> int:
         manifest = json.load(f)
     rows = []
     total = matched = 0
+    hi_total = hi_matched = 0
     for doc in manifest["docs"]:
         png_path = os.path.join(FIX, doc["png"])
         with open(png_path, "rb") as f:
@@ -58,6 +70,10 @@ def main() -> int:
                 misses.append(field["key"] + "=" + field["value"])
             if pdf_hit:
                 pdf_matched += 1
+            if is_devanagari(field["value"]):
+                hi_total += 1
+                if hit:
+                    hi_matched += 1
         acc = doc_matched / doc_total if doc_total else 0.0
         pdf_acc = pdf_matched / doc_total if doc_total else 0.0
         rows.append((doc["id"], doc["kind"], doc_matched, doc_total, acc, conf, misses))
@@ -65,11 +81,14 @@ def main() -> int:
               f"acc={acc:.2f} extract_acc={pdf_acc:.2f} ocr_conf={conf:.1f}"
               + (f" MISS: {', '.join(misses)}" if misses else ""))
     agg = matched / total if total else 0.0
+    hi_acc = hi_matched / hi_total if hi_total else 0.0
     print(f"AGGREGATE: {matched}/{total} acc={agg:.3f} (gate >= {THRESHOLD})")
+    print(f"HINDI (Devanagari-aware): {hi_matched}/{hi_total} acc={hi_acc:.3f} "
+          f"(gate >= {THRESHOLD})")
     per_doc_ok = all(r[4] >= THRESHOLD for r in rows)
     print(f"PER-DOC GATE: {'PASS' if per_doc_ok else 'FAIL'} "
           f"(min per-doc acc={min(r[4] for r in rows):.2f})")
-    if agg < THRESHOLD or not per_doc_ok:
+    if agg < THRESHOLD or not per_doc_ok or hi_acc < THRESHOLD:
         print("ACCURACY GATE FAILED")
         return 1
     print("ACCURACY GATE PASSED")
