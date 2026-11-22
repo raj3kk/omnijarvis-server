@@ -229,9 +229,9 @@ describe("handleRequest (2a-2 routes, D1 licences)", () => {
     expect(body.key_id).toBeUndefined();
   });
 
-  it("GET / -> version 5 (B-3 Cloudflare Cron Trigger)", async () => {
+  it("GET / -> version 6 (R3 Groq free fallback leg)", async () => {
     const body = (await route("/").json()) as Record<string, unknown>;
-    expect(body.version).toBe("5");
+    expect(body.version).toBe("6");
   });
 
   it("pairing code: derives from token", async () => {

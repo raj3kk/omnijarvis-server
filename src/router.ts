@@ -12,8 +12,21 @@
  *   6. metering per call (usageMetadata is the source of truth)
  *
  * Two modes (D11 §3.1 — the tension, resolved by billing_mode):
- *   byok (live default):        3.5 FL -> 3.1 FL (quality-first)
- *   founder_pays (gated):       3.1 FL -> 3.5 FL (cost-first)
+ *   byok (live default):        3.5 FL -> 3.1 FL -> Groq gpt-oss-120b (quality-first)
+ *   founder_pays (gated):       3.1 FL -> 3.5 FL -> Groq gpt-oss-120b (cost-first)
+ * Groq leg (R3, 2026-11-22): free tier, no card — 30 RPM / 1,000 RPD / 8K TPM /
+ * 200K TPD per model (Groq rate-limits page, read 2026-11-22). OpenAI-compatible
+ * chat completions, $0 cost, metered with real usage tokens. It is the THIRD leg
+ * on text kinds only (agent_plan / quick_command / casual_chat / search_grounding):
+ * NOT on doc_extraction (Groq offers json_object only — it cannot enforce Gemini
+ * responseSchema), NOT on embeddings (Groq has no embeddings API), NOT on live.
+ * Groq key is per-tenant BYOK (`tenants.groq_key_enc`, same AES-GCM envelope as
+ * the Gemini key); a tenant without one simply skips the leg (trace
+ * `router_groq_skipped`) — Gemini-only behaviour is unchanged. Founder-pays mode
+ * may use an optional FOUNDER_GROQ_KEY Worker secret (still $0, no margin impact).
+ * OpenRouter is deliberately NOT a leg: D8 ($10 purchase) is still OPEN and the
+ * D11 brief gates OpenRouter overflow code on D8; at $0 its :free tier is 50 RPD
+ * pooled — 20x worse than Groq — with a rotating roster and no SLA.
  * gemini-2.5-flash-lite is RETIRED (Google 404 for new users since
  * ~Nov 2026 — "no longer available to new users, use gemini-3.5-flash-lite").
  * It appears NOWHERE in chains/prices/validation (P0 fix, 2026-11-21):
@@ -47,6 +60,18 @@ export const MODEL_31 = "gemini-3.1-flash-lite";
 export const MODEL_35 = "gemini-3.5-flash-lite";
 export const MODEL_EMBED = "gemini-embedding-001";
 export const MODEL_LIVE = "gemini-2.5-flash-native-audio-dialog";
+/** Groq free-tier leg (R3): gpt-oss-120b is the flagship free chat model.
+ * Llama chat ids (llama-3.3-70b-versatile, llama-3.1-8b-instant) are DEAD on
+ * Groq free/developer tiers since 2026-08-16 — never use them. */
+export const MODEL_GROQ = "openai/gpt-oss-120b";
+/** Other Groq free-tier chat models a ROUTER_CONFIG chain may name. */
+export const GROQ_MODELS = [MODEL_GROQ, "openai/gpt-oss-20b", "qwen/qwen3.8-27b"] as const;
+export const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
+export const GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models";
+
+export function isGroqModel(model: string): boolean {
+  return (GROQ_MODELS as readonly string[]).includes(model);
+}
 
 /** Live text models, quality-first (BYOK primary order). Validation tries these in order. */
 export const LIVE_TEXT_MODELS = [MODEL_35, MODEL_31] as const;
@@ -57,6 +82,10 @@ export const DEFAULT_PRICES: Record<string, { in: number; out: number }> = {
   [MODEL_31]: { in: 0.25, out: 1.5 },
   [MODEL_35]: { in: 0.3, out: 2.5 },
   [MODEL_EMBED]: { in: 0.15, out: 0 },
+  // Groq free tier: $0 per token (no card, no billing) — cost always 0.
+  [MODEL_GROQ]: { in: 0, out: 0 },
+  "openai/gpt-oss-20b": { in: 0, out: 0 },
+  "qwen/qwen3.8-27b": { in: 0, out: 0 },
 };
 
 export type RequestKind =
@@ -70,19 +99,19 @@ export type RequestKind =
 
 const DEFAULT_CHAINS: Record<string, Record<RequestKind, string[]>> = {
   byok: {
-    agent_plan: [MODEL_35, MODEL_31],
-    quick_command: [MODEL_35, MODEL_31],
-    casual_chat: [MODEL_35, MODEL_31],
-    search_grounding: [MODEL_31, MODEL_35],
+    agent_plan: [MODEL_35, MODEL_31, MODEL_GROQ],
+    quick_command: [MODEL_35, MODEL_31, MODEL_GROQ],
+    casual_chat: [MODEL_35, MODEL_31, MODEL_GROQ],
+    search_grounding: [MODEL_31, MODEL_35, MODEL_GROQ],
     live: [MODEL_LIVE],
     doc_extraction: [MODEL_35, MODEL_31],
     embeddings: [MODEL_EMBED],
   },
   founder_pays: {
-    agent_plan: [MODEL_31, MODEL_35],
-    quick_command: [MODEL_31, MODEL_35],
-    casual_chat: [MODEL_31, MODEL_35],
-    search_grounding: [MODEL_31, MODEL_35],
+    agent_plan: [MODEL_31, MODEL_35, MODEL_GROQ],
+    quick_command: [MODEL_31, MODEL_35, MODEL_GROQ],
+    casual_chat: [MODEL_31, MODEL_35, MODEL_GROQ],
+    search_grounding: [MODEL_31, MODEL_35, MODEL_GROQ],
     live: [MODEL_LIVE],
     doc_extraction: [MODEL_31, MODEL_35],
     embeddings: [MODEL_EMBED],
@@ -148,7 +177,9 @@ export function loadRouterConfig(env: { ROUTER_CONFIG?: string }): RouterConfig 
     }
   }
   const flat = JSON.stringify(config);
-  if (flat.includes("3.8")) throw new Error("router config: gemini-3.8 is block-listed in paid routes");
+  // R3: the guard must name Gemini 3.8 exactly — a bare "3.8" false-positives
+  // on qwen/qwen3.8-27b (a Groq free model, not Gemini 3.8 at all).
+  if (flat.includes("gemini-3.8")) throw new Error("router config: gemini-3.8 is block-listed in paid routes");
   // R-T19 guard: a retired model in any chain can never serve a new key —
   // refuse the config loudly instead of routing into a guaranteed 404.
   for (const mode of Object.values(config.chains)) {
@@ -207,6 +238,10 @@ export interface RouterDeps {
   nowMs?: () => number;
   masterKeyB64?: string;
   founderKey?: string;
+  /** Optional founder Groq key (Worker secret FOUNDER_GROQ_KEY) — used for
+   * the Groq leg in founder_pays mode only. Groq is $0, so founder cost
+   * stays $0. Absent = founder-pays tenants skip the Groq leg. */
+  founderGroqKey?: string;
   config?: RouterConfig;
   timeoutMs?: number;
 }
@@ -282,7 +317,7 @@ function toGeminiContents(messages: ChatMessage[]): { role: string; parts: { tex
   return messages.map((m) => ({ role: m.role, parts: [{ text: m.text }] }));
 }
 
-interface GeminiCallOutcome {
+interface LlmCallOutcome {
   retryable: boolean;
   status: number;
   text?: string;
@@ -299,7 +334,7 @@ async function callGemini(
   apiKey: string,
   req: RouteRequest,
   messages: ChatMessage[],
-): Promise<GeminiCallOutcome> {
+): Promise<LlmCallOutcome> {
   const timeoutMs = deps.timeoutMs ?? CALL_TIMEOUT_MS;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -388,17 +423,102 @@ async function safeText(res: { text(): Promise<string> }): Promise<string> {
   }
 }
 
-function classifyError(status: number, bodyText: string): GeminiCallOutcome {
+function classifyError(status: number, bodyText: string): LlmCallOutcome {
   const lower = bodyText.toLowerCase();
   if (status === 429) return { retryable: true, status, inputTokens: 0, outputTokens: 0, error: "rate_limited", errorCode: "rate_limited" };
   if (status >= 500) return { retryable: true, status, inputTokens: 0, outputTokens: 0, error: `upstream_${status}`, errorCode: "upstream_error" };
   if (status === 404 && (lower.includes("not found") || lower.includes("not_found"))) {
     return { retryable: true, status, inputTokens: 0, outputTokens: 0, error: "model_not_found", errorCode: "model_not_found" };
   }
-  if (status === 400 && (lower.includes("api_key_invalid") || lower.includes("api key not valid"))) {
+  // 401 = invalid key on both providers (Groq returns 401 invalid_api_key;
+  // Gemini returns 400 api_key_invalid, handled below). Non-retryable.
+  if (status === 401) {
+    return { retryable: false, status, inputTokens: 0, outputTokens: 0, error: "invalid_key", errorCode: "invalid_key" };
+  }
+  if (status === 400 && (lower.includes("api_key_invalid") || lower.includes("api key not valid") || lower.includes("invalid_api_key") || lower.includes("incorrect api key"))) {
     return { retryable: false, status, inputTokens: 0, outputTokens: 0, error: "invalid_key", errorCode: "invalid_key" };
   }
   return { retryable: false, status, inputTokens: 0, outputTokens: 0, error: `upstream_${status}`, errorCode: "upstream_error" };
+}
+
+/** Groq chat completions (OpenAI-compatible). Same outcome contract as
+ * callGemini: usage tokens are the source of truth — without them the call
+ * fails as usage_metadata_missing, never billed on an estimate. The key
+ * travels only in the Authorization header — never in a URL, log, or response. */
+function toGroqMessages(messages: ChatMessage[], system?: string): { role: string; content: string }[] {
+  const out: { role: string; content: string }[] = [];
+  if (system) out.push({ role: "system", content: system });
+  for (const m of messages) out.push({ role: m.role === "model" ? "assistant" : "user", content: m.text });
+  return out;
+}
+
+async function callGroq(
+  deps: RouterDeps,
+  model: string,
+  apiKey: string,
+  req: RouteRequest,
+  messages: ChatMessage[],
+): Promise<LlmCallOutcome> {
+  const timeoutMs = deps.timeoutMs ?? CALL_TIMEOUT_MS;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await (deps.fetchFn ?? fetch)(GROQ_API_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model, messages: toGroqMessages(messages, req.system) }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return classifyError(res.status, await safeText(res));
+    const data = (await res.json()) as {
+      choices?: { message?: { content?: string | null }; finishReason?: string }[];
+      usage?: { prompt_tokens?: number; completion_tokens?: number };
+    };
+    const text = data.choices?.[0]?.message?.content ?? "";
+    if (!text) {
+      return { retryable: true, status: res.status, inputTokens: 0, outputTokens: 0, error: "empty_response", errorCode: "empty_response" };
+    }
+    const usage = data.usage;
+    if (!usage || typeof usage.prompt_tokens !== "number" || typeof usage.completion_tokens !== "number") {
+      // usage is the source of truth — without it, no billing.
+      return { retryable: false, status: res.status, inputTokens: 0, outputTokens: 0, error: "usage_metadata_missing", errorCode: "usage_metadata_missing" };
+    }
+    return {
+      retryable: false,
+      status: res.status,
+      text,
+      inputTokens: usage.prompt_tokens,
+      outputTokens: usage.completion_tokens,
+    };
+  } catch (e) {
+    if ((e as Error)?.name === "AbortError") {
+      return { retryable: true, status: 0, inputTokens: 0, outputTokens: 0, error: "timeout", errorCode: "timeout" };
+    }
+    return { retryable: true, status: 0, inputTokens: 0, outputTokens: 0, error: String((e as Error)?.message ?? e).slice(0, 200), errorCode: "network_error" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Resolve the Groq key for this tenant, lazily (only when a Groq leg is
+ * actually reached — a corrupt Groq envelope must never break Gemini calls).
+ * BYOK: tenant's encrypted groq_key_enc. Founder-pays: FOUNDER_GROQ_KEY. */
+async function resolveGroqKey(
+  deps: RouterDeps,
+  tenant: { groq_key_enc?: string | null },
+  billingMode: string,
+): Promise<{ key: string | null; reason: string }> {
+  if (billingMode === "founder_pays") {
+    return deps.founderGroqKey ? { key: deps.founderGroqKey, reason: "" } : { key: null, reason: "no_key" };
+  }
+  if (!tenant.groq_key_enc) return { key: null, reason: "no_key" };
+  if (!deps.masterKeyB64) return { key: null, reason: "decrypt_failed" };
+  try {
+    const master = await importMasterKey(deps.masterKeyB64);
+    return { key: await decryptTenantKey(master, tenant.groq_key_enc), reason: "" };
+  } catch {
+    return { key: null, reason: "decrypt_failed" };
+  }
 }
 
 function failResult(
@@ -503,7 +623,11 @@ export async function routeLlm(deps: RouterDeps, req: RouteRequest): Promise<Rou
   const { messages, truncated } = truncateMessages(req.messages, req.system);
   const attempted: string[] = [];
   const sleep = deps.sleepFn ?? sleepDefault;
-  let lastError: GeminiCallOutcome | null = null;
+  let lastError: LlmCallOutcome | null = null;
+  // Groq key resolves lazily, once, at the first Groq leg (A5).
+  let groqKey: string | null = null;
+  let groqResolved = false;
+  let groqSkipReason = "no_key";
 
   for (let i = 0; i < chain.length; i++) {
     const model = chain[i];
@@ -515,8 +639,30 @@ export async function routeLlm(deps: RouterDeps, req: RouteRequest): Promise<Rou
       });
       continue;
     }
+    // Groq leg: skip (traced) when the tenant has no usable Groq key —
+    // the Gemini-only path behaves exactly as before.
+    let groqApiKey: string | null = null;
+    if (isGroqModel(model)) {
+      if (!groqResolved) {
+        groqResolved = true;
+        const resolved = await resolveGroqKey(deps, tenant, billingMode);
+        groqKey = resolved.key;
+        groqSkipReason = resolved.reason;
+      }
+      if (!groqKey) {
+        await insertTrace(deps.db, tenantId, deviceId, "router_groq_skipped", {
+          turn_id: req.turn_id,
+          model,
+          reason: groqSkipReason,
+        });
+        continue;
+      }
+      groqApiKey = groqKey;
+    }
     attempted.push(model);
-    const outcome = await callGemini(deps, model, apiKey as string, req, messages);
+    const outcome = groqApiKey
+      ? await callGroq(deps, model, groqApiKey, req, messages)
+      : await callGemini(deps, model, apiKey as string, req, messages);
     if (outcome.retryable) {
       breakerRecord(model, true, now);
       lastError = outcome;
@@ -632,4 +778,31 @@ export async function validateGeminiKey(apiKey: string, fetchFn: typeof fetch = 
     }
   }
   return false;
+}
+
+/**
+ * Validate a tenant-supplied Groq key with a tiny models-list call
+ * (GET /openai/v1/models, no tokens spent). 200 => true. Anything else
+ * (401 invalid key, 429, 5xx) => false — unvalidated keys are never stored.
+ * Timeout 15s. The key travels only in the Authorization header — never in
+ * a URL, log, or response. A free key comes from console.groq.com → API Keys
+ * (free tier, no card); without one the tenant simply skips the Groq leg.
+ */
+export async function validateGroqKey(apiKey: string, fetchFn: typeof fetch = fetch): Promise<boolean> {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15_000);
+    try {
+      const res = await fetchFn(GROQ_MODELS_URL, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: ctrl.signal,
+      });
+      return res.ok;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return false;
+  }
 }

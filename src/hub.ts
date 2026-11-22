@@ -18,6 +18,7 @@
  * - /dispatch is DO-internal (x-internal-secret) — not exposed here.
  * - /api/llm/route + /api/llm/turn-complete: x-internal-secret (server-to-server).
  * - /api/tenants/:id/key(+status): x-admin-token (LLM_ADMIN_TOKEN).
+ * - /api/tenants/:id/groq-key(+status): same gate, Groq BYOK key (R3).
  * - /api/docs/*: x-internal-secret (agent) OR paired device + Ed25519
  *   signature (3b); Free tier: doc extraction blocked.
  * - /api/browser/*: x-internal-secret (3c); device reports captcha
@@ -59,6 +60,7 @@ export interface Env {
   QDRANT_URL?: string; // 3d: unset = qdrant_not_configured (account pending)
   QDRANT_API_KEY?: string;
   FOUNDER_GEMINI_KEY?: string;
+  FOUNDER_GROQ_KEY?: string; // R3: optional founder Groq key ($0 free tier) — founder_pays Groq leg only
   ROUTER_CONFIG?: string;
   RENDER_WORKER_URL?: string;
   E2B_API_KEY?: string; // Phase 4: unset = e2b_not_configured (U-4, no account yet)
@@ -71,7 +73,7 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "5"; // 5: B-3 Cloudflare Cron Trigger — hub self-ticks every 5 min (GitHub scheduler bypass; GitHub dispatcher stays as fallback, ticks are idempotent)
+const VERSION = "6"; // 6: R3 Groq free fallback leg (gpt-oss-120b, BYOK groq_key_enc; D8 OpenRouter still gated)
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";
@@ -89,7 +91,7 @@ import {
   type AssistOutcome,
   type CaptchaAssistEvent,
 } from "./browser";
-import { completeTurn, loadRouterConfig, routeLlm, validateGeminiKey, type RequestKind } from "./router";
+import { completeTurn, loadRouterConfig, routeLlm, validateGeminiKey, validateGroqKey, type RequestKind } from "./router";
 import { encryptTenantKey, importMasterKey } from "./keyvault";
 import {
   MAX_SKILL_CODE_BYTES,
@@ -461,6 +463,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           db: env.DB,
           masterKeyB64: env.KEY_ENC_SECRET,
           founderKey: env.FOUNDER_GEMINI_KEY,
+          founderGroqKey: env.FOUNDER_GROQ_KEY,
           config,
         },
         {
@@ -507,37 +510,52 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     // Tenant BYOK key management (admin-token gated; LLM_ADMIN_TOKEN).
-    // Key is validated (tiny Gemini call) then AES-GCM encrypted into D1.
-    // The key value is NEVER echoed back, logged, or stored plaintext.
-    if (path.startsWith("/api/tenants/") && (path.endsWith("/key") || path.endsWith("/key-status"))) {
+    // Key is validated (tiny Gemini call / Groq models-list call) then
+    // AES-GCM encrypted into D1. The key value is NEVER echoed back,
+    // logged, or stored plaintext. Groq routes mirror the Gemini ones
+    // (R3): /groq-key + /groq-key-status, column tenants.groq_key_enc.
+    if (path.startsWith("/api/tenants/") && (path.endsWith("/key") || path.endsWith("/key-status") || path.endsWith("/groq-key") || path.endsWith("/groq-key-status"))) {
       if (!env.LLM_ADMIN_TOKEN || request.headers.get("x-admin-token") !== env.LLM_ADMIN_TOKEN) {
         return json({ error: "unauthorized" }, 401);
       }
-      const parts = path.split("/").filter(Boolean); // api, tenants, :id, key[-status]
+      const parts = path.split("/").filter(Boolean); // api, tenants, :id, key[-status] | groq-key[-status]
       const tenantId = parts[2] ?? "";
       if (!tenantId) return json({ error: "bad_request" }, 400);
       const tenant = await getTenant(env.DB, tenantId);
       if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      const isGroq = path.endsWith("/groq-key") || path.endsWith("/groq-key-status");
       if (method === "GET" && path.endsWith("/key-status")) {
         return json({ ok: true, has_key: !!tenant.gemini_key_enc, billing_mode: tenant.billing_mode });
+      }
+      if (method === "GET" && path.endsWith("/groq-key-status")) {
+        return json({ ok: true, has_groq_key: !!tenant.groq_key_enc });
       }
       if (method === "DELETE" && path.endsWith("/key")) {
         await env.DB.prepare("UPDATE tenants SET gemini_key_enc = NULL WHERE id = ?").bind(tenantId).run();
         return json({ ok: true });
       }
-      if (method === "POST" && path.endsWith("/key")) {
+      if (method === "DELETE" && path.endsWith("/groq-key")) {
+        await env.DB.prepare("UPDATE tenants SET groq_key_enc = NULL WHERE id = ?").bind(tenantId).run();
+        return json({ ok: true });
+      }
+      if (method === "POST" && (path.endsWith("/key") || path.endsWith("/groq-key"))) {
         const body = await readJson(request);
-        const key = typeof body.gemini_key === "string" ? body.gemini_key : "";
+        const rawKey = isGroq ? body.groq_key : body.gemini_key;
+        const key = typeof rawKey === "string" ? rawKey : "";
         const billingMode = typeof body.billing_mode === "string" ? body.billing_mode : tenant.billing_mode;
         if (!key) return json({ error: "bad_request" }, 400);
-        if (billingMode === "founder_pays" && !env.FOUNDER_GEMINI_KEY) {
+        if (!isGroq && billingMode === "founder_pays" && !env.FOUNDER_GEMINI_KEY) {
           return json({ error: "founder_pays_not_enabled" }, 400);
         }
         if (!env.KEY_ENC_SECRET) return json({ error: "key_vault_not_configured" }, 500);
-        const valid = await validateGeminiKey(key);
+        const valid = isGroq ? await validateGroqKey(key) : await validateGeminiKey(key);
         if (!valid) return json({ error: "invalid_key" }, 400);
         const master = await importMasterKey(env.KEY_ENC_SECRET);
         const enc = await encryptTenantKey(master, key);
+        if (isGroq) {
+          await env.DB.prepare("UPDATE tenants SET groq_key_enc = ? WHERE id = ?").bind(enc, tenantId).run();
+          return json({ ok: true });
+        }
         await env.DB
           .prepare("UPDATE tenants SET gemini_key_enc = ?, billing_mode = ? WHERE id = ?")
           .bind(enc, billingMode, tenantId)

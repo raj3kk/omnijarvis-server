@@ -93,6 +93,7 @@ export interface TenantRow {
   plan_tier: string;
   billing_mode: string;
   gemini_key_enc: string | null;
+  groq_key_enc?: string | null; // 0008 (R3): BYOK Groq key, same AES-GCM envelope
   pii_consent?: number | null; // 0004: DPDP consent for storing PII in doc_jobs (default 0)
   email_verified?: number | null; // 0007: 1 = email verified (Resend token / admin god-mode)
   pending_downgrade_tier?: string | null; // 0007: downgrade effective next cycle
@@ -103,7 +104,7 @@ export interface TenantRow {
 export async function getTenant(db: D1Like, tenantId: string): Promise<TenantRow | null> {
   const row = await db
     .prepare(
-      "SELECT id, owner_email, plan_tier, billing_mode, gemini_key_enc, pii_consent, email_verified, pending_downgrade_tier FROM tenants WHERE id = ?",
+      "SELECT id, owner_email, plan_tier, billing_mode, gemini_key_enc, groq_key_enc, pii_consent, email_verified, pending_downgrade_tier FROM tenants WHERE id = ?",
     )
     .bind(tenantId)
     .first<TenantRow>();
