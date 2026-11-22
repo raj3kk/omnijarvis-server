@@ -20,7 +20,13 @@ name: cron-dispatcher
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    # B-3 audit 2026-11-22: "*/5" fired only ONCE in 5.5h (00:40:51Z, success)
+    # despite being registered+active — GitHub drops/delays schedule events
+    # hardest at :00 and on 5-min boundaries under load (docs + cronmiss).
+    # "2/5" keeps the same 5-min cadence on off-peak minutes (:02,:07,...),
+    # avoiding the busiest minute entirely. Re-registration lag (~4h on the
+    # last re-add) is accepted: the old cadence was already unusable.
+    - cron: "2/5 * * * *"
   workflow_dispatch: {}
 
 permissions:
