@@ -359,6 +359,20 @@ export async function extractStructured(input: ExtractInput): Promise<{
 }> {
   const schema = input.schema;
   const fieldNames = Object.keys((schema.properties as Record<string, unknown> | undefined) ?? {});
+  // v9 fix: the responseSchema previously declared `fields` as a bare
+  // {type:"object"} with NO properties, so Gemini's structured output
+  // returned a schema-valid empty object on every call (live-proven:
+  // two extract calls, fields={} both times, HTTP 200). Declare each
+  // requested field inside `fields` so the model has keys to fill;
+  // callers that omit a type default to string. `fields` itself stays
+  // the only required key — absent fields stay absent (missing list).
+  const fieldProps: Record<string, unknown> = {};
+  const schemaProps = (schema.properties as Record<string, unknown> | undefined) ?? {};
+  for (const f of fieldNames) {
+    const def = schemaProps[f] as Record<string, unknown> | undefined;
+    const t = def?.type;
+    fieldProps[f] = { type: typeof t === "string" ? t : "string" };
+  }
   const result = await routeLlm(
     {
       db: input.db,
@@ -386,7 +400,7 @@ export async function extractStructured(input: ExtractInput): Promise<{
       response_schema: {
         type: "object",
         properties: {
-          fields: { type: "object" },
+          fields: { type: "object", properties: fieldProps },
           confidence: { type: "number" },
         },
         required: ["fields"],
