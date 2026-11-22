@@ -111,12 +111,13 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "12"; // 12: R-15 Qdrant fixes (integer point id + tenant_id index) + Retry-After on 429s + b2Region bare hostname; 11 was M-I-3 Groq-only
+const VERSION = "13"; // 13: M-I-30 in-app cron (NL->cron parse + enable/delete); 12 was Qdrant + Retry-After + B2
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";
 import { handleSync, type SyncRequest } from "./sync";
-import { constantTimeEqual, handleTick, type DispatchStep } from "./cron";
+import { constantTimeEqual, handleTick, nextCronRun, type DispatchStep } from "./cron";
+import { cronLlmSystemPrompt, llmParseCronText, parseNaturalCron } from "./nl-cron";
 import { checkRateLimit, checkUpstashLive, probeUpstashCounter, type RateLimitResult } from "./ratelimit";
 import { d1Batch, getDevice, getTenant, insertTrace, verifyLicenceKey } from "./db";
 import {
@@ -2238,6 +2239,106 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (auth.tenant_id && auth.tenant_id !== job.tenant_id) return json({ error: "forbidden" }, 403);
       await env.DB.prepare("UPDATE scheduled_jobs SET enabled = ? WHERE id = ?").bind(0, jobId).run();
       return json({ ok: true, job_id: jobId, enabled: false });
+    }
+
+    // M-I-30: re-enable a disabled job (cap-checked like create; the
+    // next run is recomputed from now — the stored next_run_at is stale
+    // after any time disabled).
+    if (path.startsWith("/api/billing/cron-jobs/") && path.endsWith("/enable") && method === "POST") {
+      const body = await readJson(request);
+      const auth = await billingAuth(body);
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const jobId = path.split("/").filter(Boolean)[3] ?? "";
+      const job = await env.DB
+        .prepare("SELECT id, tenant_id, cron_expr, enabled FROM scheduled_jobs WHERE id = ?")
+        .bind(jobId)
+        .first<{ id: string; tenant_id: string; cron_expr: string; enabled: number }>();
+      if (!job) return json({ error: "job_not_found" }, 404);
+      if (auth.tenant_id && auth.tenant_id !== job.tenant_id) return json({ error: "forbidden" }, 403);
+      if (job.enabled === 1) return json({ ok: true, job_id: jobId, enabled: true });
+      const tenant = await getTenant(env.DB, job.tenant_id);
+      if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      const used = await countEnabledJobs(env.DB, job.tenant_id);
+      if (used >= planLimits(tenant.plan_tier).cron_jobs) {
+        return json({ error: "cron_cap", detail: "Cron limit khatam — purana band karo ya upgrade karo" }, 403);
+      }
+      const next = nextCronRun(job.cron_expr, Date.now());
+      if (next === null) return json({ error: "bad_cron" }, 400);
+      await env.DB.prepare("UPDATE scheduled_jobs SET enabled = ?, next_run_at = ? WHERE id = ?").bind(1, next, jobId).run();
+      return json({ ok: true, job_id: jobId, enabled: true, next_run_at: next });
+    }
+
+    // M-I-30: delete a job outright (tenant-scoped; the disable route
+    // only pauses). No un-delete — the app confirms before calling.
+    if (path.startsWith("/api/billing/cron-jobs/") && method === "DELETE") {
+      const jobId = path.split("/").filter(Boolean)[3] ?? "";
+      const auth = await billingAuth({});
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const job = await env.DB
+        .prepare("SELECT id, tenant_id FROM scheduled_jobs WHERE id = ?")
+        .bind(jobId)
+        .first<{ id: string; tenant_id: string }>();
+      if (!job) return json({ error: "job_not_found" }, 404);
+      if (auth.tenant_id && auth.tenant_id !== job.tenant_id) return json({ error: "forbidden" }, 403);
+      await env.DB.prepare("DELETE FROM scheduled_jobs WHERE id = ?").bind(jobId).run();
+      return json({ ok: true, job_id: jobId, deleted: true });
+    }
+
+    // M-I-30: NL -> cron expression. Deterministic parse first (free,
+    // no LLM); LLM fallback through the existing router with a strict
+    // output contract. NEVER emits an unvalidated expression — anything
+    // that fails nextCronRun() is 422 unparseable. Times are the user's
+    // local time; utc_offset_minutes (IST = 330) converts to UTC.
+    if (path === "/api/cron/parse" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await billingAuth(body);
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const text = typeof body.text === "string" ? body.text : "";
+      if (!text.trim()) return json({ error: "bad_request" }, 400);
+      const offsetRaw = typeof body.utc_offset_minutes === "number" ? body.utc_offset_minutes : 0;
+      const utcOffsetMinutes = Number.isFinite(offsetRaw) && Math.abs(offsetRaw) <= 14 * 60 ? Math.trunc(offsetRaw) : 0;
+      const tenant = await getTenant(env.DB, tenantId);
+      if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      const rl = await checkRateLimit(env, "billing", tenantId);
+      if (!rl.allowed) return rateLimited(rl);
+      const nowMs = Date.now();
+      const deterministic = parseNaturalCron(text, { utcOffsetMinutes, nowMs });
+      if (deterministic) return json({ ok: true, ...deterministic });
+      // LLM fallback: one quick_command call, strict contract. Any
+      // router refusal (byok_required included) is an unparseable
+      // parse, not a 500 — the caller retries with a clearer phrase.
+      let config;
+      try {
+        config = loadRouterConfig(env);
+      } catch {
+        return json({ error: "router_config_error" }, 500);
+      }
+      const res = await routeLlm(
+        {
+          db: env.DB,
+          masterKeyB64: env.KEY_ENC_SECRET,
+          founderKey: env.FOUNDER_GEMINI_KEY,
+          founderGroqKey: env.FOUNDER_GROQ_KEY,
+          config,
+        },
+        {
+          tenant_id: tenantId,
+          turn_id: `cron-parse-${nowMs}`,
+          kind: "quick_command",
+          messages: [{ role: "user", text }],
+          system: cronLlmSystemPrompt(utcOffsetMinutes),
+        },
+      );
+      if (!res.ok || !res.text) {
+        return json({ error: "unparseable", detail: "Time samajh nahi aaya — dobara saaf shabdon me likho (jaise: har subah 8 baje)" }, 422);
+      }
+      const parsed = llmParseCronText(res.text, nowMs);
+      if (!parsed) {
+        return json({ error: "unparseable", detail: "Time samajh nahi aaya — dobara saaf shabdon me likho (jaise: har subah 8 baje)" }, 422);
+      }
+      return json({ ok: true, ...parsed });
     }
 
     // --- E2B runs (Phase 4) ---
