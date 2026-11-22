@@ -71,12 +71,12 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "4"; // 4: Phase 4 billing — UPI subscriptions + D1 ledger + caps + E2B threshold gating (launch GATED)
+const VERSION = "5"; // 5: B-3 Cloudflare Cron Trigger — hub self-ticks every 5 min (GitHub scheduler bypass; GitHub dispatcher stays as fallback, ticks are idempotent)
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";
 import { handleSync, type SyncRequest } from "./sync";
-import { handleTick, type DispatchStep } from "./cron";
+import { constantTimeEqual, handleTick, type DispatchStep } from "./cron";
 import { checkRateLimit } from "./ratelimit";
 import { d1Batch, getDevice, getTenant, insertTrace, verifyLicenceKey } from "./db";
 import {
@@ -243,6 +243,48 @@ async function dispatchCaptchaAssist(
   return { sent: body.sent === true };
 }
 
+/**
+ * Shared cron-tick runner (B-3: GitHub scheduler bypass).
+ * Used by BOTH entry points so the behaviour is identical:
+ *  - POST /api/cron/tick (GitHub Actions dispatcher, header-secret gated)
+ *  - Cloudflare Cron Trigger (scheduled(), Worker's own CRON_SECRET)
+ * The tick itself is idempotent (cron.ts: cron_fire trace per job+minute),
+ * so a GitHub tick and a Cloudflare tick in the same minute never
+ * double-fire a job. Billing sweeps run after the tick in both paths.
+ */
+export async function runCronTick(
+  env: Env,
+  source: "http" | "cf-cron",
+  cronExpr?: string,
+  scheduledTimeMs?: number,
+): Promise<Record<string, unknown>> {
+  if (source === "cf-cron") {
+    await insertTrace(env.DB, "system", "hub", "cron_trigger", {
+      source: "cf-cron",
+      cron: cronExpr ?? "*/5 * * * *",
+      scheduledTime: scheduledTimeMs ?? Date.now(),
+    });
+  }
+  const dispatch: DispatchStep = async (deviceId, step) => {
+    const id = env.JARVIS_HUB.idFromName(`device:${deviceId}`);
+    const stub = env.JARVIS_HUB.get(id);
+    const res = await stub.fetch(
+      new Request("https://hub/dispatch", {
+        method: "POST",
+        headers: {
+          "x-internal-secret": env.INTERNAL_SECRET ?? "",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ device_id: deviceId, step }),
+      }),
+    );
+    return res.ok;
+  };
+  const result = await handleTick(env.DB, env, env.CRON_SECRET ?? null, dispatch);
+  const sweeps = await runBillingSweeps(env.DB);
+  return { ...result, billing_sweeps: sweeps };
+}
+
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, "") || "/";
@@ -386,29 +428,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return json(result, result.ok ? 200 : 403);
     }
 
-    // Cron tick (secret-gated).
+    // Cron tick (secret-gated). Same runner as the Cloudflare Cron
+    // Trigger (B-3) — behaviour identical in both paths.
     if (path === "/api/cron/tick" && method === "POST") {
-      const dispatch: DispatchStep = async (deviceId, step) => {
-        const id = env.JARVIS_HUB.idFromName(`device:${deviceId}`);
-        const stub = env.JARVIS_HUB.get(id);
-        const res = await stub.fetch(
-          new Request("https://hub/dispatch", {
-            method: "POST",
-            headers: {
-              "x-internal-secret": env.INTERNAL_SECRET ?? "",
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({ device_id: deviceId, step }),
-          }),
-        );
-        return res.ok;
-      };
-      const result = await handleTick(env.DB, env, request.headers.get("x-cron-secret"), dispatch);
-      if (!result.ok && result.error === "unauthorized") return json({ error: "unauthorized" }, 401);
-      // Phase 4 billing sweeps (expiry, pending-payment timeout, renewal
-      // reminders, E2B 15-min auto-kill) — run after the job tick, same secret.
-      const sweeps = await runBillingSweeps(env.DB);
-      return json({ ...result, billing_sweeps: sweeps });
+      if (!env.CRON_SECRET || !constantTimeEqual(request.headers.get("x-cron-secret") ?? "", env.CRON_SECRET)) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const result = await runCronTick(env, "http");
+      return json(result);
     }
 
     // LLM router (Phase 3, stage 3a) — internal-secret gated, server-to-server only.
@@ -1943,5 +1970,21 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     return handleRequest(request, env);
+  },
+  // B-3: Cloudflare Cron Trigger (wrangler.toml [triggers]) — the hub
+  // ticks itself every 5 min, so due scheduled_jobs fire even when
+  // GitHub's scheduler drops/delays the dispatcher. Same runner as the
+  // HTTP tick; idempotency prevents double-fires with GitHub ticks.
+  async scheduled(
+    event: { cron: string; scheduledTime: number },
+    env: Env,
+    ctx: { waitUntil(promise: Promise<unknown>): void },
+  ): Promise<void> {
+    ctx.waitUntil(
+      runCronTick(env, "cf-cron", event.cron, event.scheduledTime).then(
+        (r) => console.log("cf-cron tick", JSON.stringify(r)),
+        (e) => console.log("cf-cron tick failed", String((e as Error)?.message ?? e)),
+      ),
+    );
   },
 };

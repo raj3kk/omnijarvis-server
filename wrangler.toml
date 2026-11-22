@@ -17,3 +17,12 @@ new_sqlite_classes = ["JarvisHub"]
 binding = "DB"
 database_name = "omnijarvis-db"
 database_id = "37a7ff24-9fd2-40f9-b122-82cdaea7e79d"
+
+# B-3: Cloudflare Cron Trigger — the hub ticks itself every 5 min
+# (scheduled() in src/hub.ts). GitHub Actions dispatcher stays as a
+# fallback; ticks are idempotent, so both firing in one minute is safe.
+# NOTE: deploy_omnijarvis_hub.py uploads via the Scripts API (wrangler.toml
+# is NOT read by it), so the trigger must ALSO be set via the Cloudflare
+# API schedules endpoint after deploy — this block is the source of truth.
+[triggers]
+crons = ["*/5 * * * *"]

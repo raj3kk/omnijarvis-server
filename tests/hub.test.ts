@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { handleRequest, route, type Env } from "../src/hub";
+import hubWorker, { handleRequest, route, type Env } from "../src/hub";
 import { FakeD1 } from "./fake-d1";
 import { deriveSixDigit, deriveTenantId } from "../src/pairing";
 import { genHubKey } from "./helpers";
@@ -229,9 +229,9 @@ describe("handleRequest (2a-2 routes, D1 licences)", () => {
     expect(body.key_id).toBeUndefined();
   });
 
-  it("GET / -> version 4 (Phase 4 billing)", async () => {
+  it("GET / -> version 5 (B-3 Cloudflare Cron Trigger)", async () => {
     const body = (await route("/").json()) as Record<string, unknown>;
-    expect(body.version).toBe("4");
+    expect(body.version).toBe("5");
   });
 
   it("pairing code: derives from token", async () => {
@@ -304,6 +304,35 @@ describe("handleRequest (2a-2 routes, D1 licences)", () => {
     const db = new FakeD1();
     const res = await handleRequest(new Request("https://hub/nope"), fakeEnv(db));
     expect(res.status).toBe(404);
+  });
+});
+
+describe("Cloudflare Cron Trigger (B-3: hub self-tick)", () => {
+  it("scheduled() runs the tick with the Worker's own secret + writes a cron_trigger trace", async () => {
+    const db = new FakeD1();
+    const env = fakeEnv(db);
+    let pending: Promise<unknown> | undefined;
+    const ctx = { waitUntil: (p: Promise<unknown>) => { pending = p; } };
+    await hubWorker.scheduled({ cron: "*/5 * * * *", scheduledTime: Date.now() }, env, ctx);
+    await pending;
+    const traces = (await db.prepare("SELECT * FROM traces").bind().all()).results as Record<string, unknown>[];
+    const trigger = traces.find((t) => t.kind === "cron_trigger");
+    expect(trigger).toBeDefined();
+    expect(JSON.parse(String(trigger!.detail)).source).toBe("cf-cron");
+  });
+
+  it("HTTP tick with correct secret -> 200 ok:true (refactor preserved)", async () => {
+    const db = new FakeD1();
+    const res = await handleRequest(
+      new Request("https://hub/api/cron/tick", {
+        method: "POST",
+        headers: { "x-cron-secret": "test-cron" },
+      }),
+      fakeEnv(db),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.ok).toBe(true);
   });
 });
 
