@@ -118,7 +118,7 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "18"; // 18: R2 shared memory — /api/admin/train + /api/memory/list + sync memories/events + Main run-start recall + memory_push + cap 2000; 17 was Main Executor v1 (R1)
+const VERSION = "19"; // 19: R3 live screen + tap-to-operate — DO __live_screen__ marker + /live-screen route + captcha slider/geetest known types (detect-only, never auto-solve); 18 was R2 shared memory
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";

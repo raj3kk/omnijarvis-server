@@ -32,6 +32,14 @@
  *   no command executes from it — so it is NOT signed; the session
  *   itself is paired + HELLO-verified. A solution/token value is
  *   NEVER read, traced, or stored.
+ * - Live screen (R3.1, U22): the device streams OCR text/events as
+ *   signed LIVE_SCREEN WS messages; the DO forwards them to the OTHER
+ *   sockets of this DO (admin viewer, R4) — never echoed to the
+ *   sender, never traced, never stored. Worker -> DO dispatch is POST
+ *   /live-screen (secret-gated), queued as a "__live_screen__" marked
+ *   row when offline and flushed RAW on the next HELLO (MEMORY_PUSH
+ *   pattern). Pixels never reach the hub; sensitive screen kinds
+ *   (otp/banking/password/payment) are dropped at the DO.
  *
  * SQLite tables (DO built-in): sessions, nonces, pending_steps.
  * Presence = WS connection itself (C1) — no heartbeat polling.
@@ -59,6 +67,9 @@ import {
 const NONCE_TTL_MS = 300_000; // 5 min
 const HELLO_TIMEOUT_MS = 30_000; // 30s
 const MAX_PENDING_PER_DEVICE = 50;
+// R3.1: live-screen kinds the DO never forwards (defense in depth —
+// the phone excludes them first; the hub drops them here too).
+const LIVE_SCREEN_SENSITIVE_KINDS = new Set(["otp", "banking", "password", "payment"]);
 
 interface DeviceMessage {
   type: string;
@@ -298,8 +309,17 @@ export class JarvisHub extends DurableObject<Env> {
       // as RAW events (never signed as EXECUTE_STEP), then deleted.
       // R2.4: same for queued MEMORY_PUSH events (marker
       // "__memory_push__" — the phone pulls the rows after the notice).
-      if (step && typeof step === "object" && ("__captcha_assist__" in step || "__memory_push__" in step)) {
-        const event = (step["__captcha_assist__"] ?? step["__memory_push__"]) as Record<string, unknown>;
+      // R3.1: same for queued LIVE_SCREEN events (marker
+      // "__live_screen__" — text/events only, never pixels).
+      if (
+        step &&
+        typeof step === "object" &&
+        ("__captcha_assist__" in step || "__memory_push__" in step || "__live_screen__" in step)
+      ) {
+        const event = (step["__captcha_assist__"] ?? step["__memory_push__"] ?? step["__live_screen__"]) as Record<
+          string,
+          unknown
+        >;
         try {
           ws.send(JSON.stringify(event));
         } catch {
@@ -360,11 +380,15 @@ export class JarvisHub extends DurableObject<Env> {
    * R2.4: MEMORY_PUSH uses the same shape with marker
    * "__memory_push__" — the event carries ids/counts only, never
    * memory content; the phone pulls the rows from /api/memory/list.
+   * R3.1: LIVE_SCREEN uses the same shape with marker
+   * "__live_screen__" — the event carries OCR text/events only,
+   * never pixels; a connected admin viewer (R4) reads the screen
+   * through it, the phone never re-reads its own frames.
    */
   private async queueOrSendEvent(
     deviceId: string,
     event: Record<string, unknown>,
-    marker: "__captcha_assist__" | "__memory_push__" = "__captcha_assist__",
+    marker: "__captcha_assist__" | "__memory_push__" | "__live_screen__" = "__captcha_assist__",
   ): Promise<boolean> {
     if (this.authenticatedDeviceId === deviceId && this.sockets.size > 0) {
       for (const ws of this.sockets) {
@@ -445,6 +469,27 @@ export class JarvisHub extends DurableObject<Env> {
       const sent = await this.queueOrSendEvent(body.device_id, body.event, "__memory_push__");
       return Response.json({ ok: true, sent });
     }
+    // R3.1: LIVE_SCREEN dispatch (Worker -> DO): POST /live-screen,
+    // secret-gated. Body: {device_id, event:{type:"LIVE_SCREEN", ...}}.
+    // Same shape as /memory-push — live send on an authenticated
+    // socket, else queued as a "__live_screen__" marked row and flushed
+    // RAW on the next HELLO. The event carries OCR text/events only —
+    // never pixels, never screen content from sensitive kinds.
+    if (path === "/live-screen" && request.method === "POST") {
+      const secret = (this.env as unknown as Record<string, string | undefined>).INTERNAL_SECRET;
+      if (!secret || request.headers.get("x-internal-secret") !== secret) {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+      const body = (await request.json()) as { device_id?: string; event?: Record<string, unknown> };
+      if (!body.device_id || !body.event || body.event.type !== "LIVE_SCREEN") {
+        return Response.json({ error: "bad_request" }, { status: 400 });
+      }
+      if (this.expectedDeviceId && body.device_id !== this.expectedDeviceId) {
+        return Response.json({ error: "device_mismatch" }, { status: 400 });
+      }
+      const sent = await this.queueOrSendEvent(body.device_id, body.event, "__live_screen__");
+      return Response.json({ ok: true, sent });
+    }
     // WS upgrade (Worker routes /ws/:deviceId here with x-expected-device).
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("expected websocket", { status: 426 });
@@ -474,7 +519,13 @@ export class JarvisHub extends DurableObject<Env> {
       ws.send(JSON.stringify({ type: "PONG" }));
       return;
     }
-    if (msg.type !== "HELLO" && msg.type !== "STEP_RESULT" && msg.type !== "CAPTCHA_DETECTED" && msg.type !== "CAPTCHA_RESOLVED") {
+    if (
+      msg.type !== "HELLO" &&
+      msg.type !== "STEP_RESULT" &&
+      msg.type !== "CAPTCHA_DETECTED" &&
+      msg.type !== "CAPTCHA_RESOLVED" &&
+      msg.type !== "LIVE_SCREEN"
+    ) {
       ws.close(4400, "unknown_type");
       return;
     }
@@ -528,6 +579,39 @@ export class JarvisHub extends DurableObject<Env> {
     if (msg.type === "CAPTCHA_RESOLVED") {
       await this.handleCaptchaResolved(msg.device_id, payload);
       ws.send(JSON.stringify({ type: "ACK", id: typeof payload.task_id === "string" ? payload.task_id : null }));
+      return;
+    }
+    // R3.1: device-reported live-screen frame (OCR text/events from the
+    // phone's LiveScreenWatcher). Signed + verified above, same as
+    // HELLO/STEP_RESULT. Forwarded to the OTHER sockets of this DO
+    // (admin viewer, R4) — never echoed back to the sender, never
+    // traced, never stored (events pass through the DO only). Sensitive
+    // screen kinds are dropped here too (defense in depth — the phone
+    // excludes them first; the hub never forwards them). A frame with
+    // no text is dropped silently; a malformed frame never closes the
+    // session.
+    if (msg.type === "LIVE_SCREEN") {
+      const kind = typeof payload.screen_kind === "string" ? payload.screen_kind : "unknown";
+      if (LIVE_SCREEN_SENSITIVE_KINDS.has(kind)) return;
+      const text = typeof payload.text === "string" ? payload.text : "";
+      if (!text) return;
+      const boxes = Array.isArray(payload.boxes) ? payload.boxes : [];
+      const event = {
+        type: "LIVE_SCREEN",
+        device_id: msg.device_id,
+        text: text.slice(0, 4000),
+        boxes,
+        screen_kind: kind,
+        at: Date.now(),
+      };
+      for (const other of this.sockets) {
+        if (other === ws) continue;
+        try {
+          other.send(JSON.stringify(event));
+        } catch {
+          // socket dead — skip it, never break the session
+        }
+      }
       return;
     }
     // STEP_RESULT: trace it (D1) + ack.

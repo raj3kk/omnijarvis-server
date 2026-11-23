@@ -310,7 +310,9 @@ describe("request validation + image-size gate (DESIGN §2.4)", () => {
     expect(validateSolveRequest(solveBody({ image_b64: undefined })).ok).toBe(false);
     expect(validateSolveRequest(solveBody({ auto_solve_allowed: false })).ok).toBe(false);
     expect(validateSolveRequest(solveBody({ auto_solve_allowed: undefined })).ok).toBe(false);
-    expect(validateSolveRequest(solveBody({ challenge_type: "slider" })).ok).toBe(false);
+    expect(validateSolveRequest(solveBody({ challenge_type: "slider" })).ok).toBe(true); // R3.7: known, detect-only
+    expect(validateSolveRequest(solveBody({ challenge_type: "geetest" })).ok).toBe(true); // R3.7: known, detect-only
+    expect(validateSolveRequest(solveBody({ challenge_type: "recaptcha_v3" })).ok).toBe(false);
     expect(validateSolveRequest(solveBody({ task_id: "" })).ok).toBe(false);
     expect(validateSolveRequest(solveBody({ image_b64: "!!!not-base64!!!" })).ok).toBe(false);
     // Oversized: 200 KB + 1 byte decoded.
@@ -655,7 +657,7 @@ describe("POST /api/captcha/solve route matrix (DESIGN §8.1/§8.4)", () => {
     expect(missing.status).toBe(400);
     const flagOff = await signedSolve(db, key, solveBody({ auto_solve_allowed: false }), { masterB64: master });
     expect(flagOff.status).toBe(400);
-    const badType = await signedSolve(db, key, solveBody({ challenge_type: "slider" }), { masterB64: master });
+    const badType = await signedSolve(db, key, solveBody({ challenge_type: "recaptcha_v3" }), { masterB64: master });
     expect(badType.status).toBe(400);
     const big = Buffer.alloc(MAX_CAPTCHA_IMAGE_BYTES + 1, 0x41).toString("base64");
     const oversized = await signedSolve(db, key, solveBody({ image_b64: big }), { masterB64: master });

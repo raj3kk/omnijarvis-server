@@ -65,12 +65,18 @@ export const CAPTCHA_SOLVE_CHAIN_BYOK = [MODEL_35, MODEL_31, MODEL_GROQ_VISION] 
 /** Founder-pays cost-first order (gated — no founder key live, so BYOK in practice). */
 export const CAPTCHA_SOLVE_CHAIN_FOUNDER = [MODEL_31, MODEL_35, MODEL_GROQ_VISION] as const;
 
-/** Challenge types the route accepts (DESIGN §2.4 + §4.1 audit values). */
+/** Challenge types the route accepts (DESIGN §2.4 + §4.1 audit values).
+ * R3.7: "slider" + "geetest" are KNOWN (detection + human-assist) but
+ * NEVER auto-solvable — they stay out of AUTO_SOLVABLE_TYPES (D3 lock).
+ * The route accepts them and solveCaptcha answers not_allowed (200),
+ * exactly like turnstile. */
 export const KNOWN_CHALLENGE_TYPES = [
   "recaptcha_grid",
   "hcaptcha_grid",
   "text",
   "turnstile",
+  "slider",
+  "geetest",
   "audio",
   "unknown",
 ] as const;
@@ -478,7 +484,9 @@ export async function solveCaptcha(deps: CaptchaDeps, input: SolveCaptchaInput):
   };
 
   // Scope: only grids + simple text are solvable (DESIGN §5). Anything
-  // else (audio, Turnstile, v3, unknown) is human-only by design.
+  // else (audio, Turnstile, slider, geetest, v3, unknown) is human-only
+  // by design — R3.7 policy (D3 lock): slider/geetest are detection +
+  // human-assist only, never auto-solved.
   if (!isAutoSolvableType(challenge_type)) {
     await record({ model: null, confidence: null, outcome: "not_allowed", attempts: 0, latency_ms: elapsed() });
     return failure(solveId, "not_allowed", 0, elapsed());
