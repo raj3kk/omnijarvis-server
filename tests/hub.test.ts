@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import hubWorker, { handleRequest, route, type Env } from "../src/hub";
 import { FakeD1 } from "./fake-d1";
 import { deriveSixDigit, deriveTenantId } from "../src/pairing";
@@ -229,9 +229,9 @@ describe("handleRequest (2a-2 routes, D1 licences)", () => {
     expect(body.key_id).toBeUndefined();
   });
 
-  it("GET / -> version 20 (Models + admin website + FCM triggers, R4)", async () => {
+  it("GET / -> version 21 (G-17 observability first-use)", async () => {
     const body = (await route("/").json()) as Record<string, unknown>;
-    expect(body.version).toBe("20");
+    expect(body.version).toBe("21");
   });
 
   it("pairing code: derives from token", async () => {
@@ -363,5 +363,98 @@ describe("keepalive probe (2a-4: real checks, D1 licences)", () => {
     const body = (await res.json()) as Record<string, any>;
     expect(body.checks.d1.devices).toBe(1);
     expect(body.checks.licences.count).toBe(1);
+  });
+});
+
+describe("POST /api/observability/probe (G-17 first-use)", () => {
+  it("admin token -> awaits Sentry + Langfuse and returns the accepted ids", async () => {
+    const db = new FakeD1();
+    const seen: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      async (url: string) => {
+        seen.push(String(url));
+        if (String(url).includes("sentry.example.com")) {
+          return new Response(JSON.stringify({ id: "srv-event-1" }), { status: 200 });
+        }
+        return new Response("", { status: 200 });
+      },
+    );
+    try {
+      const res = await handleRequest(
+        new Request("https://hub/api/observability/probe", {
+          method: "POST",
+          headers: { "x-admin-token": "adm-1" },
+        }),
+        fakeEnv(db, {
+          LLM_ADMIN_TOKEN: "adm-1",
+          SENTRY_DSN: "https://pubkey123@sentry.example.com/42",
+          LANGFUSE_PUBLIC_KEY: "pk_test",
+          LANGFUSE_SECRET_KEY: "sk_test",
+        }),
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        ok: boolean;
+        sentry: { configured: boolean; event_id: string | null };
+        langfuse: { configured: boolean; trace_id: string | null };
+      };
+      expect(body.ok).toBe(true);
+      expect(body.sentry.configured).toBe(true);
+      expect(body.sentry.event_id).toBe("srv-event-1");
+      expect(body.langfuse.configured).toBe(true);
+      expect(typeof body.langfuse.trace_id).toBe("string");
+      expect(String(body.langfuse.trace_id)).toMatch(/^[0-9a-f]{32}$/);
+      expect(seen.some((u) => u.includes("/api/public/otel/v1/traces"))).toBe(true);
+      expect(seen.some((u) => u.includes("/api/42/envelope/"))).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("no admin token -> 401, senders never called", async () => {
+    const db = new FakeD1();
+    const fetchFn = vi.fn(async () => new Response("", { status: 200 }));
+    vi.stubGlobal("fetch", fetchFn);
+    try {
+      const res = await handleRequest(
+        new Request("https://hub/api/observability/probe", { method: "POST" }),
+        fakeEnv(db, {
+          LLM_ADMIN_TOKEN: "adm-1",
+          SENTRY_DSN: "https://pubkey123@sentry.example.com/42",
+          LANGFUSE_PUBLIC_KEY: "pk_test",
+          LANGFUSE_SECRET_KEY: "sk_test",
+        }),
+      );
+      expect(res.status).toBe(401);
+      expect(fetchFn).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("sinks unconfigured -> 200 with null ids (probe is honest, never faked)", async () => {
+    const db = new FakeD1();
+    const fetchFn = vi.fn(async () => new Response("", { status: 200 }));
+    vi.stubGlobal("fetch", fetchFn);
+    try {
+      const res = await handleRequest(
+        new Request("https://hub/api/observability/probe", {
+          method: "POST",
+          headers: { "x-admin-token": "adm-1" },
+        }),
+        fakeEnv(db, { LLM_ADMIN_TOKEN: "adm-1" }),
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        sentry: { configured: boolean; event_id: string | null };
+        langfuse: { configured: boolean; trace_id: string | null };
+      };
+      expect(body.sentry).toEqual({ configured: false, event_id: null });
+      expect(body.langfuse).toEqual({ configured: false, trace_id: null });
+      expect(fetchFn).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

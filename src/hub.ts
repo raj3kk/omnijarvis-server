@@ -118,7 +118,7 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "20"; // 20: R4 models + admin website + FCM triggers — /admin console, pairing auto-flow, Gmail-send idempotency (0017), cap-warning emails, U8 approve signal, Drive write + Calendar, OAuth refresh live-proven; 19 was R3 live screen
+const VERSION = "21"; // 21: G-17 observability first-use — Sentry call site + Langfuse OTel rewrite + /api/observability/probe; 20 was R4 models + admin website + FCM triggers
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";
@@ -279,7 +279,7 @@ import {
 } from "./google";
 import { linkSolveOutcome, solveCaptcha, validateSolveRequest } from "./captcha";
 import { getFcmRegistration, registerFcmToken, sendFcm } from "./fcm";
-import { isLangfuseConfigured, isSentryConfigured, langfuseHost } from "./observability";
+import { captureError, isLangfuseConfigured, isSentryConfigured, langfuseHost, trace } from "./observability";
 import {
   createPullRequest,
   getFileContent,
@@ -1090,7 +1090,17 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
               : undefined,
         },
       );
-      if (result.ok) return json(result);
+      if (result.ok) {
+        // G-17: one Langfuse trace per successful LLM turn (metadata
+        // only — never prompt/response text). Fire-and-forget: trace()
+        // never throws and never blocks the response.
+        void trace(env, "llm_route", {
+          tenant_id: tenantId,
+          kind: typeof body.kind === "string" ? body.kind : "quick_command",
+          turn_id: typeof body.turn_id === "string" ? body.turn_id : "",
+        });
+        return json(result);
+      }
       const code = result.error_code ?? "upstream_error";
       const status =
         code === "byok_required"
@@ -2460,6 +2470,30 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         langfuse: { configured: langfuseConfigured, host: langfuseConfigured ? langfuseHost(env) : null },
         sentry: { configured: isSentryConfigured(env) },
         upstash: upstashStatus(env),
+      });
+    }
+
+    // POST /api/observability/probe — admin: first-use probe (G-17).
+    // Awaits one Sentry event + one Langfuse trace through the live
+    // senders and returns the vendor-accepted ids (null = not
+    // configured, or the vendor rejected the send). ADMIN-ONLY
+    // (x-admin-token). No PII: the event is a synthetic probe error,
+    // the trace carries only route metadata.
+    if (path === "/api/observability/probe" && method === "POST") {
+      if (!env.LLM_ADMIN_TOKEN || request.headers.get("x-admin-token") !== env.LLM_ADMIN_TOKEN) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const [sentryId, traceId] = await Promise.all([
+        captureError(env, new Error("observability probe"), {
+          route: "observability_probe",
+          source: "g17_probe",
+        }),
+        trace(env, "observability_probe", { route: "observability_probe", source: "g17_probe" }),
+      ]);
+      return json({
+        ok: true,
+        sentry: { configured: isSentryConfigured(env), event_id: sentryId },
+        langfuse: { configured: isLangfuseConfigured(env), trace_id: traceId },
       });
     }
 
@@ -4185,6 +4219,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     return json({ error: "not_found" }, 404);
     return json({ error: "not_found" }, 404);
   } catch (e) {
+    // G-17: first Sentry call site — fire-and-forget; captureError
+    // never throws and never blocks the 500 response.
+    void captureError(env, e, { route: "handleRequest" });
     return json({ error: "server_error", detail: String((e as Error)?.message ?? e) }, 500);
   }
 }

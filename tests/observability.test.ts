@@ -41,41 +41,95 @@ describe("langfuseHost / isLangfuseConfigured", () => {
   });
 });
 
-describe("trace() — Langfuse ingestion", () => {
-  it("env unset -> fetch never called (silent no-op)", async () => {
+describe("trace() — Langfuse OTel ingestion (v3 removed 2026-11-16, G-17)", () => {
+  it("env unset -> fetch never called (silent no-op), returns null", async () => {
     const fetchFn = vi.fn(async () => okJson({}));
-    await trace({}, "x", {}, { fetchFn: fetchFn as unknown as typeof fetch });
+    await expect(trace({}, "x", {}, { fetchFn: fetchFn as unknown as typeof fetch })).resolves.toBeNull();
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
-  it("posts a trace-create batch with Basic auth to /api/public/ingestion", async () => {
+  it("posts one root OTel span with Basic auth + ingestion-version 4 to /api/public/otel/v1/traces", async () => {
     const seen: { url: string; init: RequestInit }[] = [];
     const fetchFn = (async (url: string, init?: RequestInit) => {
       seen.push({ url, init: init ?? {} });
-      return okJson({ success: true });
+      return okJson({});
     }) as unknown as typeof fetch;
-    await trace(LANGFUSE_ENV, "memory_store", { tenant_id: "t-1", kind: "fact" }, { fetchFn });
+    const traceId = await trace(
+      LANGFUSE_ENV,
+      "memory_store",
+      { tenant_id: "t-1", kind: "fact", count: 3 },
+      { fetchFn },
+    );
+    expect(typeof traceId).toBe("string");
+    expect(String(traceId)).toMatch(/^[0-9a-f]{32}$/);
     expect(seen).toHaveLength(1);
-    expect(seen[0].url).toBe("https://cloud.langfuse.com/api/public/ingestion");
+    expect(seen[0].url).toBe("https://cloud.langfuse.com/api/public/otel/v1/traces");
     expect(seen[0].init.method).toBe("POST");
     const headers = seen[0].init.headers as Record<string, string>;
     expect(headers.Authorization).toBe(`Basic ${btoa("pk_test:sk_test")}`);
+    expect(headers["x-langfuse-ingestion-version"]).toBe("4");
     const body = JSON.parse(String(seen[0].init.body)) as {
-      batch: Array<{ type: string; body: { name: string; metadata: Record<string, unknown> } }>;
+      resourceSpans: Array<{
+        resource: { attributes: Array<{ key: string; value: { stringValue: string } }> };
+        scopeSpans: Array<{
+          scope: { name: string };
+          spans: Array<{
+            traceId: string;
+            spanId: string;
+            name: string;
+            startTimeUnixNano: string;
+            endTimeUnixNano: string;
+            attributes: Array<{ key: string; value: { stringValue?: string; intValue?: string } }>;
+          }>;
+        }>;
+      }>;
     };
-    expect(body.batch).toHaveLength(1);
-    expect(body.batch[0].type).toBe("trace-create");
-    expect(body.batch[0].body.name).toBe("memory_store");
-    expect(body.batch[0].body.metadata).toEqual({ tenant_id: "t-1", kind: "fact" });
+    expect(body.resourceSpans).toHaveLength(1);
+    expect(body.resourceSpans[0].resource.attributes).toEqual([
+      { key: "service.name", value: { stringValue: "omnijarvis-hub" } },
+    ]);
+    const spans = body.resourceSpans[0].scopeSpans[0].spans;
+    expect(spans).toHaveLength(1);
+    expect(spans[0].traceId).toBe(traceId);
+    expect(spans[0].traceId).toMatch(/^[0-9a-f]{32}$/);
+    expect(spans[0].spanId).toMatch(/^[0-9a-f]{16}$/);
+    expect(spans[0].name).toBe("memory_store");
+    expect(spans[0].startTimeUnixNano).toMatch(/^\d+$/);
+    expect(spans[0].endTimeUnixNano).toMatch(/^\d+$/);
+    expect(BigInt(spans[0].endTimeUnixNano) > BigInt(spans[0].startTimeUnixNano)).toBe(true);
+    const attrs = new Map(spans[0].attributes.map((a) => [a.key, a.value]));
+    expect(attrs.get("tenant_id")).toEqual({ stringValue: "t-1" });
+    expect(attrs.get("kind")).toEqual({ stringValue: "fact" });
+    expect(attrs.get("count")).toEqual({ intValue: "3" });
+    // Trace-level metadata is duplicated under langfuse.trace.metadata.*.
+    expect(attrs.get("langfuse.trace.metadata.tenant_id")).toEqual({ stringValue: "t-1" });
+    expect(attrs.get("langfuse.trace.metadata.kind")).toEqual({ stringValue: "fact" });
+    expect(attrs.get("langfuse.trace.metadata.count")).toEqual({ intValue: "3" });
   });
 
-  it("non-ok status and network throw both resolve (never block the request path)", async () => {
+  it("non-scalar metadata is dropped, never serialised", async () => {
+    const seen: { url: string; init: RequestInit }[] = [];
+    const fetchFn = (async (url: string, init?: RequestInit) => {
+      seen.push({ url, init: init ?? {} });
+      return okJson({});
+    }) as unknown as typeof fetch;
+    await trace(LANGFUSE_ENV, "x", { ok: "yes", nested: { secret: "no" }, list: [1] }, { fetchFn });
+    const body = JSON.parse(String(seen[0].init.body)) as {
+      resourceSpans: Array<{ scopeSpans: Array<{ spans: Array<{ attributes: Array<{ key: string }> }> }> }>;
+    };
+    const keys = body.resourceSpans[0].scopeSpans[0].spans[0].attributes.map((a) => a.key);
+    expect(keys).toContain("ok");
+    expect(keys).not.toContain("nested");
+    expect(keys).not.toContain("list");
+  });
+
+  it("non-ok status and network throw both resolve null (never block the request path)", async () => {
     const errFetch = (async () => new Response("no", { status: 500 })) as unknown as typeof fetch;
-    await expect(trace(LANGFUSE_ENV, "x", {}, { fetchFn: errFetch })).resolves.toBeUndefined();
+    await expect(trace(LANGFUSE_ENV, "x", {}, { fetchFn: errFetch })).resolves.toBeNull();
     const throwFetch = (async () => {
       throw new Error("down");
     }) as unknown as typeof fetch;
-    await expect(trace(LANGFUSE_ENV, "x", {}, { fetchFn: throwFetch })).resolves.toBeUndefined();
+    await expect(trace(LANGFUSE_ENV, "x", {}, { fetchFn: throwFetch })).resolves.toBeNull();
   });
 });
 
@@ -99,11 +153,27 @@ describe("parseSentryDsn / isSentryConfigured", () => {
 });
 
 describe("captureError() — Sentry envelope", () => {
-  it("env unset / bad DSN -> fetch never called", async () => {
+  it("env unset / bad DSN -> fetch never called, resolves null", async () => {
     const fetchFn = vi.fn(async () => okJson({}));
-    await captureError({}, new Error("x"), {}, { fetchFn: fetchFn as unknown as typeof fetch });
-    await captureError({ SENTRY_DSN: "garbage" }, new Error("x"), {}, { fetchFn: fetchFn as unknown as typeof fetch });
+    await expect(
+      captureError({}, new Error("x"), {}, { fetchFn: fetchFn as unknown as typeof fetch }),
+    ).resolves.toBeNull();
+    await expect(
+      captureError({ SENTRY_DSN: "garbage" }, new Error("x"), {}, { fetchFn: fetchFn as unknown as typeof fetch }),
+    ).resolves.toBeNull();
     expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it("returns the vendor-accepted id from the ingest response", async () => {
+    const fetchFn = (async () => okJson({ id: "srv-event-1" })) as unknown as typeof fetch;
+    await expect(captureError(SENTRY_ENV, new Error("x"), {}, { fetchFn })).resolves.toBe("srv-event-1");
+  });
+
+  it("2xx with a non-JSON body -> returns the generated event id", async () => {
+    const fetchFn = (async () => new Response("ok", { status: 200 })) as unknown as typeof fetch;
+    const id = await captureError(SENTRY_ENV, new Error("x"), {}, { fetchFn });
+    expect(typeof id).toBe("string");
+    expect(String(id)).toMatch(/^[0-9a-f]{32}$/);
   });
 
   it("posts a newline-delimited envelope with X-Sentry-Auth and the exception", async () => {
@@ -131,12 +201,12 @@ describe("captureError() — Sentry envelope", () => {
     expect(event.tags).toEqual({ tenant_id: "t-1", route: "memory_store" });
   });
 
-  it("non-ok status and network throw both resolve", async () => {
+  it("non-ok status and network throw both resolve null", async () => {
     const errFetch = (async () => new Response("no", { status: 500 })) as unknown as typeof fetch;
-    await expect(captureError(SENTRY_ENV, new Error("x"), {}, { fetchFn: errFetch })).resolves.toBeUndefined();
+    await expect(captureError(SENTRY_ENV, new Error("x"), {}, { fetchFn: errFetch })).resolves.toBeNull();
     const throwFetch = (async () => {
       throw new Error("down");
     }) as unknown as typeof fetch;
-    await expect(captureError(SENTRY_ENV, new Error("x"), {}, { fetchFn: throwFetch })).resolves.toBeUndefined();
+    await expect(captureError(SENTRY_ENV, new Error("x"), {}, { fetchFn: throwFetch })).resolves.toBeNull();
   });
 });
