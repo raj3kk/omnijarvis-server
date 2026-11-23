@@ -35,6 +35,7 @@
  * instead, and every Main call is still metered (llm_usage rows).
  */
 import { getTenant, insertTrace, type D1Like } from "./db";
+import { listMemoriesByKind, loadApprovedPatterns } from "./memory";
 import { loadRouterConfig, routeLlm } from "./router";
 import {
   createBranch,
@@ -589,6 +590,46 @@ const TOKEN_UNBLOCK_INSTRUCTIONS =
   "PUT /accounts/{account_id}/workers/scripts/omnijarvis-hub/secrets with {\"name\": \"GITHUB_ADMIN_TOKEN\", \"text\": \"<token>\", \"type\": \"secret_text\"}. " +
   "Then re-run POST /api/main/step {\"job_id\": \"<id>\"} to resume — no rebuild needed.";
 
+/**
+ * R2.3 U19: run-start recall — what Main knows before it plans.
+ * Approved learned_patterns (admin first, cap 20) + recent
+ * kind='admin_training' memories (cap 10). `learned_patterns` has NO
+ * tenant column (templates only, global); memories are per-tenant.
+ * Admin rows outrank user rows; on a conflict the admin row wins and
+ * the architect is told to say so. Content goes ONLY into the LLM
+ * prompt — the transcript records counts, never content.
+ */
+export interface MainRecall {
+  patterns: Array<{ template: string; source: string }>;
+  memories: Array<{ content: string; kind: string }>;
+}
+
+export async function loadMainRecall(db: D1Like, tenantId: string): Promise<MainRecall> {
+  const patterns = await loadApprovedPatterns(db, 20);
+  const memories = await listMemoriesByKind(db, tenantId, "admin_training", 10);
+  return {
+    patterns: patterns.map((p) => ({ template: p.template, source: p.source })),
+    memories: memories.map((m) => ({ content: m.content, kind: m.kind })),
+  };
+}
+
+export function formatMainRecall(recall: MainRecall): string {
+  const lines: string[] = [];
+  if (recall.patterns.length > 0) {
+    lines.push("Learned guidance (approved patterns — [admin] outranks [user]; if one conflicts with the repo map, the [admin] row wins and say so in the plan):");
+    for (const p of recall.patterns) {
+      lines.push(`- [${p.source}] ${p.template}`);
+    }
+  }
+  if (recall.memories.length > 0) {
+    lines.push("Admin training memories:");
+    for (const m of recall.memories) {
+      lines.push(`- ${m.content}`);
+    }
+  }
+  return lines.join("\n");
+}
+
 // --- Step machine ---
 
 type StepOutcome = { done: boolean; retryable?: boolean; note: string; error?: string };
@@ -619,12 +660,30 @@ async function stepLocalize(env: MainEnv, job: MainJob): Promise<StepOutcome> {
     phase: "repo-map",
     note: `repo map built: ${mapRes.data.files} files, ${mapRes.data.symbols} symbols${mapRes.data.truncated ? " (truncated)" : ""}`,
   });
+  // R2.3: run-start recall — approved patterns + admin training
+  // memories go into the architect prompt, labelled. A recall read
+  // failure never blocks the job (empty recall = plan without it).
+  let recallBlock = "";
+  try {
+    const recall = await loadMainRecall(env.DB, job.tenant_id);
+    const adminPatterns = recall.patterns.filter((p) => p.source === "admin").length;
+    await appendTranscript(env.DB, job, {
+      phase: "recall",
+      note: `recall loaded: ${recall.patterns.length} patterns (${adminPatterns} admin) + ${recall.memories.length} admin memories`,
+    });
+    recallBlock = formatMainRecall(recall);
+  } catch {
+    await appendTranscript(env.DB, job, {
+      phase: "recall",
+      note: "recall read failed — planning without it",
+    });
+  }
   const call = await callMainLlm(
     env,
     job,
     "architect",
     ARCHITECT_SYSTEM,
-    `Ask: ${job.ask}\n\nRepo map:\n${mapRes.data.map}`,
+    `Ask: ${job.ask}\n\nRepo map:\n${mapRes.data.map}${recallBlock ? `\n\n${recallBlock}` : ""}`,
   );
   if (!call.ok) {
     if (call.error === "job_llm_budget_exhausted") return { done: false, note: "job LLM budget exhausted", error: call.error };

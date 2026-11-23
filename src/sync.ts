@@ -4,7 +4,9 @@
  * Auth: device paired hona chahiye (D1 devices lookup) + request signed
  * hona chahiye (device Ed25519 key, canonical string — crypto.ts).
  * Sync scope (Pehle-Jaanch §3.4): traces + counters + job acks.
- * Chat history (30 turns) device-local rehti hai — sync nahi hoti.
+ * R2.2: + "memories" (Trained Jarvis docs -> D1, embedded here) +
+ * "events" (shared event log -> jarvis_events, 0016). Chat history
+ * (30 turns) device-local rehti hai — sync nahi hoti.
  *
  * Conflict rule (frozen): SERVER-WINS. Device apna last_seq bhejta hai;
  * server apna last_seq deta hai; device ka seq peeche ho to device apna
@@ -14,10 +16,11 @@
 
 import { isTimestampFresh, verifySignature } from "./crypto";
 import { getDevice, insertTrace, type D1Like } from "./db";
+import { embedText, storeMemory, type EmbedDeps } from "./memory";
 
 export interface SyncRequest {
   device_id: string;
-  table: "traces" | "counters";
+  table: "traces" | "counters" | "memories" | "events";
   rows: Record<string, unknown>[];
   last_seq: number;
   nonce: string;
@@ -32,7 +35,15 @@ export interface SyncResult {
   error?: string;
 }
 
-export async function handleSync(db: D1Like, req: SyncRequest, rawRowsJson: string): Promise<SyncResult> {
+/** Max rows per sync call for the embedding tables (bounds LLM work). */
+export const SYNC_MEMORY_MAX_ROWS = 100;
+
+export async function handleSync(
+  db: D1Like,
+  req: SyncRequest,
+  rawRowsJson: string,
+  embedDeps?: EmbedDeps,
+): Promise<SyncResult> {
   const device = await getDevice(db, req.device_id);
   if (!device || device.enabled === 0) {
     return { ok: false, server_seq: 0, accepted: 0, error: "device_not_paired" };
@@ -57,6 +68,54 @@ export async function handleSync(db: D1Like, req: SyncRequest, rawRowsJson: stri
       const kind = typeof row.kind === "string" ? row.kind : "unknown";
       const detail = (row.detail as Record<string, unknown>) ?? {};
       await insertTrace(db, device.tenant_id, req.device_id, kind, detail);
+      accepted++;
+    }
+  } else if (req.table === "memories") {
+    // R2.2: Trained Jarvis docs -> D1 memories (embedded here, kind
+    // preserved). Two phases: embed ALL first, store after — an embed
+    // failure stores NOTHING, so a retry never duplicates rows.
+    if (req.rows.length > SYNC_MEMORY_MAX_ROWS) {
+      return { ok: false, server_seq: 0, accepted: 0, error: "too_many_rows" };
+    }
+    if (!embedDeps) {
+      return { ok: false, server_seq: 0, accepted: 0, error: "embed_unavailable" };
+    }
+    const clean: Array<{ content: string; kind: string }> = [];
+    for (const row of req.rows) {
+      const content = typeof row.content === "string" ? row.content.trim() : "";
+      if (!content) return { ok: false, server_seq: 0, accepted: 0, error: "content_required" };
+      if (content.length > 4000) return { ok: false, server_seq: 0, accepted: 0, error: "content_too_long" };
+      const kind = typeof row.kind === "string" && row.kind.trim() ? row.kind : "fact";
+      clean.push({ content, kind });
+    }
+    const embeddings: number[][] = [];
+    for (let i = 0; i < clean.length; i++) {
+      const emb = await embedText(embedDeps, device.tenant_id, clean[i].content, `sync-mem-${Date.now()}-${i}`);
+      if (!emb.ok) {
+        return { ok: false, server_seq: 0, accepted: 0, error: emb.error_code };
+      }
+      embeddings.push(emb.embedding);
+    }
+    for (let i = 0; i < clean.length; i++) {
+      await storeMemory(db, device.tenant_id, clean[i].content, clean[i].kind, embeddings[i]);
+      accepted++;
+    }
+  } else if (req.table === "events") {
+    // R2.2: shared event log -> jarvis_events. Talker + Executor both
+    // write here; the phone reads it back via /api/memory/list's
+    // patterns + its own local log. No embedding, plain inserts.
+    for (const row of req.rows) {
+      const turn = typeof row.turn === "string" ? row.turn.slice(0, 4000) : "";
+      const action = typeof row.action === "string" ? row.action.slice(0, 4000) : "";
+      if (!action.trim()) continue;
+      const result = typeof row.result === "string" ? row.result.slice(0, 4000) : "";
+      const screenMeaning = typeof row.screen_meaning === "string" ? row.screen_meaning.slice(0, 2000) : "";
+      await db
+        .prepare(
+          "INSERT INTO jarvis_events (tenant_id, device_id, turn, action, result, screen_meaning, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(device.tenant_id, req.device_id, turn, action, result, screenMeaning, Date.now())
+        .run();
       accepted++;
     }
   } else {

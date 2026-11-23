@@ -43,8 +43,11 @@
  * - /api/skills/library: approved-only; Free = 1 skill, Pro/Business =
  *   full library. Quarantined skills are never listed (3d).
  * - /api/memory/*: paired device + Ed25519 or x-internal-secret;
- *   D1-backed vector store (JS cosine, cap 500/tenant). Qdrant is
- *   env-gated and NOT live (account pending) — D1 fallback (3d).
+ *   D1-backed vector store (JS cosine, cap 2000/tenant, R2.5 D-R16).
+ *   Qdrant is env-gated and NOT live (account pending) — D1 fallback (3d).
+ *   R2: GET /api/memory/list (pull: memories + approved patterns) and
+ *   POST /api/admin/train (admin-only training); new memories push to
+ *   the phone over WS (memory_push) with an FCM notice fallback.
  * - /api/billing/*: subscription + UPI flow (Phase 4, UPI-only — no
  *   gateway). subscribe/utr/renew/upgrade/downgrade: paired device or
  *   x-internal-secret; /admin/*: x-admin-token (LLM_ADMIN_TOKEN).
@@ -115,7 +118,7 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "17"; // 17: Main Executor v1 (R1) — GitHub client + /api/escalate + /api/main/* + /api/github/* + key_audit + N-1/N-2; 16 was malformed llm message shape -> 400
+const VERSION = "18"; // 18: R2 shared memory — /api/admin/train + /api/memory/list + sync memories/events + Main run-start recall + memory_push + cap 2000; 17 was Main Executor v1 (R1)
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";
@@ -183,6 +186,8 @@ import {
 import {
   MAX_MEMORY_CONTENT_CHARS,
   embedText,
+  listMemoriesByKind,
+  loadApprovedPatterns,
   qdrantStatus,
   searchMemories,
   storeMemory,
@@ -368,6 +373,196 @@ async function dispatchCaptchaAssist(
   return { sent: body.sent === true };
 }
 
+/** R2.4: deliver a MEMORY_PUSH event to a device's DO (live or queued),
+ * with an FCM notice fallback when the device is not on WS. The event
+ * carries NO memory content — only ids/counts; the phone pulls the real
+ * rows from GET /api/memory/list. The FCM notice is best-effort (a
+ * notice only — execution never comes from FCM) and never throws. */
+export interface MemoryPushEvent {
+  type: "MEMORY_PUSH";
+  tenant_id: string;
+  memory_ids: number[];
+  patterns_added: number;
+  at: number;
+}
+
+async function dispatchMemoryPush(
+  env: Env,
+  tenantId: string,
+  deviceId: string,
+  event: MemoryPushEvent,
+): Promise<{ sent: boolean; fcm: boolean }> {
+  try {
+    const id = env.JARVIS_HUB.idFromName(`device:${deviceId}`);
+    const stub = env.JARVIS_HUB.get(id);
+    const res = await stub.fetch(
+      new Request("https://hub/memory-push", {
+        method: "POST",
+        headers: {
+          "x-internal-secret": env.INTERNAL_SECRET ?? "",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ device_id: deviceId, event }),
+      }),
+    );
+    if (res.ok) {
+      const body = (await res.json()) as { sent?: boolean };
+      if (body.sent === true) return { sent: true, fcm: false };
+    }
+  } catch {
+    // DO unreachable — fall through to the FCM notice below.
+  }
+  try {
+    const fcm = await sendFcm(env, env.DB, {
+      tenantId,
+      deviceId,
+      title: "Jarvis ko kuch naya sikhaya gaya",
+      body: "Nayi yaadein aayi hain — kholo to dekhoge.",
+      kind: "memory_push",
+      data: { type: "MEMORY_PUSH" },
+    });
+    return { sent: false, fcm: fcm.ok };
+  } catch {
+    return { sent: false, fcm: false };
+  }
+}
+
+/** R2.4: fan a MEMORY_PUSH out to every enabled device of a tenant.
+ * Best-effort per device — one device failing never blocks the others
+ * or the train call that triggered it. */
+async function fanOutMemoryPush(
+  env: Env,
+  tenantId: string,
+  event: MemoryPushEvent,
+): Promise<{ devices: number; ws: number; fcm: number }> {
+  let devices = 0;
+  let ws = 0;
+  let fcm = 0;
+  try {
+    const rows = await env.DB.prepare(
+      "SELECT device_id FROM devices WHERE tenant_id = ? AND enabled = 1",
+    )
+      .bind(tenantId)
+      .all<{ device_id: string }>();
+    for (const row of rows.results ?? []) {
+      devices++;
+      const r = await dispatchMemoryPush(env, tenantId, row.device_id, event);
+      if (r.sent) ws++;
+      else if (r.fcm) fcm++;
+    }
+  } catch {
+    // Fan-out is best-effort — the train already succeeded.
+  }
+  return { devices, ws, fcm };
+}
+
+/**
+ * R2.3: fetch one admin-training URL as plain text. SSRF guard:
+ * https only; localhost / private / loopback / link-local hostnames and
+ * IP literals are refused (metadata endpoints included). DNS rebinding
+ * cannot be checked from inside a Worker (no DNS API) — the primary
+ * control is the x-admin-token gate: only the admin can call this
+ * route at all. HTML is tag-stripped; PDFs/binaries are refused
+ * (use the Trained tab + doc worker for those). 4 MB cap, 15 s timeout.
+ */
+const TRAIN_FETCH_TIMEOUT_MS = 15_000;
+
+function isTrainUrlBlocked(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "localhost" || h === "metadata.google.internal" || h.endsWith(".local")) return true;
+  if (h === "::1" || h === "0.0.0.0") return true;
+  const v4 = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    if (a === 127 || a === 10 || a === 0) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 169 && b === 254) return true;
+    return false;
+  }
+  if (h.startsWith("fe80:") || h.startsWith("fc") || h.startsWith("fd")) return true;
+  return false;
+}
+
+function stripHtmlToText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function fetchTrainUrl(
+  rawUrl: string,
+  fetchFn: typeof fetch = fetch,
+): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return { ok: false, error: "invalid_url" };
+  }
+  if (url.protocol !== "https:") return { ok: false, error: "https_only" };
+  if (isTrainUrlBlocked(url.hostname)) return { ok: false, error: "blocked_host" };
+  let res: Response;
+  try {
+    res = await fetchFn(url.toString(), { signal: AbortSignal.timeout(TRAIN_FETCH_TIMEOUT_MS) });
+  } catch {
+    return { ok: false, error: "fetch_failed" };
+  }
+  if (!res.ok) return { ok: false, error: "fetch_failed" };
+  const contentType = res.headers.get("content-type") ?? "";
+  if (!/^(text\/|application\/json)/i.test(contentType)) {
+    return { ok: false, error: "unsupported_content_type" };
+  }
+  let buf: ArrayBuffer;
+  try {
+    buf = await res.arrayBuffer();
+  } catch {
+    return { ok: false, error: "fetch_failed" };
+  }
+  if (buf.byteLength > MAX_INGEST_BYTES) return { ok: false, error: "content_too_long" };
+  const raw = new TextDecoder().decode(buf);
+  const text = /text\/html/i.test(contentType) ? stripHtmlToText(raw) : raw.trim();
+  if (!text) return { ok: false, error: "empty_document" };
+  return { ok: true, text };
+}
+
+/** R2.3: split training text into ≤4000-char chunks on paragraph lines. */
+function chunkTrainText(text: string, maxChars = MAX_MEMORY_CONTENT_CHARS): string[] {
+  const chunks: string[] = [];
+  let current = "";
+  for (const para of text.split(/\n+/)) {
+    const piece = para.trim();
+    if (!piece) continue;
+    if (current && current.length + 1 + piece.length > maxChars) {
+      chunks.push(current);
+      current = piece;
+    } else {
+      current = current ? `${current}\n${piece}` : piece;
+    }
+    while (current.length > maxChars) {
+      chunks.push(current.slice(0, maxChars));
+      current = current.slice(maxChars);
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function newPatternId(): string {
+  const rand = new Uint8Array(4);
+  crypto.getRandomValues(rand);
+  return `pat-${Date.now().toString(36)}-${[...rand].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
 /**
  * Shared cron-tick runner (B-3: GitHub scheduler bypass).
  * Used by BOTH entry points so the behaviour is identical:
@@ -498,6 +693,135 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       });
     }
 
+    // R2.3 U19: admin training — the admin trains Jarvis from the
+    // server (Trained tab se ALAG: this is the server-side console
+    // path; the website UI lands in R4). ADMIN-ONLY (x-admin-token).
+    // Body: {tenant_id, documents: [{title, text?, url?, kind?}],
+    // instructions: [{text}]}. Documents are chunked (<=4000 chars)
+    // and stored as kind 'admin_training' memories (embedded via the
+    // same path as /api/memory/store); instructions become approved
+    // learned_patterns rows (source='admin', approved=1 — the admin IS
+    // the approver, no queue). Admin wins on conflict and the Talker
+    // says so. New memories push to the tenant's devices (WS
+    // memory_push, FCM notice fallback). At least one of documents /
+    // instructions is required. Caps: 10 docs, 50 instructions,
+    // 50 memories per call.
+    if (path === "/api/admin/train" && method === "POST") {
+      if (!env.LLM_ADMIN_TOKEN || request.headers.get("x-admin-token") !== env.LLM_ADMIN_TOKEN) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const body = await readJson(request);
+      const tenantId = typeof body.tenant_id === "string" ? body.tenant_id : "";
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const tenant = await getTenant(env.DB, tenantId);
+      if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      const documents = Array.isArray(body.documents) ? (body.documents as Record<string, unknown>[]) : [];
+      const instructions = Array.isArray(body.instructions) ? (body.instructions as Record<string, unknown>[]) : [];
+      if (documents.length === 0 && instructions.length === 0) {
+        return json({ error: "bad_request", detail: "documents ya instructions chahiye" }, 400);
+      }
+      if (documents.length > 10) return json({ error: "too_many_documents" }, 400);
+      if (instructions.length > 50) return json({ error: "too_many_instructions" }, 400);
+      // Resolve every document to text first (no writes yet).
+      const texts: string[] = [];
+      for (const doc of documents) {
+        const title = typeof doc.title === "string" ? doc.title.trim() : "";
+        const text = typeof doc.text === "string" ? doc.text.trim() : "";
+        const url = typeof doc.url === "string" ? doc.url.trim() : "";
+        if (!text && !url) return json({ error: "bad_request", detail: "har document me text ya url chahiye" }, 400);
+        if (text) {
+          texts.push(title ? `${title}\n${text}` : text);
+        } else {
+          const fetched = await fetchTrainUrl(url);
+          if (!fetched.ok) return json({ error: fetched.error }, 400);
+          texts.push(title ? `${title}\n${fetched.text}` : fetched.text);
+        }
+      }
+      const chunks: string[] = [];
+      for (const text of texts) {
+        for (const chunk of chunkTrainText(text)) {
+          if (chunks.length >= 50) return json({ error: "too_many_chunks" }, 400);
+          chunks.push(chunk);
+        }
+      }
+      const cleanInstructions: string[] = [];
+      for (const inst of instructions) {
+        const text = typeof inst.text === "string" ? inst.text.trim() : "";
+        if (!text) return json({ error: "bad_request", detail: "khali instruction nahi" }, 400);
+        if (text.length > 2000) return json({ error: "instruction_too_long" }, 400);
+        cleanInstructions.push(text);
+      }
+      // Embed + store document chunks (kind 'admin_training' always —
+      // Main recall queries this kind; a passed kind is ignored).
+      const memoryIds: number[] = [];
+      for (let i = 0; i < chunks.length; i++) {
+        const emb = await embedText(
+          {
+            db: env.DB,
+            masterKeyB64: env.KEY_ENC_SECRET,
+            founderKey: env.FOUNDER_GEMINI_KEY,
+            config: loadRouterConfig(env),
+          },
+          tenantId,
+          chunks[i],
+          `train-${Date.now()}-${i}`,
+        );
+        if (!emb.ok) {
+          const status =
+            emb.error_code === "byok_required" ? 402 : emb.error_code === "tenant_not_found" ? 404 : 502;
+          return json({ error: emb.error_code, detail: emb.error }, status);
+        }
+        memoryIds.push(await storeMemory(env.DB, tenantId, chunks[i], "admin_training", emb.embedding));
+      }
+      // Instructions -> learned_patterns (insert or bump, admin wins).
+      const patternIds: string[] = [];
+      const nowMs = Date.now();
+      for (const text of cleanInstructions) {
+        const hash = await sha256Hex(text);
+        const existing = await env.DB.prepare(
+          "SELECT id, use_count FROM learned_patterns WHERE template_hash = ?",
+        )
+          .bind(hash)
+          .first<{ id: string; use_count: number }>();
+        if (existing) {
+          await env.DB.prepare(
+            "UPDATE learned_patterns SET use_count = ?, last_seen = ?, approved = ?, source = ? WHERE id = ?",
+          )
+            .bind((existing.use_count ?? 1) + 1, nowMs, 1, "admin", existing.id)
+            .run();
+          patternIds.push(existing.id);
+        } else {
+          const id = newPatternId();
+          await env.DB.prepare(
+            "INSERT INTO learned_patterns (id, template_hash, template, use_count, first_seen, last_seen, approved, source) VALUES (?, ?, ?, 1, ?, ?, 1, 'admin')",
+          )
+            .bind(id, hash, text, nowMs, nowMs)
+            .run();
+          patternIds.push(id);
+        }
+      }
+      await insertTrace(env.DB, tenantId, "", "admin_train", {
+        memories_added: memoryIds.length,
+        patterns_added: patternIds.length,
+      });
+      const push = await fanOutMemoryPush(env, tenantId, {
+        type: "MEMORY_PUSH",
+        tenant_id: tenantId,
+        memory_ids: memoryIds,
+        patterns_added: patternIds.length,
+        at: nowMs,
+      });
+      return json({
+        ok: true,
+        tenant_id: tenantId,
+        patterns_added: patternIds.length,
+        memories_added: memoryIds.length,
+        memory_ids: memoryIds,
+        pattern_ids: patternIds,
+        push,
+      });
+    }
+
     // Pairing: init (licence-verified, rate-limited).
     if (path === "/api/pairing/init" && method === "POST") {
       const rl = await checkRateLimit(env, "pairingInit", clientIp(request));
@@ -588,7 +912,18 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         return json({ error: "bad_request" }, 400);
       }
       const rawRowsJson = JSON.stringify(syncReq.rows);
-      const result = await handleSync(env.DB, syncReq, rawRowsJson);
+      let embedConfig;
+      try {
+        embedConfig = loadRouterConfig(env);
+      } catch {
+        embedConfig = undefined;
+      }
+      const result = await handleSync(env.DB, syncReq, rawRowsJson, {
+        db: env.DB,
+        masterKeyB64: env.KEY_ENC_SECRET,
+        founderKey: env.FOUNDER_GEMINI_KEY,
+        config: embedConfig,
+      });
       return json(result, result.ok ? 200 : 403);
     }
 
@@ -2082,6 +2417,54 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const deleted = await wipeMemories(env.DB, tenantId);
       const q = qdrantStatus(env);
       return json({ ok: true, deleted, qdrant: q.configured ? "configured" : "not_configured" });
+    }
+
+    // R2.4 U20: pull endpoint for the phone — memories (newest first,
+    // `since` cursor on created_at) + approved learned_patterns (admin
+    // first) in one response. Device-signed (authorizeDocsRequest) or
+    // x-internal-secret, same as the other /api/memory/* routes. GET has
+    // no body: the signed payload is the frozen string
+    // `memory-list:<tenant_id>:<since>:<limit>` (same shape as
+    // /api/skills/sync). The phone calls this on start, after a
+    // memory_push notice, and on Trained-tab refresh. No embeddings
+    // here — plain D1 reads.
+    if (path === "/api/memory/list" && method === "GET") {
+      const tenantId = url.searchParams.get("tenant_id") ?? "";
+      const sinceRaw = Number(url.searchParams.get("since") ?? "0");
+      const since = Number.isFinite(sinceRaw) && sinceRaw > 0 ? Math.floor(sinceRaw) : 0;
+      const limitRaw = Number(url.searchParams.get("limit") ?? "50");
+      const limit = Number.isFinite(limitRaw) ? Math.min(200, Math.max(1, Math.floor(limitRaw))) : 50;
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? "",
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: `memory-list:${tenantId}:${since}:${limit}`,
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const resolvedTenant = auth.tenant_id ?? tenantId;
+      if (!resolvedTenant) return json({ error: "bad_request" }, 400);
+      if (auth.tenant_id && tenantId && auth.tenant_id !== tenantId) {
+        return json({ error: "forbidden" }, 403);
+      }
+      const tenant = await getTenant(env.DB, resolvedTenant);
+      if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      const rl = await checkRateLimit(env, "memory", resolvedTenant);
+      if (!rl.allowed) return rateLimited(rl);
+      const memRes = await env.DB.prepare(
+        "SELECT id, content, kind, created_at FROM memories WHERE tenant_id = ? AND created_at > ? ORDER BY created_at DESC LIMIT ?",
+      )
+        .bind(resolvedTenant, since, limit)
+        .all<{ id: number; content: string; kind: string; created_at: number }>();
+      const patterns = await loadApprovedPatterns(env.DB, 20);
+      return json({
+        ok: true,
+        memories: (memRes.results ?? []).map((r) => ({ id: r.id, content: r.content, kind: r.kind, created_at: r.created_at })),
+        patterns: patterns.map((p) => ({ id: p.id, template: p.template, source: p.source, use_count: p.use_count })),
+        since,
+      });
     }
 
     // --- Billing (Phase 4) — subscription + UPI + D1 ledger + caps ---

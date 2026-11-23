@@ -2,7 +2,8 @@
  * Memory tests (Phase 3, stage 3d) — S-T5–S-T7 + S-T11 + memory auth/errors.
  *
  * S-T5 memory store/search cosine · S-T6 wipe (D1 + Qdrant field) ·
- * S-T7 Qdrant not configured · S-T11 memory cap 500 (FIFO eviction).
+ * S-T7 Qdrant not configured · S-T11 memory cap 2000 (FIFO eviction,
+ * R2.5 D-R16 — was 500).
  * Gemini embeddings are MOCKED (keyword -> fixed vector; no real key in CI).
  * Live happy-path proof needs a test BYOK key (parent-side, U-1).
  */
@@ -222,15 +223,15 @@ describe("S-T7 Qdrant not configured (completeness #30: real client)", () => {
   });
 });
 
-describe("S-T11 memory cap 500 (FIFO eviction)", () => {
-  it("500 seeded -> store 501st -> count still 500, oldest gone, newest present", async () => {
+describe("S-T11 memory cap 2000 (FIFO eviction) — R2.5 D-R16 (was 500)", () => {
+  it("2000 seeded -> store 2001st -> count still 2000, oldest gone, newest present", async () => {
     const db = new FakeD1();
     const master = await makeMasterKeyB64();
     await seedTenantWithKey(db, "t-1", master);
     stubEmbed();
     const env = fakeEnv(db, { KEY_ENC_SECRET: master });
-    expect(MEMORY_CAP_PER_TENANT).toBe(500);
-    for (let i = 0; i < 500; i++) {
+    expect(MEMORY_CAP_PER_TENANT).toBe(2000);
+    for (let i = 0; i < 2000; i++) {
       await db
         .prepare("INSERT INTO memories (tenant_id, content, embedding, kind, created_at) VALUES (?, ?, ?, ?, ?)")
         .bind("t-1", `memory ${i}`, JSON.stringify([1, 0]), "fact", FIXED_NOW + i)
@@ -242,7 +243,7 @@ describe("S-T11 memory cap 500 (FIFO eviction)", () => {
       .prepare("SELECT COUNT(*) AS n FROM memories WHERE tenant_id = ?")
       .bind("t-1")
       .first<{ n: number }>();
-    expect(count?.n).toBe(500);
+    expect(count?.n).toBe(2000);
     const oldest = await db
       .prepare("SELECT id FROM memories WHERE tenant_id = ? AND content = ?")
       .bind("t-1", "memory 0")

@@ -296,8 +296,10 @@ export class JarvisHub extends DurableObject<Env> {
       }
       // 3c: queued CAPTCHA_ASSIST events are marked rows — they go out
       // as RAW events (never signed as EXECUTE_STEP), then deleted.
-      if (step && typeof step === "object" && "__captcha_assist__" in step) {
-        const event = step["__captcha_assist__"] as Record<string, unknown>;
+      // R2.4: same for queued MEMORY_PUSH events (marker
+      // "__memory_push__" — the phone pulls the rows after the notice).
+      if (step && typeof step === "object" && ("__captcha_assist__" in step || "__memory_push__" in step)) {
+        const event = (step["__captcha_assist__"] ?? step["__memory_push__"]) as Record<string, unknown>;
         try {
           ws.send(JSON.stringify(event));
         } catch {
@@ -355,8 +357,15 @@ export class JarvisHub extends DurableObject<Env> {
    * socket never sees site/task names. Offline -> queued as a marked
    * row in pending_steps (max 50/device, shared with steps, C-T9);
    * flushPending sends marked rows back out as raw events.
+   * R2.4: MEMORY_PUSH uses the same shape with marker
+   * "__memory_push__" — the event carries ids/counts only, never
+   * memory content; the phone pulls the rows from /api/memory/list.
    */
-  private async queueOrSendEvent(deviceId: string, event: Record<string, unknown>): Promise<boolean> {
+  private async queueOrSendEvent(
+    deviceId: string,
+    event: Record<string, unknown>,
+    marker: "__captcha_assist__" | "__memory_push__" = "__captcha_assist__",
+  ): Promise<boolean> {
     if (this.authenticatedDeviceId === deviceId && this.sockets.size > 0) {
       for (const ws of this.sockets) {
         try {
@@ -373,7 +382,7 @@ export class JarvisHub extends DurableObject<Env> {
     }
     this.sql().exec(
       "INSERT INTO pending_steps (payload, created_at) VALUES (?, ?)",
-      JSON.stringify({ __captcha_assist__: event }),
+      JSON.stringify({ [marker]: event }),
       Date.now(),
     );
     return false;
@@ -414,6 +423,26 @@ export class JarvisHub extends DurableObject<Env> {
         return Response.json({ error: "device_mismatch" }, { status: 400 });
       }
       const sent = await this.queueOrSendEvent(body.device_id, body.event);
+      return Response.json({ ok: true, sent });
+    }
+    // R2.4: MEMORY_PUSH dispatch (Worker -> DO): POST /memory-push,
+    // secret-gated. Body: {device_id, event:{type:"MEMORY_PUSH", ...}}.
+    // Same shape as /captcha-assist — live send on an authenticated
+    // socket, else queued as a "__memory_push__" marked row and flushed
+    // RAW on the next HELLO. The event carries ids/counts only.
+    if (path === "/memory-push" && request.method === "POST") {
+      const secret = (this.env as unknown as Record<string, string | undefined>).INTERNAL_SECRET;
+      if (!secret || request.headers.get("x-internal-secret") !== secret) {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+      const body = (await request.json()) as { device_id?: string; event?: Record<string, unknown> };
+      if (!body.device_id || !body.event || body.event.type !== "MEMORY_PUSH") {
+        return Response.json({ error: "bad_request" }, { status: 400 });
+      }
+      if (this.expectedDeviceId && body.device_id !== this.expectedDeviceId) {
+        return Response.json({ error: "device_mismatch" }, { status: 400 });
+      }
+      const sent = await this.queueOrSendEvent(body.device_id, body.event, "__memory_push__");
       return Response.json({ ok: true, sent });
     }
     // WS upgrade (Worker routes /ws/:deviceId here with x-expected-device).

@@ -2,7 +2,7 @@
  * memory.ts — Memory API helpers (Phase 3, stage 3d).
  *
  * The vector store in Phase 3 is D1 (`memories` table, 0006): vectors as
- * JSON TEXT, JS cosine similarity, cap 500 memories/tenant (FIFO eviction),
+ * JSON TEXT, JS cosine similarity, cap 2000 memories/tenant (FIFO eviction, R2.5 D-R16 — was 500),
  * tenant-isolated. Qdrant swaps in later through the MemoryStore interface
  * — one place, no route changes.
  *
@@ -18,6 +18,8 @@
  * Mem0 extraction (Render worker `/mem/extract` -> hub `/api/llm/route`)
  * is NOT built in 3d: the Render deploy is pending (U-2) and Render-side
  * INTERNAL_SECRET provisioning does not exist yet. Open item, not a claim.
+ * R2.8: the Render worker is LIVE (v3b) and /mem/extract is verified
+ * against real traffic in the R2 build notes — see there, not here.
  *
  * Embeddings come from the 3a router (kind `embeddings`,
  * gemini-embedding-001, no fallback) — the router's own pre-checks
@@ -30,8 +32,10 @@
 import type { D1Like } from "./db";
 import { loadRouterConfig, routeLlm, type RouterDeps } from "./router";
 
-/** Hard cap: memories per tenant (FIFO eviction of the oldest row). */
-export const MEMORY_CAP_PER_TENANT = 500;
+/** Hard cap: memories per tenant (FIFO eviction of the oldest row).
+ * R2.5 (D-R16, decided): 500 -> 2,000 — Trained Jarvis + admin training
+ * need headroom; the cap is a const, not schema (no migration). */
+export const MEMORY_CAP_PER_TENANT = 2000;
 /** Max memory content length (chars) — longer is a 400, not a truncate. */
 export const MAX_MEMORY_CONTENT_CHARS = 4000;
 
@@ -107,9 +111,10 @@ export async function embedText(
 // --- D1 memory store (the Phase 3 store) ---
 
 /**
- * Store one memory. At the 500/tenant cap the OLDEST memory is evicted
- * first (FIFO), so the count never exceeds the cap and the store keeps
- * working instead of refusing. Returns the new memory id.
+ * Store one memory. At the 2000/tenant cap (R2.5, was 500) the OLDEST
+ * memory is evicted first (FIFO), so the count never exceeds the cap
+ * and the store keeps working instead of refusing. Returns the new
+ * memory id.
  */
 export async function storeMemory(
   db: D1Like,
@@ -189,6 +194,63 @@ export async function wipeMemories(db: D1Like, tenantId: string): Promise<number
   const n = countRow?.n ?? 0;
   await db.prepare("DELETE FROM memories WHERE tenant_id = ?").bind(tenantId).run();
   return n;
+}
+
+/**
+ * R2.3: list a tenant's memories of one kind, newest first.
+ * Used by Main run-start recall (kind 'admin_training', cap 10) and by
+ * /api/memory/list. Content IS returned (callers are the tenant's own
+ * Main job / device) — never put it in traces (PII rule, file header).
+ */
+export async function listMemoriesByKind(
+  db: D1Like,
+  tenantId: string,
+  kind: string,
+  limit: number,
+): Promise<MemoryHit[]> {
+  const res = await db
+    .prepare(
+      "SELECT id, content, kind, created_at FROM memories WHERE tenant_id = ? AND kind = ? ORDER BY created_at DESC LIMIT ?",
+    )
+    .bind(tenantId, kind, Math.max(1, Math.floor(limit)))
+    .all<{ id: number; content: string; kind: string; created_at: number }>();
+  return (res.results ?? []).map((r) => ({ id: r.id, content: r.content, kind: r.kind, score: 0, created_at: r.created_at }));
+}
+
+export interface ApprovedPattern {
+  id: string;
+  template: string;
+  source: string;
+  use_count: number;
+}
+
+/**
+ * R2.3: approved learned patterns for Main run-start recall.
+ * `learned_patterns` has NO tenant column (templates only, global) —
+ * admin rows first, then highest use_count. Cap 20. Admin training
+ * (source='admin', approved=1 at insert) outranks user-learned rows;
+ * on a conflict the admin row wins and the Talker says so.
+ */
+export async function loadApprovedPatterns(db: D1Like, limit: number): Promise<ApprovedPattern[]> {
+  const out: ApprovedPattern[] = [];
+  const cap = Math.max(1, Math.floor(limit));
+  const admin = await db
+    .prepare(
+      "SELECT id, template, source, use_count FROM learned_patterns WHERE approved = 1 AND source = ? ORDER BY use_count DESC LIMIT ?",
+    )
+    .bind("admin", cap)
+    .all<ApprovedPattern>();
+  out.push(...(admin.results ?? []));
+  if (out.length < cap) {
+    const user = await db
+      .prepare(
+        "SELECT id, template, source, use_count FROM learned_patterns WHERE approved = 1 AND source = ? ORDER BY use_count DESC LIMIT ?",
+      )
+      .bind("user", cap - out.length)
+      .all<ApprovedPattern>();
+    out.push(...(user.results ?? []));
+  }
+  return out;
 }
 
 // --- Qdrant (real REST client, env-gated — completeness #30) ---

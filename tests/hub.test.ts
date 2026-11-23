@@ -229,9 +229,9 @@ describe("handleRequest (2a-2 routes, D1 licences)", () => {
     expect(body.key_id).toBeUndefined();
   });
 
-  it("GET / -> version 17 (Main Executor v1, R1)", async () => {
+  it("GET / -> version 18 (Trained Jarvis + shared memory, R2)", async () => {
     const body = (await route("/").json()) as Record<string, unknown>;
-    expect(body.version).toBe("17");
+    expect(body.version).toBe("18");
   });
 
   it("pairing code: derives from token", async () => {

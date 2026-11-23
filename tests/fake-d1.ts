@@ -56,6 +56,9 @@ const PK: Record<string, string[]> = {
   // R1 Main Executor (0014 main_jobs, 0015 key_audit): TEXT ids.
   main_jobs: ["id"],
   key_audit: ["id"],
+  // R2 shared memory (0016 jarvis_events, d1_migrations): TEXT id / name.
+  jarvis_events: ["id"],
+  d1_migrations: ["name"],
 };
 
 export class FakeD1 implements D1Like {
@@ -198,6 +201,12 @@ class FakePrepared implements D1PreparedLike {
       this.db["autoInc"].set(table, next);
       row.id = next;
     }
+    // R2 shared memory (0016 jarvis_events): INTEGER PK AUTOINCREMENT.
+    if (table === "jarvis_events" && row.id === undefined) {
+      const next = (this.db["autoInc"].get(table) ?? 0) + 1;
+      this.db["autoInc"].set(table, next);
+      row.id = next;
+    }
     const pk = this.db["pkOf"](table, row);
     const existing = t.get(pk);
     if (existing && this.q.includes("ON CONFLICT")) {
@@ -243,9 +252,11 @@ class FakePrepared implements D1PreparedLike {
       const rows = this.filterRows(table, where, [...this.args]);
       return [{ [alias]: rows.length }];
     }
-    const m = this.q.match(/^SELECT (.+) FROM (\w+)(?: WHERE (.+?))?(?: ORDER BY (\w+)(?: (ASC|DESC))?)?(?: LIMIT (\d+))?$/);
+    // R2: LIMIT may be a bound parameter (LIMIT ?) — the bound value is
+    // the arg after the WHERE placeholders.
+    const m = this.q.match(/^SELECT (.+) FROM (\w+)(?: WHERE (.+?))?(?: ORDER BY (\w+)(?: (ASC|DESC))?)?(?: LIMIT (\d+|\?))?$/);
     if (!m) throw new Error(`FakeD1: cannot parse SELECT: ${this.q}`);
-    const [, colsStr, table, where, orderBy, orderDir, limit] = m;
+    const [, colsStr, table, where, orderBy, orderDir, limitTok] = m;
     let rows = this.filterRows(table, where, [...this.args]);
     if (orderBy) {
       const dir = orderDir === "DESC" ? -1 : 1;
@@ -259,7 +270,14 @@ class FakePrepared implements D1PreparedLike {
         return dir * (Number(av ?? 0) - Number(bv ?? 0));
       });
     }
-    if (limit) rows = rows.slice(0, Number(limit));
+    let limit: number | undefined;
+    if (limitTok === "?") {
+      const wherePlaceholders = (where?.match(/\?/g) ?? []).length;
+      limit = Number(this.args[wherePlaceholders] ?? 0);
+    } else if (limitTok) {
+      limit = Number(limitTok);
+    }
+    if (limit) rows = rows.slice(0, limit);
     if (colsStr.trim() !== "*") {
       const cols = colsStr.split(",").map((c) => c.trim().split(" ").pop()!);
       rows = rows.map((r) => {

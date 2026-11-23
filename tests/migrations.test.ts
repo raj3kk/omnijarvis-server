@@ -477,3 +477,36 @@ describe("D1 migration 0015 (R1 key set/delete audit trace, N-7 fix)", () => {
     expect(code).not.toMatch(/DELETE\s+FROM/i);
   });
 });
+
+const SQL16 = readFileSync(
+  new URL("../d1/migrations/0016_r2_shared_memory.sql", import.meta.url),
+  "utf8",
+);
+
+describe("D1 migration 0016 (R2 shared memory + N-3 d1_migrations tracking)", () => {
+  it("creates d1_migrations tracking + jarvis_events + learned_patterns.source", () => {
+    expect(SQL16).toContain("CREATE TABLE IF NOT EXISTS d1_migrations (");
+    expect(SQL16).toContain("name TEXT PRIMARY KEY");
+    expect(SQL16).toContain("CREATE TABLE IF NOT EXISTS jarvis_events (");
+    for (const col of ["tenant_id TEXT NOT NULL", "device_id TEXT NOT NULL", "turn TEXT NOT NULL", "action TEXT NOT NULL", "result TEXT NOT NULL", "screen_meaning TEXT NOT NULL", "created_at INTEGER NOT NULL"]) {
+      expect(SQL16).toContain(col);
+    }
+    expect(SQL16).toContain("idx_jarvis_events_tenant");
+    expect(SQL16).toContain("ALTER TABLE learned_patterns ADD COLUMN source TEXT NOT NULL DEFAULT 'user'");
+  });
+
+  it("records every migration 0001-0016 (retroactive rows, INSERT OR IGNORE)", () => {
+    for (const name of ["0001_init.sql", "0002_supabase_port.sql", "0003_router.sql", "0004_docs.sql", "0005_browser.sql", "0006_skills.sql", "0007_billing.sql", "0008_groq_key.sql", "0009_captcha_solves.sql", "0010_google_oauth.sql", "0011_email_b2.sql", "0012_fcm.sql", "0013_licence_web.sql", "0014_main_jobs.sql", "0015_key_audit.sql", "0016_r2_shared_memory.sql"]) {
+      expect(SQL16).toContain(`INSERT OR IGNORE INTO d1_migrations (name, applied_at) VALUES ('${name}'`);
+    }
+  });
+
+  it("is non-destructive: no DROP TABLE / TRUNCATE / DELETE FROM, no secrets", () => {
+    const code = SQL16.replace(/--[^\\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(code).not.toMatch(/DROP\s+TABLE/i);
+    expect(code).not.toMatch(/TRUNCATE/i);
+    expect(code).not.toMatch(/DELETE\s+FROM/i);
+    expect(code.toLowerCase()).not.toContain("github_admin_token");
+    expect(code.toLowerCase()).not.toContain("secret");
+  });
+});
