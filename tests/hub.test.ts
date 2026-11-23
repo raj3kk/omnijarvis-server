@@ -229,9 +229,9 @@ describe("handleRequest (2a-2 routes, D1 licences)", () => {
     expect(body.key_id).toBeUndefined();
   });
 
-  it("GET / -> version 19 (Live screen + tap-to-operate, R3)", async () => {
+  it("GET / -> version 20 (Models + admin website + FCM triggers, R4)", async () => {
     const body = (await route("/").json()) as Record<string, unknown>;
-    expect(body.version).toBe("19");
+    expect(body.version).toBe("20");
   });
 
   it("pairing code: derives from token", async () => {

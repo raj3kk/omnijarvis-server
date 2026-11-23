@@ -947,6 +947,37 @@ export async function setSkillStatus(db: D1Like, skillId: string, status: string
   await db.prepare("UPDATE global_skills SET status = ? WHERE id = ?").bind(status, skillId).run();
 }
 
+/**
+ * R4.11 (U8-SERVER) — device-signed "user approved" signal.
+ *
+ * The phone's approval card records an approval; this persists the
+ * signal server-side as a skill_reviews row (reviewer = device id,
+ * decision = "user_approved"). It does NOT change the skill status:
+ * the frozen quarantine rule stands — a skill leaves `quarantined`
+ * only via /api/skills/review (clean Render scan + admin approval).
+ * The admin review queue can read the user_approved signal and the
+ * phone can pull the outcome via /api/skills/sync after review.
+ * Idempotent: the same device approving the same skill twice writes
+ * one row and reports deduped:true.
+ */
+export async function recordUserApproval(
+  db: D1Like,
+  opts: { skillId: string; tenantId: string; deviceId: string; nowMs?: number },
+): Promise<{ deduped: boolean }> {
+  const existing = await db
+    .prepare("SELECT id FROM skill_reviews WHERE skill_id = ? AND reviewer = ? AND decision = ?")
+    .bind(opts.skillId, opts.deviceId, "user_approved")
+    .first<{ id: number | string }>();
+  if (existing) return { deduped: true };
+  const nowMs = opts.nowMs ?? Date.now();
+  const id = `ur-${nowMs.toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  await db
+    .prepare("INSERT INTO skill_reviews (id, skill_id, reviewer, decision, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .bind(id, opts.skillId, opts.deviceId, "user_approved", "phone approval card", nowMs)
+    .run();
+  return { deduped: false };
+}
+
 export async function insertSkillReview(
   db: D1Like,
   review: { skill_id: string; reviewer: string; decision: string; reason: string; created_at: number },

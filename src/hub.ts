@@ -118,7 +118,7 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "19"; // 19: R3 live screen + tap-to-operate — DO __live_screen__ marker + /live-screen route + captcha slider/geetest known types (detect-only, never auto-solve); 18 was R2 shared memory
+const VERSION = "20"; // 20: R4 models + admin website + FCM triggers — /admin console, pairing auto-flow, Gmail-send idempotency (0017), cap-warning emails, U8 approve signal, Drive write + Calendar, OAuth refresh live-proven; 19 was R3 live screen
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";
@@ -147,8 +147,19 @@ import {
   sessionCookie,
   verifyEmailCode,
 } from "./licence-web";
+// R4: admin website (v1) + Gmail-send idempotency + cap-warning emails.
+import {
+  OWNER_ADMIN_EMAIL,
+  adminDashboardPage,
+  adminLoginPage,
+  adminOverview,
+  ensureOwnerAdmin,
+  isAdminUser,
+} from "./admin";
+import { getIdempotencyRecord, storeIdempotencyRecord } from "./idempotency";
+import { maybeSendCapWarning } from "./cap-warning";
 import { checkRateLimit, checkUpstashLive, probeUpstashCounter, upstashStatus, type RateLimitResult } from "./ratelimit";
-import { d1Batch, getDevice, getTenant, insertKeyAudit, insertTrace, verifyLicenceKey } from "./db";
+import { d1Batch, getDevice, getTenant, insertKeyAudit, insertTrace, verifyLicenceKey, type D1Like, type TenantRow } from "./db";
 import {
   buildCaptchaAssistEvent,
   executeBrowserTask,
@@ -174,6 +185,7 @@ import {
   listApprovedSkillsSince,
   manifestHash,
   newSkillId,
+  recordUserApproval,
   scanSkillCode,
   selfExtendedTemplateHasUserContent,
   setSkillStatus,
@@ -249,8 +261,11 @@ import { createTenantBackup, listBackups, restoreTestBackup } from "./backup";
 import {
   GoogleError,
   buildAuthUrl,
+  calendarCreateEvent,
+  calendarListEvents,
   consumeOAuthState,
   driveReadFile,
+  driveUploadFile,
   exchangeCodeForTokens,
   fetchGoogleEmail,
   gmailListMessages,
@@ -572,6 +587,15 @@ function newPatternId(): string {
  * so a GitHub tick and a Cloudflare tick in the same minute never
  * double-fire a job. Billing sweeps run after the tick in both paths.
  */
+/** Owner tenant lookup by email (admin website keys section). */
+async function getTenantByOwnerEmail(db: D1Like): Promise<TenantRow | null> {
+  const row = await db
+    .prepare("SELECT id, owner_email, plan_tier, billing_mode, gemini_key_enc, groq_key_enc, pii_consent, email_verified, pending_downgrade_tier FROM tenants WHERE owner_email = ? LIMIT 1")
+    .bind(OWNER_ADMIN_EMAIL)
+    .first<TenantRow>();
+  return row;
+}
+
 export async function runCronTick(
   env: Env,
   source: "http" | "cf-cron",
@@ -600,7 +624,34 @@ export async function runCronTick(
     );
     return res.ok;
   };
-  const result = await handleTick(env.DB, env, env.CRON_SECRET ?? null, dispatch);
+  const result = await handleTick(
+    env.DB,
+    env,
+    env.CRON_SECRET ?? null,
+    dispatch,
+    Date.now(),
+    // R4.2 — due-job FCM push (kind "due-job"): when a scheduled job
+    // fires, wake/notify the device so the due job is visible even if
+    // the WS is down. Best-effort only: a missing device / unconfigured
+    // FCM must never fail the tick (sendFcm records the outcome in
+    // fcm_sends either way). The DO dispatch above already ran — the
+    // push is a notice, not the execution.
+    async (job) => {
+      try {
+        await sendFcm(env, env.DB, {
+          tenantId: job.tenant_id,
+          deviceId: job.device_id,
+          title: "Jarvis — scheduled job due",
+          body: job.command.slice(0, 200) || "A scheduled job is due.",
+          kind: "due-job",
+          data: { job_id: job.id },
+        });
+      } catch {
+        // sendFcm itself never throws for HTTP failures; this guards
+        // the record-write path. The tick result stands either way.
+      }
+    },
+  );
   // R1: step pending Main Executor jobs (max 2 per tick, one step each).
   // Best-effort — a Main failure never breaks the tick (traced, the
   // next tick retries after the backoff).
@@ -707,7 +758,25 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // instructions is required. Caps: 10 docs, 50 instructions,
     // 50 memories per call.
     if (path === "/api/admin/train" && method === "POST") {
-      if (!env.LLM_ADMIN_TOKEN || request.headers.get("x-admin-token") !== env.LLM_ADMIN_TOKEN) {
+      // R4.5: the admin website has no x-admin-token to send — it logs
+      // in with the licence-web email-code session. Accept a valid
+      // admin session (owner email + is_admin flag) as an alternative
+      // to the token gate. The token gate stays for API callers.
+      let adminAuthed = !!env.LLM_ADMIN_TOKEN && request.headers.get("x-admin-token") === env.LLM_ADMIN_TOKEN;
+      if (!adminAuthed) {
+        const cookie = request.headers.get("cookie") ?? "";
+        const m = cookie.match(new RegExp(`(?:^|;\\s*)${LICENCE_SESSION_COOKIE}=([^;]+)`));
+        if (m) {
+          const tokenHash = await hashSessionToken(m[1]);
+          const sessRow = await env.DB.prepare("SELECT email, expires_at FROM licence_web_sessions WHERE token_hash = ?")
+            .bind(tokenHash)
+            .first<{ email: string; expires_at: number }>();
+          if (sessRow && sessRow.expires_at >= Date.now() && (await isAdminUser(env.DB, sessRow.email))) {
+            adminAuthed = true;
+          }
+        }
+      }
+      if (!adminAuthed) {
         return json({ error: "unauthorized" }, 401);
       }
       const body = await readJson(request);
@@ -901,6 +970,51 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       });
     }
 
+    // R4.1 — Pairing AUTO (licence activation me merge): the app
+    // generates its Ed25519 keypair locally, then calls this ONE route
+    // with the licence key + device id + public key. The hub verifies
+    // the licence (same trust as /api/pairing/init, which already
+    // issues a token on licence-key alone), resolves the tenant, and
+    // registers the device — no 6-digit code for the user to type.
+    // The manual code path (/api/pairing/init + /api/pairing/register)
+    // stays as the fallback when auto fails. Re-pairing an already
+    // paired device is idempotent (registerDevice upserts, no cap hit).
+    if (path === "/api/pairing/auto" && method === "POST") {
+      const rl = await checkRateLimit(env, "pairingInit", clientIp(request));
+      if (!rl.allowed) return rateLimited(rl);
+      const body = await readJson(request);
+      const deviceId = typeof body.device_id === "string" ? body.device_id : "";
+      const tenantId = typeof body.tenant_id === "string" ? body.tenant_id : "";
+      const licenceKey = typeof body.licence_key === "string" ? body.licence_key : "";
+      const publicKey = typeof body.public_key === "string" ? body.public_key : "";
+      if (!deviceId || !licenceKey || !publicKey) return json({ error: "bad_request" }, 400);
+      const licensed = await verifyLicenceKey(env.DB, licenceKey);
+      if (!licensed) return json({ error: "licence_invalid" }, 403);
+      const resolvedTenantId = tenantId || (await deriveTenantId(licenceKey));
+      const existingDevice = await getDevice(env.DB, deviceId);
+      if (!existingDevice || existingDevice.tenant_id !== resolvedTenantId) {
+        const tenantRow = await getTenant(env.DB, resolvedTenantId);
+        const planTier = tenantRow?.plan_tier ?? "free";
+        const deviceCount = await countEnabledDevices(env.DB, resolvedTenantId);
+        if (deviceCount >= planLimits(planTier).devices) {
+          return json(
+            { error: "device_limit", detail: "Device limit khatam — purana device unpair karo ya upgrade karo" },
+            403,
+          );
+        }
+      }
+      await registerDevice(env.DB, deviceId, resolvedTenantId, publicKey);
+      await insertTrace(env.DB, resolvedTenantId, deviceId, "pairing_auto", { auto: true });
+      const hubKey = await getHubPublicKey(env);
+      return json({
+        ok: true,
+        paired: true,
+        device_id: deviceId,
+        tenant_id: resolvedTenantId,
+        ...(hubKey ? { hub_public_key: hubKey.publicKeyB64, key_id: hubKey.keyId } : {}),
+      });
+    }
+
     // Sync proxy (paired + signed).
     if (path === "/api/sync" && method === "POST") {
       const body = await readJson(request);
@@ -1003,6 +1117,16 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         return json({ error: "bad_request" }, 400);
       }
       await completeTurn(env.DB, tenantId, turnId, body.success);
+      // R4.9 — 80% cap-warning email (replies/mo only), best-effort:
+      // a warning failure never fails the turn-complete. One email per
+      // tenant+period (cap_warnings dedupe in maybeSendCapWarning).
+      if (body.success) {
+        try {
+          await maybeSendCapWarning(env, env.DB, tenantId);
+        } catch {
+          // Warning is advisory; the turn result stands.
+        }
+      }
       return json({ ok: true });
     }
 
@@ -2076,6 +2200,47 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         decision: "rejected",
       });
       return json({ ok: true, skill_id: skillId, status: "rejected" });
+    }
+
+    // R4.11 (U8-SERVER) — device-signed "user approved" signal.
+    // The phone's approval card calls this after its phone-side record.
+    // It records the user's approval (skill_reviews, decision
+    // "user_approved") and NOTHING else: the skill STAYS quarantined —
+    // the frozen rule (approve needs a clean Render scan + admin
+    // review) is untouched. The admin review queue reads the signal;
+    // the phone pulls the outcome via /api/skills/sync after review.
+    // Idempotent: the same device approving the same skill twice
+    // returns deduped:true with one review row.
+    if (path === "/api/skills/approve" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const skillId = typeof body.skill_id === "string" ? body.skill_id : "";
+      if (!skillId) return json({ error: "bad_request" }, 400);
+      const rl = await checkRateLimit(env, "skills", auth.device_id ?? clientIp(request));
+      if (!rl.allowed) return rateLimited(rl);
+      const skill = await getSkill(env.DB, skillId);
+      if (!skill) return json({ error: "skill_not_found" }, 404);
+      const deviceId = auth.device_id ?? "";
+      const tenantId = auth.tenant_id ?? skill.submitted_by ?? "";
+      const rec = await recordUserApproval(env.DB, { skillId, tenantId, deviceId });
+      await insertTrace(env.DB, tenantId, deviceId, "skill_user_approved", { skill_id: skillId, deduped: rec.deduped });
+      return json({
+        ok: true,
+        skill_id: skillId,
+        status: skill.status,
+        user_approved: true,
+        deduped: rec.deduped,
+        note: "Recorded. The skill stays quarantined until a clean scan + admin review approves it.",
+      });
     }
 
     if (path === "/api/skills/library" && method === "GET") {
@@ -3402,7 +3567,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         const tokens = await exchangeCodeForTokens(env, code, origin);
         const email = await fetchGoogleEmail(tokens.accessToken);
         await storeGoogleTokens(env.DB, env, consumed.tenant_id, email, tokens);
-        await insertTrace(env.DB, consumed.tenant_id, consumed.device_id, "google_connected", { scopes: "gmail_read_send_drive_read" });
+        await insertTrace(env.DB, consumed.tenant_id, consumed.device_id, "google_connected", { scopes: "gmail_read_send_drive_read_write_calendar" });
         return htmlPage("Google connected", "Gmail + Drive connect ho gaya. Ab Agent Mode Gmail bhej/padh sakta hai aur Drive files padh sakta hai.", 200);
       } catch (e) {
         if (e instanceof GoogleError) {
@@ -3448,11 +3613,31 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const text = typeof body.body === "string" ? body.body : "";
       if (!to || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return json({ error: "bad_request", detail: "valid 'to' email required" }, 400);
       if (text.length > 100_000) return json({ error: "bad_request", detail: "body too large (100k chars)" }, 400);
+      // R4.6 (D-R18) — Idempotency-Key: the app sends one per logical
+      // send (content hash — see src/idempotency.ts). A replayed key
+      // returns the FIRST send's message id with deduped:true and sends
+      // nothing — the double-tap sends one mail. No header = no dedupe
+      // (old apps keep working). The lookup runs BEFORE the rate limit:
+      // a deduped replay makes no Google call, so it spends no budget.
+      const idemKey = (request.headers.get("idempotency-key") ?? "").trim();
+      if (idemKey) {
+        if (idemKey.length > 128) return json({ error: "bad_request", detail: "Idempotency-Key too long (max 128 chars)" }, 400);
+        const prior = await getIdempotencyRecord(env.DB, tenantId, idemKey);
+        if (prior) return json({ ok: true, id: prior.gmail_message_id, deduped: true });
+      }
       const rl = await checkRateLimit(env, "googleApi", tenantId);
       if (!rl.allowed) return rateLimited(rl);
       try {
         const sent = await gmailSend({ db: env.DB, env, tenantId }, { to, subject, body: text });
-        return json({ ok: true, id: sent.id });
+        if (idemKey) {
+          try {
+            await storeIdempotencyRecord(env.DB, tenantId, idemKey, sent.id);
+          } catch {
+            // The mail is sent; a failed dedupe write must not fail
+            // the response (worst case: a later replay re-sends).
+          }
+        }
+        return json({ ok: true, id: sent.id, deduped: false });
       } catch (e) {
         if (e instanceof GoogleError) return json({ error: e.code, detail: e.message }, e.status);
         throw e;
@@ -3508,6 +3693,104 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       try {
         const file = await driveReadFile({ db: env.DB, env, tenantId }, fileId);
         return json({ ok: true, file });
+      } catch (e) {
+        if (e instanceof GoogleError) return json({ error: e.code, detail: e.message }, e.status);
+        throw e;
+      }
+    }
+
+    // R4.8 (U27) — Drive write + Calendar. Scope trap: these need the
+    // drive.file / calendar.events scopes (GOOGLE_SCOPES, R4.8). A token
+    // granted before R4.8 gets google_reconnect_required (403) from
+    // the helpers — the app sends the user back through consent; the
+    // old token keeps working read-only.
+    if (path === "/api/google/drive/upload" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const rl = await checkRateLimit(env, "googleApi", tenantId);
+      if (!rl.allowed) return rateLimited(rl);
+      try {
+        const file = await driveUploadFile(
+          { db: env.DB, env, tenantId },
+          {
+            name: typeof body.name === "string" ? body.name : "",
+            mimeType: typeof body.mime_type === "string" ? body.mime_type : "application/octet-stream",
+            contentBase64: typeof body.content_base64 === "string" ? body.content_base64 : "",
+          },
+        );
+        return json({ ok: true, file });
+      } catch (e) {
+        if (e instanceof GoogleError) return json({ error: e.code, detail: e.message }, e.status);
+        throw e;
+      }
+    }
+
+    if (path === "/api/google/calendar/events" && method === "GET") {
+      const deviceId = request.headers.get("x-device-id") ?? url.searchParams.get("device_id") ?? "";
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId,
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: url.pathname + url.search,
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? url.searchParams.get("tenant_id") ?? "";
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const rl = await checkRateLimit(env, "googleApi", tenantId);
+      if (!rl.allowed) return rateLimited(rl);
+      try {
+        const events = await calendarListEvents(
+          { db: env.DB, env, tenantId },
+          { maxResults: Number(url.searchParams.get("max_results") ?? 10) || 10 },
+        );
+        return json({ ok: true, events });
+      } catch (e) {
+        if (e instanceof GoogleError) return json({ error: e.code, detail: e.message }, e.status);
+        throw e;
+      }
+    }
+
+    if (path === "/api/google/calendar/events" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const rl = await checkRateLimit(env, "googleApi", tenantId);
+      if (!rl.allowed) return rateLimited(rl);
+      try {
+        const event = await calendarCreateEvent(
+          { db: env.DB, env, tenantId },
+          {
+            summary: typeof body.summary === "string" ? body.summary : "",
+            start: typeof body.start === "string" ? body.start : "",
+            end: typeof body.end === "string" ? body.end : "",
+            description: typeof body.description === "string" ? body.description : undefined,
+          },
+        );
+        return json({ ok: true, event });
       } catch (e) {
         if (e instanceof GoogleError) return json({ error: e.code, detail: e.message }, e.status);
         throw e;
@@ -3641,6 +3924,62 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
     if (path === "/licence/admin" && method === "GET") {
       return new Response(licenceAdminPage(), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+
+    // --- R4.5: admin website v1 (hub-served, M-I-19) ---
+    // Auth = licence-web email-code session + is_admin flag (owner
+    // email only). No x-admin-token on these routes — the page has no
+    // token to send. Key values are NEVER returned (status booleans
+    // only); the Gemini key set is live-validated + encrypted like
+    // POST /api/tenants/:id/key. The GitHub admin token cannot be set
+    // from inside the Worker (Worker secrets come from the Cloudflare
+    // API outside) — the page shows status + the owner-side step.
+    if (path === "/admin" && method === "GET") {
+      const sess = await licenceWebSession();
+      if (!sess) return new Response(adminLoginPage(), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+      await ensureOwnerAdmin(env.DB, sess.email);
+      if (!(await isAdminUser(env.DB, sess.email))) {
+        return new Response(adminLoginPage(), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+      }
+      return new Response(adminDashboardPage(sess.email), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+
+    if (path === "/api/admin/overview" && method === "GET") {
+      const sess = await licenceWebSession();
+      if (!sess || !(await isAdminUser(env.DB, sess.email))) return json({ error: "unauthorized" }, 401);
+      return json({ ok: true, ...(await adminOverview(env.DB, VERSION)) });
+    }
+
+    if (path === "/api/admin/keys" && method === "GET") {
+      const sess = await licenceWebSession();
+      if (!sess || !(await isAdminUser(env.DB, sess.email))) return json({ error: "unauthorized" }, 401);
+      const tenant = await getTenantByOwnerEmail(env.DB);
+      return json({
+        ok: true,
+        has_gemini_key: !!tenant?.gemini_key_enc,
+        has_groq_key: !!tenant?.groq_key_enc,
+        founder_gemini_key_set: !!env.FOUNDER_GEMINI_KEY,
+        founder_groq_key_set: !!env.FOUNDER_GROQ_KEY,
+        github_admin_token_set: !!env.GITHUB_ADMIN_TOKEN,
+      });
+    }
+
+    if (path === "/api/admin/keys/gemini" && method === "POST") {
+      const sess = await licenceWebSession();
+      if (!sess || !(await isAdminUser(env.DB, sess.email))) return json({ error: "unauthorized" }, 401);
+      const body = await readJson(request);
+      const key = typeof body.gemini_key === "string" ? body.gemini_key : "";
+      if (!key) return json({ error: "bad_request" }, 400);
+      const tenant = await getTenantByOwnerEmail(env.DB);
+      if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      if (!env.KEY_ENC_SECRET) return json({ error: "key_vault_not_configured" }, 500);
+      const valid = await validateGeminiKey(key);
+      if (!valid) return json({ error: "invalid_key" }, 400);
+      const master = await importMasterKey(env.KEY_ENC_SECRET);
+      const enc = await encryptTenantKey(master, key);
+      await env.DB.prepare("UPDATE tenants SET gemini_key_enc = ? WHERE id = ?").bind(enc, tenant.id).run();
+      await insertKeyAudit(env.DB, { tenantId: tenant.id, keyKind: "gemini", action: "set", actor: "admin-website" });
+      return json({ ok: true });
     }
 
     if ((path === "/api/licence-web/signup" || path === "/api/licence-web/login") && method === "POST") {

@@ -16,7 +16,13 @@
  *
  * Scopes (minimal, see DESIGN.md §2): gmail.readonly + gmail.send +
  * drive.readonly (+ `email` so the userinfo call can resolve the
- * connected account's address). No gmail.modify, no drive write.
+ * connected account's address). R4.8 adds drive.file (upload/create —
+ * app-created files only, least privilege) + calendar.events (list +
+ * create). No gmail.modify, no full-drive scope. A token granted
+ * BEFORE R4.8 has drive.readonly only — Drive write / Calendar calls
+ * with it get a clean `google_reconnect_required` (403) and the app
+ * sends the user back through consent; the old token keeps working
+ * read-only until then (nothing is broken by the scope change).
  *
  * Tenant isolation: the tenant is NEVER taken from a client-supplied
  * tenant_id on API routes — signed device requests resolve it via
@@ -38,12 +44,19 @@ export const GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke";
 export const GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo";
 export const GOOGLE_GMAIL_BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
 export const GOOGLE_DRIVE_BASE = "https://www.googleapis.com/drive/v3/files";
+export const GOOGLE_DRIVE_UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3/files";
+export const GOOGLE_CALENDAR_BASE = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
 
 /** Minimal scopes — see DESIGN.md §2 for the justification of each. */
 export const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/gmail.readonly",
   "https://www.googleapis.com/auth/gmail.send",
   "https://www.googleapis.com/auth/drive.readonly",
+  // R4.8 (U27): Drive write via drive.file (app-created files only) +
+  // Calendar events. Old tokens (drive.readonly) get a clean
+  // google_reconnect_required on write calls — see driveUploadFile.
+  "https://www.googleapis.com/auth/drive.file",
+  "https://www.googleapis.com/auth/calendar.events",
   "email",
 ];
 
@@ -53,6 +66,8 @@ export const OAUTH_STATE_TTL_MS = 600_000; // 10 min
 export const REFRESH_SKEW_MS = 60_000; // 60 s
 /** Drive content cap for agent steps — larger files return metadata only. */
 export const DRIVE_MAX_BYTES = 512 * 1024; // 512 KB
+/** Drive upload cap (decoded bytes) — v1 bound, documented in BUILD_NOTES. */
+export const DRIVE_UPLOAD_MAX_BYTES = 1024 * 1024; // 1 MB
 /** Gmail list cap for agent steps. */
 export const GMAIL_MAX_RESULTS = 10;
 
@@ -595,4 +610,146 @@ export async function driveReadFile(deps: GoogleApiDeps, fileId: string): Promis
     return { id: fileId, name, mimeType, size, text: null, content_note: "binary_or_undecodable" };
   }
   return { id: fileId, name, mimeType, size, text: rawText };
+}
+
+// --- Drive write + Calendar (R4.8, U27) ---
+//
+// SCOPE TRAP (read before calling): Drive write needs the drive.file
+// scope and Calendar needs calendar.events — both added to
+// GOOGLE_SCOPES in R4.8. A token granted before R4.8 has drive.readonly
+// only: Google answers 403 insufficientPermissions, and these
+// functions translate that into GoogleError("google_reconnect_required",
+// 403) — the app sends the user back through consent. The old token
+// keeps working read-only; nothing is broken, nothing is faked.
+
+export interface DriveUploadResult {
+  id: string;
+  name: string;
+  mimeType: string;
+}
+
+function scopeInsufficientError(action: string): GoogleError {
+  return new GoogleError(
+    "google_reconnect_required",
+    403,
+    `${action} needs a new Google consent (Drive write / Calendar scope) — reconnect in AI Brain > Google`,
+  );
+}
+
+/**
+ * Upload a file to Drive (multipart upload, drive.file scope — the
+ * file lands in the user's Drive, created by Jarvis). contentBase64
+ * is standard base64 of the file bytes; decoded size is capped at
+ * DRIVE_UPLOAD_MAX_BYTES.
+ */
+export async function driveUploadFile(
+  deps: GoogleApiDeps,
+  input: { name: string; mimeType: string; contentBase64: string },
+): Promise<DriveUploadResult> {
+  const name = (input.name ?? "").trim();
+  if (!name || name.length > 255) {
+    throw new GoogleError("bad_request", 400, "A file name (max 255 chars) is required");
+  }
+  const mimeType = (input.mimeType ?? "application/octet-stream").trim() || "application/octet-stream";
+  let bytes: Uint8Array;
+  try {
+    bytes = base64ToBytes(input.contentBase64 ?? "");
+  } catch {
+    throw new GoogleError("bad_request", 400, "contentBase64 is not valid base64");
+  }
+  if (bytes.length > DRIVE_UPLOAD_MAX_BYTES) {
+    throw new GoogleError("bad_request", 400, `File too large for Drive upload (max ${DRIVE_UPLOAD_MAX_BYTES} bytes decoded)`);
+  }
+  const boundary = "jarvis-drive-upload-7f3a";
+  const meta = JSON.stringify({ name, mimeType });
+  const body =
+    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${meta}\r\n` +
+    `--${boundary}\r\nContent-Type: ${mimeType}\r\nContent-Transfer-Encoding: base64\r\n\r\n${input.contentBase64}\r\n` +
+    `--${boundary}--`;
+  const uploaded = await googleFetch(deps, `${GOOGLE_DRIVE_UPLOAD_BASE}?uploadType=multipart`, {
+    method: "POST",
+    headers: { "Content-Type": `multipart/related; boundary=${boundary}` },
+    body,
+  });
+  if (uploaded.status === 403) throw scopeInsufficientError("Drive upload");
+  const parsed = uploaded.json as Record<string, unknown> | null;
+  if (uploaded.status < 200 || uploaded.status >= 300 || typeof parsed?.id !== "string") {
+    throw googleApiError(uploaded.status, uploaded.json);
+  }
+  return { id: parsed.id, name: typeof parsed.name === "string" ? parsed.name : name, mimeType: typeof parsed.mimeType === "string" ? parsed.mimeType : mimeType };
+}
+
+export interface CalendarEventSummary {
+  id: string;
+  summary: string;
+  start: string;
+  end: string;
+  htmlLink?: string;
+}
+
+function toCalendarSummary(ev: Record<string, unknown>): CalendarEventSummary {
+  const start = ev.start as { dateTime?: string; date?: string } | undefined;
+  const end = ev.end as { dateTime?: string; date?: string } | undefined;
+  return {
+    id: typeof ev.id === "string" ? ev.id : "",
+    summary: typeof ev.summary === "string" ? ev.summary : "(no title)",
+    start: start?.dateTime ?? start?.date ?? "",
+    end: end?.dateTime ?? end?.date ?? "",
+    htmlLink: typeof ev.htmlLink === "string" ? ev.htmlLink : undefined,
+  };
+}
+
+/** Upcoming events on the primary calendar, soonest first. */
+export async function calendarListEvents(
+  deps: GoogleApiDeps,
+  input: { maxResults?: number } = {},
+): Promise<CalendarEventSummary[]> {
+  const max = Math.min(Math.max(input.maxResults ?? 10, 1), 50);
+  const params = new URLSearchParams({
+    maxResults: String(max),
+    timeMin: new Date().toISOString(),
+    singleEvents: "true",
+    orderBy: "startTime",
+  });
+  const res = await googleFetch(deps, `${GOOGLE_CALENDAR_BASE}?${params.toString()}`);
+  if (res.status === 403) throw scopeInsufficientError("Calendar read");
+  if (res.status !== 200) throw googleApiError(res.status, res.json);
+  const items = ((res.json as { items?: Array<Record<string, unknown>> } | null)?.items ?? []) as Array<Record<string, unknown>>;
+  return items.map(toCalendarSummary);
+}
+
+/**
+ * Create an event on the primary calendar. start/end are RFC 3339
+ * date-times (e.g. 2026-11-24T10:00:00+05:30). Returns the created
+ * event (id + link for the user to open).
+ */
+export async function calendarCreateEvent(
+  deps: GoogleApiDeps,
+  input: { summary: string; start: string; end: string; description?: string },
+): Promise<CalendarEventSummary> {
+  const summary = (input.summary ?? "").trim();
+  if (!summary || summary.length > 500) {
+    throw new GoogleError("bad_request", 400, "An event title (max 500 chars) is required");
+  }
+  const start = (input.start ?? "").trim();
+  const end = (input.end ?? "").trim();
+  if (!start || !end || Number.isNaN(Date.parse(start)) || Number.isNaN(Date.parse(end))) {
+    throw new GoogleError("bad_request", 400, "start and end must be RFC 3339 date-times");
+  }
+  const created = await googleFetch(deps, GOOGLE_CALENDAR_BASE, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      summary,
+      description: input.description ?? undefined,
+      start: { dateTime: start },
+      end: { dateTime: end },
+    }),
+  });
+  if (created.status === 403) throw scopeInsufficientError("Calendar create");
+  const parsed = created.json as Record<string, unknown> | null;
+  if (created.status < 200 || created.status >= 300 || typeof parsed?.id !== "string") {
+    throw googleApiError(created.status, created.json);
+  }
+  return toCalendarSummary(parsed);
 }

@@ -42,12 +42,22 @@ export interface TickResult {
   error?: string;
 }
 
+/**
+ * R4.2 — optional per-fire hook. runCronTick passes a notifier that
+ * sends the due-job FCM push (kind "due-job"). The hook runs AFTER the
+ * job is marked run, and a hook failure never breaks the tick (the
+ * caller wraps it; a throw here is swallowed so one bad push cannot
+ * stop the remaining jobs).
+ */
+export type OnJobFired = (job: { id: string; tenant_id: string; device_id: string; command: string }) => Promise<void>;
+
 export async function handleTick(
   db: D1Like,
   env: CronEnv,
   secret: string | null,
   dispatch: DispatchStep,
   nowMs = Date.now(),
+  onFired?: OnJobFired,
 ): Promise<TickResult> {
   if (!env.CRON_SECRET || !secret || !constantTimeEqual(secret, env.CRON_SECRET)) {
     return { ok: false, fired: 0, skipped: 0, error: "unauthorized" };
@@ -93,6 +103,13 @@ export async function handleTick(
     const next = nextCronRun(String(job.cron_expr), nowMs);
     await markJobRun(db, jobId, nowMs, next);
     fired++;
+    if (onFired) {
+      try {
+        await onFired({ id: jobId, tenant_id: String(job.tenant_id), device_id: String(job.device_id), command: String(job.command) });
+      } catch {
+        // One bad push must never stop the tick or the next job.
+      }
+    }
   }
   return { ok: true, fired, skipped };
 }

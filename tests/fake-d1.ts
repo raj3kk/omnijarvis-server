@@ -59,6 +59,9 @@ const PK: Record<string, string[]> = {
   // R2 shared memory (0016 jarvis_events, d1_migrations): TEXT id / name.
   jarvis_events: ["id"],
   d1_migrations: ["name"],
+  // R4 (0017): Gmail-send idempotency + cap warnings.
+  idempotency_keys: ["tenant_id", "key"],
+  cap_warnings: ["id"],
 };
 
 export class FakeD1 implements D1Like {

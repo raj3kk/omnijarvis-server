@@ -498,8 +498,10 @@ export interface CapUsage {
 }
 
 /** Har cap jis par usage >= 80% ho — status response me warnings[].
- * Cap-warning emails are NOT sent (status-only by design); renewal
- * reminders are the email path (Resend, src/email.ts). */
+ * R4.9 changed the email half of this design: the replies/mo cap now
+ * ALSO sends one warning email per period (src/cap-warning.ts, hooked
+ * in /api/llm/turn-complete). e2b/cron/devices stay status-only.
+ * Renewal reminders remain the other email path (Resend, src/email.ts). */
 export function capWarnings(usage: CapUsage, planTier: string): string[] {
   const limits = planLimits(planTier);
   const out: string[] = [];
