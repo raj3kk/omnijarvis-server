@@ -49,6 +49,11 @@ export const RATE_LIMITS: Record<string, { limit: number; windowMs: number }> = 
   licenceWebSignupIp: { limit: 10, windowMs: 3_600_000 },
   licenceWebVerify: { limit: 10, windowMs: 600_000 },
   licenceWebGenerate: { limit: 5, windowMs: 3_600_000 },
+  // R1 Main Executor + GitHub proxy: escalations and PR requests are
+  // rare (a runaway loop is the only thing that should ever hit these).
+  mainEscalate: { limit: 10, windowMs: 60_000 },
+  githubFetch: { limit: 30, windowMs: 60_000 },
+  githubPr: { limit: 10, windowMs: 60_000 },
 };
 
 export interface RateLimitResult {

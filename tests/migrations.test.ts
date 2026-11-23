@@ -425,3 +425,55 @@ describe("D1 migration 0013 (M-I-28 licence web: users + codes + sessions)", () 
     expect(code.toLowerCase()).not.toContain("resend_api_key");
   });
 });
+
+const SQL14 = readFileSync(
+  new URL("../d1/migrations/0014_main_jobs.sql", import.meta.url),
+  "utf8",
+);
+
+describe("D1 migration 0014 (R1 Main Executor jobs)", () => {
+  it("creates main_jobs with the job state machine columns", () => {
+    expect(SQL14).toContain("CREATE TABLE IF NOT EXISTS main_jobs (");
+    for (const col of ["id TEXT PRIMARY KEY", "tenant_id TEXT NOT NULL", "ask TEXT NOT NULL", "repo TEXT NOT NULL", "status TEXT NOT NULL DEFAULT 'received'", "mode TEXT NOT NULL DEFAULT 'github'", "plan TEXT", "transcript TEXT NOT NULL DEFAULT '[]'", "pr_url TEXT", "llm_calls INTEGER NOT NULL DEFAULT 0", "steps_used INTEGER NOT NULL DEFAULT 0", "created_at INTEGER NOT NULL"]) {
+      expect(SQL14).toContain(col);
+    }
+    expect(SQL14).toContain("idx_main_jobs_status");
+    expect(SQL14).toContain("idx_main_jobs_tenant");
+  });
+
+  it("is non-destructive: no DROP TABLE / TRUNCATE / DELETE FROM, no secrets", () => {
+    const code = SQL14.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(code).not.toMatch(/DROP\s+TABLE/i);
+    expect(code).not.toMatch(/TRUNCATE/i);
+    expect(code).not.toMatch(/DELETE\s+FROM/i);
+    expect(code.toLowerCase()).not.toContain("github_admin_token");
+  });
+});
+
+const SQL15 = readFileSync(
+  new URL("../d1/migrations/0015_key_audit.sql", import.meta.url),
+  "utf8",
+);
+
+describe("D1 migration 0015 (R1 key set/delete audit trace, N-7 fix)", () => {
+  it("creates key_audit with tenant + kind + action, and NO value column", () => {
+    expect(SQL15).toContain("CREATE TABLE IF NOT EXISTS key_audit (");
+    for (const col of ["id TEXT PRIMARY KEY", "tenant_id TEXT NOT NULL", "key_kind TEXT NOT NULL", "action TEXT NOT NULL", "actor TEXT NOT NULL DEFAULT 'admin'", "created_at INTEGER NOT NULL"]) {
+      expect(SQL15).toContain(col);
+    }
+    expect(SQL15).toContain("idx_key_audit_tenant");
+    // The key VALUE is never recorded — there must be no column that
+    // could hold one.
+    const code = SQL15.replace(/--[^\n]*/g, "");
+    expect(code.toLowerCase()).not.toContain("key_value");
+    expect(code.toLowerCase()).not.toContain("key_enc");
+    expect(code.toLowerCase()).not.toContain("secret");
+  });
+
+  it("is non-destructive: no DROP TABLE / TRUNCATE / DELETE FROM", () => {
+    const code = SQL15.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(code).not.toMatch(/DROP\s+TABLE/i);
+    expect(code).not.toMatch(/TRUNCATE/i);
+    expect(code).not.toMatch(/DELETE\s+FROM/i);
+  });
+});

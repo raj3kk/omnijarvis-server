@@ -34,6 +34,7 @@ const RATE_LIMITS = {
   licenceVerify: { limit: 30, windowMs: 60_000 },
   licenceGenerate: { limit: 20, windowMs: 60_000 },
   licenceRelease: { limit: 30, windowMs: 60_000 },
+  licenceRevoke: { limit: 20, windowMs: 60_000 }, // U14
   licenceStatus: { limit: 60, windowMs: 60_000 },
   patternsPost: { limit: 60, windowMs: 60_000 },
   patternsGet: { limit: 120, windowMs: 60_000 },
@@ -293,7 +294,16 @@ async function licenceVerify(request, env) {
   } catch {
     return json({ ok: false, error: "verify_failed" }, 500);
   }
-  if (!licence || licence.status !== "active") {
+  // U14: a revoked licence gets a distinct 403 — the phone can tell the
+  // user the licence was revoked (contact the owner) instead of treating
+  // it as a typo'd/invalid key. Unknown keys stay 404 invalid_licence.
+  if (!licence) {
+    return json({ ok: false, error: "invalid_licence" }, 404);
+  }
+  if (licence.status === "revoked") {
+    return json({ ok: false, error: "licence_revoked" }, 403);
+  }
+  if (licence.status !== "active") {
     return json({ ok: false, error: "invalid_licence" }, 404);
   }
   if (!licence.device_id) {
@@ -467,6 +477,47 @@ async function licenceRelease(request, env) {
   if (!released.ok) return json({ error: "release_failed" }, 500);
   if (released.changes === 0) return json({ error: "not_bound" }, 409);
   return json({ ok: true, released: true, via: "key_device" });
+}
+
+// U14 — admin-only revoke (the hub's /api/licence-web/admin/revoke is the
+// dashboard path; this is the Worker's own route). Sets status='revoked':
+// a revoked licence can never verify again (403 licence_revoked) and a
+// new licence cannot be generated for that user (licenceGenerate 403).
+// The device binding is left on the row as an audit trail — the row is
+// dead either way. Idempotent: revoking an already-revoked licence
+// returns ok:true with already:true.
+async function licenceRevoke(request, env) {
+  if (rateLimited(request, "licenceRevoke")) {
+    return json({ error: "revoke_failed" }, 429);
+  }
+  if (!(await isLicenceAdmin(request, env))) {
+    return json({ error: "admin_forbidden" }, 403);
+  }
+  const body = await request.json().catch(() => ({}));
+  const key = typeof body.key === "string" ? body.key.trim().toUpperCase() : "";
+  if (!key) return json({ error: "missing_key" }, 400);
+  let licence;
+  try {
+    licence = await d1First(
+      env,
+      "SELECT key, user_id, device_id, status FROM licences WHERE key = ?",
+      key
+    );
+  } catch {
+    return json({ error: "revoke_failed" }, 500);
+  }
+  if (!licence) return json({ error: "invalid_licence" }, 404);
+  if (licence.status === "revoked") return json({ ok: true, revoked: true, already: true });
+  if (licence.status !== "active") return json({ error: "invalid_licence" }, 404);
+  const revoked = await d1Run(
+    env,
+    "UPDATE licences SET status = ? WHERE key = ? AND status = 'active'",
+    "revoked",
+    key
+  );
+  if (!revoked.ok) return json({ error: "revoke_failed" }, 500);
+  if (revoked.changes === 0) return json({ error: "invalid_licence" }, 404);
+  return json({ ok: true, revoked: true });
 }
 
 async function licenceStatus(request, env) {
@@ -746,6 +797,7 @@ function statusPage() {
 <li><code>POST /api/licence/verify</code> — { key, device_id }</li>
 <li><code>POST /api/licence/generate</code> — admin token required</li>
 <li><code>POST /api/licence/release</code> — admin token + key, or { key, device_id }</li>
+<li><code>POST /api/licence/revoke</code> — admin token required (U14)</li>
 <li><code>GET /api/licence/status</code> — admin token + key, or ?key=…&amp;device_id=…</li>
 <li><code>GET / POST / DELETE /api/patterns</code> — approved templates only (GET); uploads need an activated licence</li>
 </ul>
@@ -768,6 +820,9 @@ export default {
       }
       if (path === "/api/licence/release" && request.method === "POST") {
         return await licenceRelease(request, env);
+      }
+      if (path === "/api/licence/revoke" && request.method === "POST") {
+        return await licenceRevoke(request, env);
       }
       if (path === "/api/licence/status" && request.method === "GET") {
         return await licenceStatus(request, env);

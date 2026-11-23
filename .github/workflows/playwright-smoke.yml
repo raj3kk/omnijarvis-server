@@ -1,0 +1,27 @@
+name: Playwright smoke
+# R1 (2026-11-23): Main Executor's browser verification, $0 on the public
+# repo's runners. Read-only GETs against the LIVE hub + licence Worker —
+# no auth, no writes, no secrets. Runs on PRs (before the deploy lands,
+# so the spec never hard-codes a version) and on manual dispatch.
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "licence-worker/**"
+      - "tests/playwright/**"
+      - ".github/workflows/playwright-smoke.yml"
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      # No package.json change: Playwright is installed ad-hoc for this run.
+      - run: npm i --no-save @playwright/test
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test tests/playwright/smoke.spec.ts --reporter=list

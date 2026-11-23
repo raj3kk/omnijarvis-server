@@ -67,6 +67,32 @@ export async function insertTrace(
     .run();
 }
 
+/**
+ * R1 (N-7 fix): audit trace for every Gemini/Groq key set and delete.
+ * Only the fact is recorded (tenant, key kind, action, actor) — the key
+ * VALUE is never written here or anywhere else. Read-only table: nothing
+ * in the hub deletes from key_audit.
+ */
+export async function insertKeyAudit(
+  db: D1Like,
+  opts: {
+    tenantId: string;
+    keyKind: "gemini" | "groq";
+    action: "set" | "delete";
+    actor?: string;
+    nowMs?: number;
+  },
+): Promise<string> {
+  const id = `ka-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  await db
+    .prepare(
+      "INSERT INTO key_audit (id, tenant_id, key_kind, action, actor, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id, opts.tenantId, opts.keyKind, opts.action, opts.actor ?? "admin", opts.nowMs ?? Date.now())
+    .run();
+  return id;
+}
+
 export async function touchDeviceSeen(db: D1Like, deviceId: string): Promise<void> {
   await db
     .prepare("UPDATE devices SET last_seen = ? WHERE device_id = ?")

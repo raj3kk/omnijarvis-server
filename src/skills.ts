@@ -911,6 +911,38 @@ export async function listApprovedSkills(db: D1Like): Promise<SkillRow[]> {
   return res.results ?? [];
 }
 
+/**
+ * U13 — approved skills created after `sinceMs` (0 = all), oldest first.
+ * The phone syncs this list after an approval push so a newly approved
+ * skill lands on-device without re-pulling the whole library.
+ */
+export async function listApprovedSkillsSince(db: D1Like, sinceMs: number): Promise<SkillRow[]> {
+  const res = await db
+    .prepare(
+      "SELECT id, manifest, status, submitted_by, created_at FROM global_skills " +
+        "WHERE status = ? AND created_at > ? ORDER BY created_at ASC",
+    )
+    .bind("approved", sinceMs)
+    .all<SkillRow>();
+  return res.results ?? [];
+}
+
+/**
+ * U13 — active submissions by one tenant (quarantined + approved).
+ * Rejected skills do not count: a rejected submitter may try again.
+ * JS-filtered on status (the metering.ts precedent) so the count stays
+ * exact without an IN-literal in the query.
+ */
+export async function countActiveSkillsByTenant(db: D1Like, tenantId: string): Promise<number> {
+  const res = await db
+    .prepare("SELECT id, status FROM global_skills WHERE submitted_by = ?")
+    .bind(tenantId)
+    .all<{ id: string; status: string }>();
+  return (res.results ?? []).filter(
+    (r) => r.status === "quarantined" || r.status === "approved",
+  ).length;
+}
+
 export async function setSkillStatus(db: D1Like, skillId: string, status: string): Promise<void> {
   await db.prepare("UPDATE global_skills SET status = ? WHERE id = ?").bind(status, skillId).run();
 }

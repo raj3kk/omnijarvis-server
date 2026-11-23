@@ -123,8 +123,9 @@ export type SolveError =
 /** Audit outcomes (DESIGN §4.1), plus 'submitted' — the hub-side
  * submission event (the answer handed to the device, which submits it
  * exactly once). submitted_ok / submitted_wrong are device-side
- * distinctions reported via /api/browser/resolve, not linkable to a
- * solve_id in v1, so the hub records 'submitted' here. */
+ * distinctions reported via /api/browser/resolve with the solve_id —
+ * linkSolveOutcome() below links them back to the submitted row, so
+ * the success rate is auditable per solve_id (U12, hub v17). */
 export type SolveOutcome =
   | "answered"
   | "low_confidence"
@@ -316,6 +317,39 @@ async function insertSolveRow(db: D1Like, row: SolveRow): Promise<void> {
       row.created_at,
     )
     .run();
+}
+
+/**
+ * U12 — link a solve outcome back to its solve_id (hub v17).
+ * The device reports, via /api/browser/resolve { solve_id, solved },
+ * whether the submitted answer actually cleared the challenge. The
+ * submitted row is the successful attempt's row: id = solve_id
+ * (attempt 1) or `<solve_id>-a2` / `-a3` (attempts 2–3). Only a row
+ * still in outcome 'submitted' is relinked — a failed/capped attempt
+ * keeps its own outcome, and a second link finds no 'submitted' row
+ * (idempotent: linked:false, no overwrite). tenantId scopes the
+ * update for device callers; internal-secret callers pass undefined
+ * (admin-equivalent, unscoped).
+ */
+export async function linkSolveOutcome(
+  db: D1Like,
+  solveId: string,
+  solved: boolean,
+  tenantId?: string,
+): Promise<{ ok: boolean; linked: boolean }> {
+  const outcome: SolveOutcome = solved ? "submitted_ok" : "submitted_wrong";
+  const ids = [solveId, `${solveId}-a2`, `${solveId}-a3`];
+  const placeholders = ids.map(() => "?").join(",");
+  const where = tenantId
+    ? `tenant_id = ? AND outcome = 'submitted' AND id IN (${placeholders})`
+    : `outcome = 'submitted' AND id IN (${placeholders})`;
+  const args = tenantId ? [tenantId, ...ids] : ids;
+  const res = await db
+    .prepare(`UPDATE captcha_solves SET outcome = ? WHERE ${where}`)
+    .bind(outcome, ...args)
+    .run();
+  const changes = (res.meta as { changes?: number } | undefined)?.changes ?? 0;
+  return { ok: true, linked: changes > 0 };
 }
 
 async function traceSolve(

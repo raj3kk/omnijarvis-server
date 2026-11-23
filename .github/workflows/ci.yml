@@ -17,6 +17,26 @@ jobs:
       - run: npm test
       - run: npx tsc --noEmit
 
+  # R1 lint check (CI-only, report-only): no biome.json / eslint config
+  # exists in this repo yet, so Biome runs with its defaults and its
+  # findings NEVER fail the build. The job fails only if the linter
+  # itself cannot run (npx/download failure) — same rule as the app's
+  # ktlint report-only job. Pin the Biome version so a future Biome
+  # release cannot silently change what "clean" means.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Linter presence check (Biome must be runnable)
+        run: npx --yes @biomejs/biome@1.9.4 --version
+      - name: Biome check (report-only — findings never fail CI)
+        run: |
+          npx --yes @biomejs/biome@1.9.4 check src/ licence-worker/worker.js || echo "::warning::Biome findings present (report-only; see the log above)"
+
   render-smoke:
     runs-on: ubuntu-latest
     steps:

@@ -111,10 +111,11 @@ export interface Env {
   LICENCE_ADMIN_TOKEN?: string; // M-I-28: hub calls the licence Worker generate/release with this (same value as the Worker's own secret — no new secret)
   LICENCE_WORKER_URL?: string; // M-I-28: override, default https://jarvis-licence.rajraj3kk.workers.dev
   LICENCE_WORKER?: Fetcher; // M-I-28: service binding to jarvis-licence (see licenceWorkerCall — workers.dev subrequests 1042)
+  GITHUB_ADMIN_TOKEN?: string; // R1 Main Executor: admin GitHub PAT (repo read/write on raj3kk/jarvis-agent-app + raj3kk/omnijarvis-server) — set once by the admin as a Worker secret; unset = Main runs propose-only (dry-run)
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "16"; // 16: malformed llm message shape -> 400 (was 500); 15 was the licence Worker service binding
+const VERSION = "17"; // 17: Main Executor v1 (R1) — GitHub client + /api/escalate + /api/main/* + /api/github/* + key_audit + N-1/N-2; 16 was malformed llm message shape -> 400
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";
@@ -143,8 +144,8 @@ import {
   sessionCookie,
   verifyEmailCode,
 } from "./licence-web";
-import { checkRateLimit, checkUpstashLive, probeUpstashCounter, type RateLimitResult } from "./ratelimit";
-import { d1Batch, getDevice, getTenant, insertTrace, verifyLicenceKey } from "./db";
+import { checkRateLimit, checkUpstashLive, probeUpstashCounter, upstashStatus, type RateLimitResult } from "./ratelimit";
+import { d1Batch, getDevice, getTenant, insertKeyAudit, insertTrace, verifyLicenceKey } from "./db";
 import {
   buildCaptchaAssistEvent,
   executeBrowserTask,
@@ -159,6 +160,7 @@ import { completeTurn, loadRouterConfig, routeLlm, validateGeminiKey, validateGr
 import { encryptTenantKey, importMasterKey } from "./keyvault";
 import {
   MAX_SKILL_CODE_BYTES,
+  countActiveSkillsByTenant,
   getSkill,
   getSkillPublicKey,
   getSkillSignature,
@@ -166,6 +168,7 @@ import {
   insertSkillReview,
   insertSkillSignature,
   listApprovedSkills,
+  listApprovedSkillsSince,
   manifestHash,
   newSkillId,
   scanSkillCode,
@@ -236,7 +239,7 @@ import {
 } from "./e2b";
 import { getMonthUsage, currentPeriod } from "./metering";
 import { planLimits } from "./router";
-import { listEmailSends, sendEmail, sendRenewalReminderEmail, sendVerificationEmail } from "./email";
+import { listEmailSends, sendEmail, sendEmailWithRecord, sendRenewalReminderEmail, sendVerificationEmail } from "./email";
 import { createTenantBackup, listBackups, restoreTestBackup } from "./backup";
 import {
   GoogleError,
@@ -254,8 +257,25 @@ import {
   revokeGoogleTokens,
   storeGoogleTokens,
 } from "./google";
-import { solveCaptcha, validateSolveRequest } from "./captcha";
+import { linkSolveOutcome, solveCaptcha, validateSolveRequest } from "./captcha";
 import { getFcmRegistration, registerFcmToken, sendFcm } from "./fcm";
+import { isLangfuseConfigured, isSentryConfigured, langfuseHost } from "./observability";
+import {
+  createPullRequest,
+  getFileContent,
+  isGitHubConfigured,
+  isWriteRepo,
+  parseRepoSlug,
+} from "./github";
+import {
+  MAIN_INLINE_STEPS_PER_RUN,
+  appendTranscript,
+  createMainJob,
+  getMainJob,
+  parseTranscript,
+  runMainStep,
+  stepMainJobs,
+} from "./main";
 import {
   MAX_INGEST_BYTES,
   authorizeDocsRequest,
@@ -386,6 +406,16 @@ export async function runCronTick(
     return res.ok;
   };
   const result = await handleTick(env.DB, env, env.CRON_SECRET ?? null, dispatch);
+  // R1: step pending Main Executor jobs (max 2 per tick, one step each).
+  // Best-effort — a Main failure never breaks the tick (traced, the
+  // next tick retries after the backoff).
+  try {
+    await stepMainJobs(env);
+  } catch (e) {
+    await insertTrace(env.DB, "system", "hub", "main_step_tick_failed", {
+      error: String((e as Error)?.message ?? e).slice(0, 200),
+    });
+  }
   // Billing sweeps run after the tick in both paths. The renewal
   // reminder callback sends the Resend email (best-effort, recorded
   // in email_sends; a failed send never breaks the tick).
@@ -664,10 +694,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }
       if (method === "DELETE" && path.endsWith("/key")) {
         await env.DB.prepare("UPDATE tenants SET gemini_key_enc = NULL WHERE id = ?").bind(tenantId).run();
+        // R1 (N-7 fix): every key set/delete writes an audit row (the
+        // key VALUE is never recorded — only the fact).
+        await insertKeyAudit(env.DB, { tenantId, keyKind: "gemini", action: "delete" });
         return json({ ok: true });
       }
       if (method === "DELETE" && path.endsWith("/groq-key")) {
         await env.DB.prepare("UPDATE tenants SET groq_key_enc = NULL WHERE id = ?").bind(tenantId).run();
+        await insertKeyAudit(env.DB, { tenantId, keyKind: "groq", action: "delete" });
         return json({ ok: true });
       }
       if (method === "POST" && (path.endsWith("/key") || path.endsWith("/groq-key"))) {
@@ -686,14 +720,266 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         const enc = await encryptTenantKey(master, key);
         if (isGroq) {
           await env.DB.prepare("UPDATE tenants SET groq_key_enc = ? WHERE id = ?").bind(enc, tenantId).run();
+          await insertKeyAudit(env.DB, { tenantId, keyKind: "groq", action: "set" });
           return json({ ok: true });
         }
         await env.DB
           .prepare("UPDATE tenants SET gemini_key_enc = ?, billing_mode = ? WHERE id = ?")
           .bind(enc, billingMode, tenantId)
           .run();
+        await insertKeyAudit(env.DB, { tenantId, keyKind: "gemini", action: "set" });
         return json({ ok: true, billing_mode: billingMode });
       }
+    }
+
+    // --- R1: Main Executor + GitHub proxy (hybrid core) ---
+    // Phone-facing routes use docs-style auth: x-internal-secret (agent
+    // caller) OR paired device + Ed25519 signature (x-device-id /
+    // x-nonce / x-ts / x-signature; POST signs sortedJson(body), GET
+    // signs the path). /api/main/run is x-admin-token; /api/main/step
+    // is x-internal-secret (cron tick + admin).
+    //
+    // Token contract (user question 2026-11-23 ~13:00 IST): WITH the
+    // admin GitHub token, Main reads repo code, creates branches,
+    // commits + pushes fixes, opens PRs, polls CI check-runs, reads
+    // failing-check output, and sends the update notice. WITHOUT it,
+    // Main runs PROPOSE-ONLY (dry-run): research + draft patch + PR
+    // body + evidence bundle, queued — no push, no PR, no authenticated
+    // calls. The loop goes live the moment the token is set as a Worker
+    // secret, no rebuild.
+    if (path === "/api/escalate" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const rl = await checkRateLimit(env, "mainEscalate", tenantId);
+      if (!rl.allowed) return rateLimited(rl);
+      const goal = typeof body.goal === "string" ? body.goal.trim() : "";
+      const repo = typeof body.repo === "string" ? body.repo.trim() : "";
+      if (!goal || !repo) return json({ error: "bad_request", detail: "goal + repo chahiye" }, 400);
+      const created = await createMainJob(env, {
+        tenantId,
+        deviceId: auth.device_id ?? undefined,
+        ask: goal,
+        repo,
+      });
+      if (!created.ok) {
+        const status = created.error === "tenant_not_found" ? 404 : created.error === "daily_job_cap" ? 429 : 400;
+        return json({ error: created.error, detail: created.detail }, status);
+      }
+      // Escalation context (what the phone tried, what went wrong) is
+      // stored as a transcript entry — the architect reads it with the
+      // job. Personal content must already be stripped by the phone;
+      // the hub truncates every field to 5,000 chars as a backstop.
+      const ctx = ["tried", "error", "need"]
+        .map((k) => (typeof body[k] === "string" && body[k].trim() ? `${k}: ${String(body[k]).slice(0, 5000)}` : ""))
+        .filter(Boolean)
+        .join("\n");
+      if (ctx) {
+        await appendTranscript(env.DB, created.job, { phase: "escalation", note: ctx });
+      }
+      return json({ ok: true, job_id: created.job.id, status: created.job.status, mode: created.job.mode });
+    }
+
+    if (path.startsWith("/api/main/jobs/") && method === "GET") {
+      const jobId = path.split("/").filter(Boolean)[3] ?? "";
+      // Admin token sees any job; a device sees only its own tenant's
+      // jobs; x-internal-secret callers are admin-equivalent (no tenant
+      // scoping — same as the other agent routes).
+      const adminOk = !!env.LLM_ADMIN_TOKEN && request.headers.get("x-admin-token") === env.LLM_ADMIN_TOKEN;
+      let tenantId: string | undefined;
+      if (!adminOk) {
+        const auth = await authorizeDocsRequest(env.DB, {
+          internalSecret: env.INTERNAL_SECRET,
+          internalHeader: request.headers.get("x-internal-secret"),
+          deviceId: request.headers.get("x-device-id") ?? "",
+          nonce: request.headers.get("x-nonce"),
+          ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+          sig: request.headers.get("x-signature"),
+          payloadRaw: path,
+        });
+        if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+        tenantId = auth.tenant_id;
+      }
+      const job = await getMainJob(env.DB, jobId);
+      if (!job) return json({ error: "job_not_found" }, 404);
+      if (tenantId && job.tenant_id !== tenantId) return json({ error: "forbidden" }, 403);
+      const entries = parseTranscript(job);
+      let plan: unknown = null;
+      try {
+        plan = job.plan ? JSON.parse(job.plan) : null;
+      } catch {
+        plan = null;
+      }
+      return json({
+        ok: true,
+        job: {
+          id: job.id,
+          tenant_id: job.tenant_id,
+          ask: job.ask,
+          repo: job.repo,
+          base_branch: job.base_branch,
+          branch: job.branch,
+          status: job.status,
+          mode: job.mode,
+          pr_url: job.pr_url,
+          pr_number: job.pr_number,
+          ci_status: job.ci_status,
+          scan_verdict: job.scan_verdict,
+          llm_calls: job.llm_calls,
+          steps_used: job.steps_used,
+          retries_used: job.retries_used,
+          error: job.error,
+          error_code: job.error_code,
+          created_at: job.created_at,
+          updated_at: job.updated_at,
+          plan,
+          transcript: entries.slice(-50),
+        },
+      });
+    }
+
+    if (path === "/api/main/run" && method === "POST") {
+      if (!env.LLM_ADMIN_TOKEN || request.headers.get("x-admin-token") !== env.LLM_ADMIN_TOKEN) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const body = await readJson(request);
+      const tenantId = typeof body.tenant_id === "string" ? body.tenant_id : "";
+      const ask = typeof body.ask === "string" ? body.ask : "";
+      const repo = typeof body.repo === "string" ? body.repo : "";
+      if (!tenantId || !ask || !repo) return json({ error: "bad_request" }, 400);
+      const snapshotFiles = Array.isArray(body.snapshot_files)
+        ? (body.snapshot_files as { path: string; content: string }[])
+        : undefined;
+      const created = await createMainJob(env, {
+        tenantId,
+        deviceId: typeof body.device_id === "string" ? body.device_id : undefined,
+        ask,
+        repo,
+        baseBranch: typeof body.base_branch === "string" ? body.base_branch : undefined,
+        snapshotFiles,
+      });
+      if (!created.ok) {
+        const status = created.error === "tenant_not_found" ? 404 : created.error === "daily_job_cap" ? 429 : 400;
+        return json({ error: created.error, detail: created.detail }, status);
+      }
+      // Run up to 3 steps inline (bounded — one step is one LLM call +
+      // at most one commit); the cron tick continues the job after.
+      let job = created.job;
+      let note = "";
+      for (let i = 0; i < MAIN_INLINE_STEPS_PER_RUN; i++) {
+        const stepped = await runMainStep(env, job.id);
+        if (!stepped.ok) {
+          note = stepped.detail ?? stepped.error;
+          break;
+        }
+        job = stepped.job;
+        note = stepped.note ?? "";
+        if (["pr_open", "pr_open_needs_work", "parked", "partial", "failed", "blocked_token"].includes(job.status)) break;
+      }
+      return json({ ok: true, job_id: job.id, status: job.status, mode: job.mode, note });
+    }
+
+    if (path === "/api/main/step" && method === "POST") {
+      if (!env.INTERNAL_SECRET || request.headers.get("x-internal-secret") !== env.INTERNAL_SECRET) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const body = await readJson(request);
+      const jobId = typeof body.job_id === "string" ? body.job_id : "";
+      if (!jobId) return json({ error: "bad_request" }, 400);
+      const stepped = await runMainStep(env, jobId, { resume: body.resume === true });
+      if (!stepped.ok) {
+        const status =
+          stepped.error === "job_not_found"
+            ? 404
+            : stepped.error === "github_token_not_configured"
+              ? 503
+              : 400;
+        return json({ error: stepped.error, detail: stepped.detail, retryable: stepped.retryable ?? false }, status);
+      }
+      return json({ ok: true, job_id: stepped.job.id, status: stepped.job.status, mode: stepped.job.mode, note: stepped.note });
+    }
+
+    if (path === "/api/github/fetch" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const rl = await checkRateLimit(env, "githubFetch", tenantId);
+      if (!rl.allowed) return rateLimited(rl);
+      const owner = typeof body.owner === "string" ? body.owner : "";
+      const repo = typeof body.repo === "string" ? body.repo : "";
+      const filePath = typeof body.path === "string" ? body.path : "";
+      if (!owner || !repo || !filePath) return json({ error: "bad_request" }, 400);
+      const ref = typeof body.ref === "string" ? body.ref : undefined;
+      const file = await getFileContent(env, owner, repo, filePath, ref);
+      if (!file.ok) {
+        const status =
+          file.error === "not_found" ? 404 : file.error === "rate_limited" ? 429 : 502;
+        return json({ error: file.error, detail: file.detail }, status);
+      }
+      if (!file.data) return json({ error: "not_found" }, 404);
+      return json({ ok: true, content: file.data.content, sha: file.data.sha, size: file.data.size });
+    }
+
+    if (path === "/api/github/pr-request" && method === "POST") {
+      const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const tenantId = auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      if (!tenantId) return json({ error: "bad_request" }, 400);
+      const rl = await checkRateLimit(env, "githubPr", tenantId);
+      if (!rl.allowed) return rateLimited(rl);
+      const owner = typeof body.owner === "string" ? body.owner : "";
+      const repo = typeof body.repo === "string" ? body.repo : "";
+      const title = typeof body.title === "string" ? body.title : "";
+      const prBody = typeof body.body === "string" ? body.body : "";
+      const head = typeof body.head === "string" ? body.head : "";
+      const base = typeof body.base === "string" ? body.base : "main";
+      if (!owner || !repo || !title || !head) return json({ error: "bad_request" }, 400);
+      if (!isWriteRepo(owner, repo)) {
+        return json({ error: "repo_not_writable", detail: "PRs only for raj3kk/jarvis-agent-app and raj3kk/omnijarvis-server" }, 403);
+      }
+      if (!isGitHubConfigured(env)) {
+        return json({ error: "github_not_configured", detail: "Admin token set hone tak PR nahi khul sakta — propose-only." }, 503);
+      }
+      const pr = await createPullRequest(env, owner, repo, {
+        title: title.slice(0, 200),
+        body: prBody.slice(0, 20000),
+        head,
+        base,
+      });
+      if (!pr.ok) {
+        const status = pr.error === "not_found" ? 404 : pr.error === "rate_limited" ? 429 : 502;
+        return json({ error: pr.error }, status);
+      }
+      return json({ ok: true, pr_url: pr.data.html_url, pr_number: pr.data.number });
     }
 
     // --- Doc pipeline (Phase 3, stage 3b) ---
@@ -1053,16 +1339,44 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     if (path === "/api/browser/resolve" && method === "POST") {
-      if (!env.INTERNAL_SECRET || request.headers.get("x-internal-secret") !== env.INTERNAL_SECRET) {
-        return json({ error: "unauthorized" }, 401);
-      }
+      // Human-assist resolution AND captcha solve-outcome link-back (U12).
+      // Body: { task_id?, solve_id?, solved: boolean, aborted?, duration_s?,
+      //         tenant_id? }. At least one of task_id / solve_id is required.
+      // Auth: x-internal-secret (agent) OR a paired device signature — the
+      // phone reports the solve outcome itself after submitting the answer.
+      // A device caller may only resolve/link rows of its own tenant.
       const body = await readJson(request);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? (typeof body.device_id === "string" ? body.device_id : ""),
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: sortedJson(body),
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
       const taskId = typeof body.task_id === "string" ? body.task_id : "";
-      if (!taskId || typeof body.solved !== "boolean") return json({ error: "bad_request" }, 400);
+      const solveId = typeof body.solve_id === "string" ? body.solve_id : "";
+      if ((!taskId && !solveId) || typeof body.solved !== "boolean") return json({ error: "bad_request" }, 400);
+      const solved = body.solved === true;
+      const tenantId =
+        auth.tenant_id ?? (typeof body.tenant_id === "string" ? body.tenant_id : "");
+      // U12: link the auto-solve outcome back to its solve_id. Only a row
+      // still in outcome 'submitted' relinks (idempotent — a second
+      // report finds nothing and returns solve_linked:false).
+      let solveLinked = false;
+      if (solveId) {
+        solveLinked = (await linkSolveOutcome(env.DB, solveId, solved, tenantId || undefined)).linked;
+      }
+      if (!taskId) return json({ ok: true, solve_id: solveId, solve_linked: solveLinked });
       const task = await getBrowserTask(env.DB, taskId);
       if (!task) return json({ error: "task_not_found" }, 404);
+      if (auth.tenant_id && task.tenant_id !== auth.tenant_id) {
+        return json({ error: "forbidden" }, 403);
+      }
       const outcome: AssistOutcome =
-        body.aborted === true ? "aborted" : body.solved === true ? "solved" : "timeout";
+        body.aborted === true ? "aborted" : solved ? "solved" : "timeout";
       const res = await resolveCaptchaAssist(env.DB, taskId, outcome);
       if (!res.ok) return json({ error: "task_not_found" }, 404);
       await insertTrace(
@@ -1071,12 +1385,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         task.device_id,
         "captcha_assist",
         captchaAssistTrace(task.id, task.site, {
-          solved: body.solved === true,
+          solved,
           duration_s: typeof body.duration_s === "number" ? body.duration_s : undefined,
           outcome,
         }),
       );
-      return json({ ok: true, task_id: taskId, status: res.status });
+      return json({ ok: true, task_id: taskId, status: res.status, solve_id: solveId || undefined, solve_linked: solveLinked });
     }
 
     // --- Captcha auto-solve (D3 LOCKED 2026-11-22, DESIGN §2) ---
@@ -1271,6 +1585,23 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }
       const rl = await checkRateLimit(env, "skills", tenantId);
       if (!rl.allowed) return rateLimited(rl);
+      // U13 — plan cap on SUBMIT (the library route already caps Free's
+      // read at 1 approved skill; this caps how many a tenant may have
+      // live at once). Active = quarantined + approved; rejected does
+      // not count, so a rejected submitter may try again. Free = 1,
+      // Pro/Business = uncapped (planLimits().skills).
+      const activeCount = await countActiveSkillsByTenant(env.DB, tenantId);
+      if (activeCount >= planLimits(tenant.plan_tier).skills) {
+        return json(
+          {
+            error: "skills_submit_cap",
+            detail: `Free plan me 1 skill submit kar sakte ho — pehli skill approve/reject hone ke baad dobara submit karo.`,
+            plan_tier: tenant.plan_tier,
+            active: activeCount,
+          },
+          403,
+        );
+      }
       const skillId = newSkillId();
       const nowMs = Date.now();
       await insertSkill(env.DB, {
@@ -1371,6 +1702,29 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           skill_id: skillId,
           decision: "approved",
         });
+        // U13 — server→phone push: tell the submitter's latest device the
+        // skill was approved, so it can pull it via /api/skills/sync.
+        // Best-effort only: the approval is already recorded above, and
+        // a missing device / unconfigured FCM must never fail the review.
+        try {
+          const latestDevice = await env.DB.prepare(
+            "SELECT device_id FROM devices WHERE tenant_id = ? AND enabled = 1 ORDER BY last_seen DESC LIMIT 1",
+          )
+            .bind(skill.submitted_by ?? "")
+            .first<{ device_id: string }>();
+          if (latestDevice) {
+            await sendFcm(env, env.DB, {
+              tenantId: skill.submitted_by ?? "",
+              deviceId: latestDevice.device_id,
+              title: "Skill approved",
+              body: "Your skill was approved and is ready to use.",
+              kind: "skill_approved",
+              data: { skill_id: skillId },
+            });
+          }
+        } catch {
+          /* push is advisory; the approval stands either way */
+        }
         return json({ ok: true, skill_id: skillId, status: "approved", signature, public_key: publicKey });
       }
       const nowMs = Date.now();
@@ -1434,6 +1788,179 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         });
       }
       return json({ ok: true, plan_tier: tenant.plan_tier, skills, count: skills.length });
+    }
+
+    if (path === "/api/skills/sync" && method === "GET") {
+      // U13 — server→phone push, pull half: the phone polls this after
+      // an approval push (or on a schedule) to fetch newly approved
+      // skills without re-pulling the whole library. ?since=<ms> =
+      // created_at watermark; 0/absent = all approved skills.
+      const tenantId = url.searchParams.get("tenant_id") ?? "";
+      const sinceMs = Number(url.searchParams.get("since") ?? "0") || 0;
+      // GET has no body: the signed payload is the frozen string
+      // `sync:<tenant_id>:<since>` (docs-style Ed25519, or internal-secret).
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? "",
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: `sync:${tenantId}:${sinceMs}`,
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const resolvedTenant = auth.tenant_id ?? tenantId;
+      if (!resolvedTenant) return json({ error: "bad_request" }, 400);
+      if (auth.tenant_id && tenantId && auth.tenant_id !== tenantId) {
+        return json({ error: "forbidden" }, 403);
+      }
+      const tenant = await getTenant(env.DB, resolvedTenant);
+      if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      const rl = await checkRateLimit(env, "skills", resolvedTenant);
+      if (!rl.allowed) return rateLimited(rl);
+      const approved = await listApprovedSkillsSince(env.DB, sinceMs);
+      const skills: Array<Record<string, unknown>> = [];
+      for (const s of approved) {
+        let manifestObj: unknown;
+        try {
+          manifestObj = JSON.parse(s.manifest);
+        } catch {
+          await insertTrace(env.DB, resolvedTenant, "", "skill_sync_skip", { skill_id: s.id });
+          continue;
+        }
+        const sig = await getSkillSignature(env.DB, s.id);
+        skills.push({
+          id: s.id,
+          manifest: manifestObj,
+          status: s.status,
+          signature: sig?.signature ?? null,
+          public_key: sig?.public_key ?? (await getSkillPublicKey(env)),
+          created_at: s.created_at,
+        });
+      }
+      return json({ ok: true, plan_tier: tenant.plan_tier, since: sinceMs, skills, count: skills.length });
+    }
+
+    // --- Diagnostics read endpoints (U15, hub v17) ---
+    // GET /api/traces — a tenant's own traces, newest first. Device-signed
+    // (or internal-secret); a device caller reads only its own tenant.
+    // ?kind= filters by trace kind; ?limit= caps the rows (default 50,
+    // max 200). Detail is parsed JSON when it parses, else the raw string.
+    if (path === "/api/traces" && method === "GET") {
+      const tenantId = url.searchParams.get("tenant_id") ?? "";
+      const kind = url.searchParams.get("kind") ?? "";
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? "50") || 50, 1), 200);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? "",
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: `traces:${tenantId}:${kind}:${limit}`,
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const resolvedTenant = auth.tenant_id ?? tenantId;
+      if (!resolvedTenant) return json({ error: "bad_request" }, 400);
+      if (auth.tenant_id && tenantId && auth.tenant_id !== tenantId) {
+        return json({ error: "forbidden" }, 403);
+      }
+      type TraceRow = { id: number; tenant_id: string; device_id: string; kind: string; detail: string; created_at: number };
+      const rows = kind
+        ? await env.DB.prepare(
+            "SELECT id, tenant_id, device_id, kind, detail, created_at FROM traces WHERE tenant_id = ? AND kind = ? ORDER BY id DESC LIMIT 200",
+          )
+            .bind(resolvedTenant, kind)
+            .all<TraceRow>()
+        : await env.DB.prepare(
+            "SELECT id, tenant_id, device_id, kind, detail, created_at FROM traces WHERE tenant_id = ? ORDER BY id DESC LIMIT 200",
+          )
+            .bind(resolvedTenant)
+            .all<TraceRow>();
+      const traces = (rows.results ?? []).slice(0, limit).map((r) => {
+        let detail: unknown = r.detail;
+        try {
+          detail = JSON.parse(r.detail);
+        } catch {
+          /* keep the raw string */
+        }
+        return { id: r.id, tenant_id: r.tenant_id, device_id: r.device_id, kind: r.kind, detail, created_at: r.created_at };
+      });
+      return json({ ok: true, tenant_id: resolvedTenant, kind: kind || undefined, traces, count: traces.length });
+    }
+
+    // GET /api/cron/status — admin: tick health from the system
+    // cron_trigger traces + scheduled-job counts. The tick trace is
+    // written only for Cloudflare Cron Trigger ticks (source cf-cron);
+    // a hub ticked only over HTTP shows last_tick_at stale — that
+    // staleness IS the signal (the CF trigger may be down).
+    if (path === "/api/cron/status" && method === "GET") {
+      if (!env.LLM_ADMIN_TOKEN || request.headers.get("x-admin-token") !== env.LLM_ADMIN_TOKEN) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const nowMs = Date.now();
+      const hourAgo = nowMs - 3_600_000;
+      const lastTicks = await env.DB.prepare(
+        "SELECT detail, created_at FROM traces WHERE tenant_id = ? AND kind = ? ORDER BY id DESC LIMIT 2",
+      )
+        .bind("system", "cron_trigger")
+        .all<{ detail: string; created_at: number }>();
+      const lastTwo = lastTicks.results ?? [];
+      const recentTicks = await env.DB.prepare(
+        "SELECT created_at FROM traces WHERE tenant_id = ? AND kind = ? AND created_at >= ? ORDER BY id DESC LIMIT 20",
+      )
+        .bind("system", "cron_trigger", hourAgo)
+        .all<{ created_at: number }>();
+      const ticksLastHour = (recentTicks.results ?? []).length;
+      let lastTickSource: string | null = null;
+      if (lastTwo[0]) {
+        try {
+          const d = JSON.parse(lastTwo[0].detail) as { source?: string };
+          lastTickSource = typeof d.source === "string" ? d.source : null;
+        } catch {
+          lastTickSource = null;
+        }
+      }
+      const cadenceS =
+        lastTwo.length >= 2
+          ? Math.round((lastTwo[0].created_at - lastTwo[1].created_at) / 1000)
+          : null;
+      const jobs = await env.DB.prepare("SELECT id, enabled, next_run_at FROM scheduled_jobs").all<{
+        id: string;
+        enabled: number;
+        next_run_at: number | null;
+      }>();
+      const allJobs = jobs.results ?? [];
+      const enabledJobs = allJobs.filter((j) => j.enabled === 1).length;
+      const dueJobs = allJobs.filter(
+        (j) => j.enabled === 1 && j.next_run_at !== null && j.next_run_at <= nowMs,
+      ).length;
+      return json({
+        ok: true,
+        last_tick_at: lastTwo[0]?.created_at ?? null,
+        last_tick_source: lastTickSource,
+        cadence_s: cadenceS,
+        ticks_last_hour: ticksLastHour,
+        enabled_jobs: enabledJobs,
+        due_jobs: dueJobs,
+        total_jobs: allJobs.length,
+      });
+    }
+
+    // GET /api/observability/status — admin: which external observability
+    // sinks are configured (flags only, never keys/DSNs; the Langfuse
+    // host is shown only when configured).
+    if (path === "/api/observability/status" && method === "GET") {
+      if (!env.LLM_ADMIN_TOKEN || request.headers.get("x-admin-token") !== env.LLM_ADMIN_TOKEN) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      const langfuseConfigured = isLangfuseConfigured(env);
+      return json({
+        ok: true,
+        langfuse: { configured: langfuseConfigured, host: langfuseConfigured ? langfuseHost(env) : null },
+        sentry: { configured: isSentryConfigured(env) },
+        upstash: upstashStatus(env),
+      });
     }
 
     if (path === "/api/memory/store" && method === "POST") {
@@ -2767,7 +3294,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       )
         .bind(email, purpose, codeHash, nowMs + LICENCE_CODE_TTL_MS, nowMs)
         .run();
-      const sent = await sendEmail(env, { to: email, ...licenceCodeEmailContent(code, purpose as "signup" | "login") });
+      // R1 (N-2 fix): licence-web codes were sent with raw sendEmail —
+      // no email_sends row, so the sends were invisible to the audit.
+      // sendEmailWithRecord records every send (tenant "licence-web" is
+      // the pseudo-tenant for the daily cap — no tenant exists yet at
+      // signup/login time).
+      const sent = await sendEmailWithRecord(env, env.DB, { tenantId: "licence-web", kind: "licence_web_code", to: email, ...licenceCodeEmailContent(code, purpose as "signup" | "login") });
       if (!sent.ok) {
         await env.DB.prepare("DELETE FROM licence_email_codes WHERE email = ? AND purpose = ?")
           .bind(email, purpose)

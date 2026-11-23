@@ -2,8 +2,8 @@
  * Fake D1 for vitest — minimal SQL engine for exactly the queries
  * src/ + licence-worker/ use (single-condition WHEREs, INSERT ... ON
  * CONFLICT upserts, UPDATE ... WHERE, DELETE ... WHERE, COUNT(*),
- * LIKE substring, IS NULL / IS NOT NULL, string literals, ORDER BY
- * ASC/DESC + LIMIT).
+ * LIKE substring, IS NULL / IS NOT NULL, string literals, IN (?, ...)
+ * lists, ORDER BY ASC/DESC + LIMIT).
  * NOT a general SQL engine — unknown shapes throw (fail loudly).
  */
 import type { D1Like, D1PreparedLike } from "../src/db";
@@ -53,6 +53,9 @@ const PK: Record<string, string[]> = {
   licence_web_users: ["email"],
   licence_email_codes: ["email", "purpose"],
   licence_web_sessions: ["token_hash"],
+  // R1 Main Executor (0014 main_jobs, 0015 key_audit): TEXT ids.
+  main_jobs: ["id"],
+  key_audit: ["id"],
 };
 
 export class FakeD1 implements D1Like {
@@ -299,6 +302,16 @@ class FakePrepared implements D1PreparedLike {
         const numM = cond.match(/^(\w+) = (\d+)$/);
         if (numM) {
           if (r[numM[1]] !== Number(numM[2])) return false;
+          continue;
+        }
+        // IN list of placeholders: `id IN (?, ?, ?)` (captcha linkSolveOutcome).
+        const inM = cond.match(/^(\w+) IN \(([\?,\s]+)\)$/);
+        if (inM) {
+          const col = inM[1];
+          const count = (inM[2].match(/\?/g) ?? []).length;
+          const vals = args.slice(argIdx, argIdx + count);
+          argIdx += count;
+          if (!vals.includes(r[col])) return false;
           continue;
         }
         const eqM = cond.match(/^(\w+) (?:=|<=|>=|<|>) \?$/);

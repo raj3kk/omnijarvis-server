@@ -106,7 +106,11 @@ export type RequestKind =
   | "live"
   | "doc_extraction"
   | "embeddings"
-  | "captcha_solve";
+  | "captcha_solve"
+  // R1 (N3 carve-out): the Main Executor loop. Its budget is per-job
+  // (40 calls) + per-tenant daily (5 jobs), enforced in main.ts — NOT
+  // the 5-calls/turn cap below, which would stop the loop at step 5.
+  | "main_executor";
 
 const DEFAULT_CHAINS: Record<string, Record<RequestKind, string[]>> = {
   byok: {
@@ -120,6 +124,9 @@ const DEFAULT_CHAINS: Record<string, Record<RequestKind, string[]>> = {
     // D3 locked (captcha-solver DESIGN §2.2): vision chain, BYOK
     // quality-first. Groq leg is qwen3.8-27b (vision) — NEVER gpt-oss-120b.
     captcha_solve: [MODEL_35, MODEL_31, MODEL_GROQ_VISION],
+    // R1 Main Executor: quality-first (architect/editor need the best
+    // free model), Groq as the $0 backstop.
+    main_executor: [MODEL_35, MODEL_31, MODEL_GROQ],
   },
   founder_pays: {
     agent_plan: [MODEL_31, MODEL_35, MODEL_GROQ],
@@ -130,6 +137,7 @@ const DEFAULT_CHAINS: Record<string, Record<RequestKind, string[]>> = {
     doc_extraction: [MODEL_31, MODEL_35],
     embeddings: [MODEL_EMBED],
     captcha_solve: [MODEL_31, MODEL_35, MODEL_GROQ_VISION],
+    main_executor: [MODEL_31, MODEL_35, MODEL_GROQ],
   },
 };
 
@@ -715,18 +723,28 @@ export async function routeLlm(deps: RouterDeps, req: RouteRequest): Promise<Rou
   }
 
   // Caps: replies/mo, then calls/turn.
-  const usage = await getMonthUsage(deps.db, tenantId, currentPeriod(now));
-  if (usage.replies >= plan.replies) {
-    await recordUsage(deps.db, {
-      tenant_id: tenantId, turn_id: req.turn_id, model: "", attempted_models: [],
-      input_tokens: 0, output_tokens: 0, cost_usd_micro: 0,
-      billing_mode: billingMode, status: "refused_cap",
-    }, now, false);
-    return { ...failResult([], "replies_cap", "Is mahine ke replies khatam — upgrade karo ya agle mahine ka intezaar karo", ms()), status: "refused_cap" };
-  }
-  const turnCalls = await countTurnCalls(deps.db, req.turn_id);
-  if (turnCalls >= MAX_CALLS_PER_TURN) {
-    return { ...failResult([], "turn_calls_cap", "Is turn me 5 calls ho chuke — aage badhaun ya rukun?", ms()), status: "refused_cap" };
+  // N3 carve-out (R1, deliberate + recorded): the Main Executor loop is
+  // NOT a user turn — it runs job-scoped turn_ids (main-<job>-<phase>-<n>)
+  // and its budget is per-job (40 LLM calls) + per-tenant daily (5 jobs),
+  // enforced in main.ts. Skipping the user caps here is what lets the
+  // loop run past step 5 without stopping. Every Main call is still
+  // metered (recordUsage below) so the billing reconcile stays exact.
+  // This is an exception for main_executor only — every other kind is
+  // capped exactly as before.
+  if (req.kind !== "main_executor") {
+    const usage = await getMonthUsage(deps.db, tenantId, currentPeriod(now));
+    if (usage.replies >= plan.replies) {
+      await recordUsage(deps.db, {
+        tenant_id: tenantId, turn_id: req.turn_id, model: "", attempted_models: [],
+        input_tokens: 0, output_tokens: 0, cost_usd_micro: 0,
+        billing_mode: billingMode, status: "refused_cap",
+      }, now, false);
+      return { ...failResult([], "replies_cap", "Is mahine ke replies khatam — upgrade karo ya agle mahine ka intezaar karo", ms()), status: "refused_cap" };
+    }
+    const turnCalls = await countTurnCalls(deps.db, req.turn_id);
+    if (turnCalls >= MAX_CALLS_PER_TURN) {
+      return { ...failResult([], "turn_calls_cap", "Is turn me 5 calls ho chuke — aage badhaun ya rukun?", ms()), status: "refused_cap" };
+    }
   }
 
   const { messages, truncated } = truncateMessages(req.messages, req.system);
