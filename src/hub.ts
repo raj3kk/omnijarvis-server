@@ -339,6 +339,23 @@ function json(body: unknown, status = 200, extraHeaders: Record<string, string> 
 }
 
 /**
+ * Fire-and-forget observability that survives the response: register the
+ * promise with ctx.waitUntil when the runtime gives us a context (the
+ * live Worker fetch path); without one (tests / direct calls) the promise
+ * still runs best-effort. G-17: a bare `void trace(...)` in the request
+ * path is DROPPED by the runtime once the Response returns — the
+ * llm_route trace from a live turn never landed until waitUntil was
+ * threaded through. Senders never reject, so an unregistered promise
+ * can never become an unhandled rejection.
+ */
+export function observe(
+  ctx: { waitUntil(promise: Promise<unknown>): void } | undefined,
+  p: Promise<unknown>,
+): void {
+  if (ctx) ctx.waitUntil(p);
+}
+
+/**
  * Shared 429 for every `checkRateLimit` refusal (M-I-4 follow-up,
  * 2026-11-22): the captcha 429s carried NO Retry-After header, so
  * clients had to guess the 60 s window. Every rate-limited response
@@ -673,7 +690,11 @@ export async function runCronTick(
   return { ...result, billing_sweeps: sweeps };
 }
 
-export async function handleRequest(request: Request, env: Env): Promise<Response> {
+export async function handleRequest(
+  request: Request,
+  env: Env,
+  ctx?: { waitUntil(promise: Promise<unknown>): void },
+): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, "") || "/";
   const method = request.method;
@@ -1092,13 +1113,18 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       );
       if (result.ok) {
         // G-17: one Langfuse trace per successful LLM turn (metadata
-        // only — never prompt/response text). Fire-and-forget: trace()
-        // never throws and never blocks the response.
-        void trace(env, "llm_route", {
-          tenant_id: tenantId,
-          kind: typeof body.kind === "string" ? body.kind : "quick_command",
-          turn_id: typeof body.turn_id === "string" ? body.turn_id : "",
-        });
+        // only — never prompt/response text). Registered with
+        // ctx.waitUntil: a bare void call is dropped by the runtime
+        // once the Response returns (live-proven: the first llm_route
+        // trace never landed).
+        observe(
+          ctx,
+          trace(env, "llm_route", {
+            tenant_id: tenantId,
+            kind: typeof body.kind === "string" ? body.kind : "quick_command",
+            turn_id: typeof body.turn_id === "string" ? body.turn_id : "",
+          }),
+        );
         return json(result);
       }
       const code = result.error_code ?? "upstream_error";
@@ -4219,16 +4245,23 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     return json({ error: "not_found" }, 404);
     return json({ error: "not_found" }, 404);
   } catch (e) {
-    // G-17: first Sentry call site — fire-and-forget; captureError
-    // never throws and never blocks the 500 response.
-    void captureError(env, e, { route: "handleRequest" });
+    // G-17: first Sentry call site — registered with ctx.waitUntil so
+    // the send survives the 500 response; captureError never throws.
+    observe(ctx, captureError(env, e, { route: "handleRequest" }));
     return json({ error: "server_error", detail: String((e as Error)?.message ?? e) }, 500);
   }
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    return handleRequest(request, env);
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: { waitUntil(promise: Promise<unknown>): void },
+  ): Promise<Response> {
+    // G-17: ctx is threaded into handleRequest so observability sends
+    // (Sentry catch-all, llm_route trace) survive the response via
+    // waitUntil instead of being dropped by the runtime.
+    return handleRequest(request, env, ctx);
   },
   // B-3: Cloudflare Cron Trigger (wrangler.toml [triggers]) — the hub
   // ticks itself every 5 min, so due scheduled_jobs fire even when

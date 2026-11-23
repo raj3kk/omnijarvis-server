@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import hubWorker, { handleRequest, route, type Env } from "../src/hub";
+import hubWorker, { handleRequest, observe, route, type Env } from "../src/hub";
 import { FakeD1 } from "./fake-d1";
 import { deriveSixDigit, deriveTenantId } from "../src/pairing";
 import { genHubKey } from "./helpers";
@@ -456,5 +456,18 @@ describe("POST /api/observability/probe (G-17 first-use)", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+describe("observe() (G-17 waitUntil threading)", () => {
+  it("registers the promise with ctx.waitUntil when a ctx is given", () => {
+    const seen: unknown[] = [];
+    const p = Promise.resolve("x");
+    observe({ waitUntil: (q) => void seen.push(q) }, p);
+    expect(seen).toEqual([p]);
+  });
+
+  it("no ctx -> best-effort, never throws (tests / direct handleRequest calls)", () => {
+    expect(() => observe(undefined, Promise.resolve("x"))).not.toThrow();
   });
 });
