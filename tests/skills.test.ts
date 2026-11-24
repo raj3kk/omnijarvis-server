@@ -7,6 +7,8 @@
  * S-T3 approve + sign + verify · S-T4 library approved-only + plan caps ·
  * S-T8 scan render_not_configured (submit pending, approve 503, reject ok) ·
  * S-T9 review admin-only · S-T10 submit validation + auth · S-T12 library auth.
+ * C-R1–C-R4 skills catalog routes (GAP-FILL, migration 0018): tier-filtered
+ * list, install happy path + dedupe, tier/cap gates, validation + auth.
  * Render scan + Gemini upstreams are MOCKED (no real key in CI). Live
  * happy-path proof needs the Render deploy (parent-side, U-2).
  */
@@ -26,6 +28,7 @@ import {
   verifySkillSignature,
   type SkillManifest,
 } from "../src/skills";
+import { seedCatalogSkills } from "../src/skills-catalog";
 
 const FIXED_NOW = Date.UTC(2026, 10, 22, 1, 0, 0);
 const RENDER_URL = "https://render-test.example.com";
@@ -1005,4 +1008,185 @@ describe("S-T13 self-extension submit: strip-check + classification echo", () =>
     expect(res.status).toBe(400);
     expect(((await res.json()) as Record<string, unknown>).error).toBe("bad_research_candidate");
   });
+});
+
+describe("C-R1–C-R4 skills catalog routes (GAP-FILL, migration 0018)", () => {
+	async function setupCatalogDb(): Promise<FakeD1> {
+		const db = new FakeD1();
+		await seedTenant(db, { id: "t-free", plan: "free" });
+		await seedTenant(db, { id: "t-pro", plan: "pro" });
+		await seedCatalogSkills(db);
+		return db;
+	}
+
+	it("C-R1 GET /api/skills/catalog — Free lists 3, Pro lists 12, installed flags start false", async () => {
+		const db = await setupCatalogDb();
+		const env = fakeEnv(db);
+		const freeRes = await handleRequest(
+			new Request("https://hub/api/skills/catalog?tenant_id=t-free", {
+				method: "GET",
+				headers: { "x-internal-secret": "test-internal" },
+			}),
+			env,
+		);
+		expect(freeRes.status).toBe(200);
+		const freeBody = (await freeRes.json()) as Record<string, unknown>;
+		expect(freeBody.plan_tier).toBe("free");
+		expect(freeBody.count).toBe(3);
+		const freeSkills = freeBody.skills as Array<Record<string, unknown>>;
+		expect(freeSkills.map((s) => s.id)).toEqual([
+			"cat-email-management",
+			"cat-scheduling",
+			"cat-web-research",
+		]);
+		expect(freeSkills.every((s) => s.installed === false)).toBe(true);
+		expect(typeof (freeSkills[0].manifest as Record<string, unknown>).name).toBe("string");
+		const proRes = await handleRequest(
+			new Request("https://hub/api/skills/catalog?tenant_id=t-pro", {
+				method: "GET",
+				headers: { "x-internal-secret": "test-internal" },
+			}),
+			env,
+		);
+		const proBody = (await proRes.json()) as Record<string, unknown>;
+		expect(proBody.count).toBe(12);
+	});
+
+	it("C-R1 auth — no secret -> 401; unknown tenant -> 404; missing tenant_id -> 400", async () => {
+		const db = await setupCatalogDb();
+		const env = fakeEnv(db);
+		const noAuth = await handleRequest(
+			new Request("https://hub/api/skills/catalog?tenant_id=t-pro", { method: "GET" }),
+			env,
+		);
+		expect(noAuth.status).toBe(401);
+		const unknown = await handleRequest(
+			new Request("https://hub/api/skills/catalog?tenant_id=t-nope", {
+				method: "GET",
+				headers: { "x-internal-secret": "test-internal" },
+			}),
+			env,
+		);
+		expect(unknown.status).toBe(404);
+		const missing = await handleRequest(
+			new Request("https://hub/api/skills/catalog", {
+				method: "GET",
+				headers: { "x-internal-secret": "test-internal" },
+			}),
+			env,
+		);
+		expect(missing.status).toBe(400);
+	});
+
+	it("C-R2 POST install happy path — Pro installs, manifest returned, re-list shows installed, repeat is deduped", async () => {
+		const db = await setupCatalogDb();
+		const env = fakeEnv(db);
+		const res = await handleRequest(
+			new Request("https://hub/api/skills/catalog/install", {
+				method: "POST",
+				headers: { "Content-Type": "application/json", "x-internal-secret": "test-internal" },
+				body: JSON.stringify({ tenant_id: "t-pro", skill_id: "cat-email-management" }),
+			}),
+			env,
+		);
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as Record<string, unknown>;
+		expect(body.ok).toBe(true);
+		expect(body.skill_id).toBe("cat-email-management");
+		expect(body.deduped).toBe(false);
+		expect((body.skill as Record<string, unknown>).id).toBe("cat-email-management");
+		const again = await handleRequest(
+			new Request("https://hub/api/skills/catalog/install", {
+				method: "POST",
+				headers: { "Content-Type": "application/json", "x-internal-secret": "test-internal" },
+				body: JSON.stringify({ tenant_id: "t-pro", skill_id: "cat-email-management" }),
+			}),
+			env,
+		);
+		expect(((await again.json()) as Record<string, unknown>).deduped).toBe(true);
+		const list = await handleRequest(
+			new Request("https://hub/api/skills/catalog?tenant_id=t-pro", {
+				method: "GET",
+				headers: { "x-internal-secret": "test-internal" },
+			}),
+			env,
+		);
+		const listed = ((await list.json()) as Record<string, unknown>).skills as Array<
+			Record<string, unknown>
+		>;
+		expect(listed.find((s) => s.id === "cat-email-management")?.installed).toBe(true);
+		expect(listed.find((s) => s.id === "cat-scheduling")?.installed).toBe(false);
+	});
+
+	it("C-R3 install gates — Free + Pro skill -> 403 skill_tier_required; Free second install -> 403 skills_install_cap; unknown skill -> 404", async () => {
+		const db = await setupCatalogDb();
+		const env = fakeEnv(db);
+		const tier = await handleRequest(
+			new Request("https://hub/api/skills/catalog/install", {
+				method: "POST",
+				headers: { "Content-Type": "application/json", "x-internal-secret": "test-internal" },
+				body: JSON.stringify({ tenant_id: "t-free", skill_id: "cat-documents" }),
+			}),
+			env,
+		);
+		expect(tier.status).toBe(403);
+		const tierBody = (await tier.json()) as Record<string, unknown>;
+		expect(tierBody.error).toBe("skill_tier_required");
+		expect(tierBody.required_tier).toBe("pro");
+		// Free installs its one free skill, then a second install hits the cap.
+		const first = await handleRequest(
+			new Request("https://hub/api/skills/catalog/install", {
+				method: "POST",
+				headers: { "Content-Type": "application/json", "x-internal-secret": "test-internal" },
+				body: JSON.stringify({ tenant_id: "t-free", skill_id: "cat-email-management" }),
+			}),
+			env,
+		);
+		expect(first.status).toBe(200);
+		const second = await handleRequest(
+			new Request("https://hub/api/skills/catalog/install", {
+				method: "POST",
+				headers: { "Content-Type": "application/json", "x-internal-secret": "test-internal" },
+				body: JSON.stringify({ tenant_id: "t-free", skill_id: "cat-scheduling" }),
+			}),
+			env,
+		);
+		expect(second.status).toBe(403);
+		const secondBody = (await second.json()) as Record<string, unknown>;
+		expect(secondBody.error).toBe("skills_install_cap");
+		expect(secondBody.cap).toBe(1);
+		const unknown = await handleRequest(
+			new Request("https://hub/api/skills/catalog/install", {
+				method: "POST",
+				headers: { "Content-Type": "application/json", "x-internal-secret": "test-internal" },
+				body: JSON.stringify({ tenant_id: "t-pro", skill_id: "cat-nope" }),
+			}),
+			env,
+		);
+		expect(unknown.status).toBe(404);
+		expect(((await unknown.json()) as Record<string, unknown>).error).toBe("skill_not_found");
+	});
+
+	it("C-R4 install validation — missing fields -> 400; no secret -> 401", async () => {
+		const db = await setupCatalogDb();
+		const env = fakeEnv(db);
+		const missing = await handleRequest(
+			new Request("https://hub/api/skills/catalog/install", {
+				method: "POST",
+				headers: { "Content-Type": "application/json", "x-internal-secret": "test-internal" },
+				body: JSON.stringify({ tenant_id: "t-pro" }),
+			}),
+			env,
+		);
+		expect(missing.status).toBe(400);
+		const noAuth = await handleRequest(
+			new Request("https://hub/api/skills/catalog/install", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ tenant_id: "t-pro", skill_id: "cat-email-management" }),
+			}),
+			env,
+		);
+		expect(noAuth.status).toBe(401);
+	});
 });

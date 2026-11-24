@@ -42,6 +42,9 @@
  *   a clean Render AST scan re-run + Ed25519 sign (SKILL_SIGN_SECRET).
  * - /api/skills/library: approved-only; Free = 1 skill, Pro/Business =
  *   full library. Quarantined skills are never listed (3d).
+ * - /api/skills/catalog (+ /catalog/install): curated starter-skills
+ *   library (0018); tier-filtered list, Free = 1 install, Pro/Business =
+ *   the library. Catalog skills are server-authored, never quarantined.
  * - /api/memory/*: paired device + Ed25519 or x-internal-secret;
  *   D1-backed vector store (JS cosine, cap 2000/tenant, R2.5 D-R16).
  *   Qdrant is env-gated and NOT live (account pending) — D1 fallback (3d).
@@ -205,6 +208,10 @@ import {
   validateSkillManifest,
   type SkillManifest,
 } from "./skills";
+import {
+  installCatalogSkill,
+  listCatalogSkills,
+} from "./skills-catalog";
 import {
   MAX_MEMORY_CONTENT_CHARS,
   embedText,
@@ -2406,6 +2413,82 @@ export async function handleRequest(
         });
       }
       return json({ ok: true, plan_tier: tenant.plan_tier, since: sinceMs, skills, count: skills.length });
+    }
+
+    // --- Skills library catalog (GAP-FILL, migration 0018) ---
+    // GET /api/skills/catalog — tier-filtered starter-skills catalog.
+    // Device-signed (authorizeDocsRequest, frozen payload
+    // `catalog:<tenant_id>`) or x-internal-secret. Free lists its 3
+    // free rows; Pro/Business list all 12. Each row carries its
+    // manifest + an `installed` flag for this tenant.
+    if (path === "/api/skills/catalog" && method === "GET") {
+      const tenantId = url.searchParams.get("tenant_id") ?? "";
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? "",
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: `catalog:${tenantId}`,
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const resolvedTenant = auth.tenant_id ?? tenantId;
+      if (!resolvedTenant) return json({ error: "bad_request" }, 400);
+      if (auth.tenant_id && tenantId && auth.tenant_id !== tenantId) {
+        return json({ error: "forbidden" }, 403);
+      }
+      const tenant = await getTenant(env.DB, resolvedTenant);
+      if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      const rl = await checkRateLimit(env, "skills", resolvedTenant);
+      if (!rl.allowed) return rateLimited(rl);
+      const res = await listCatalogSkills(env.DB, { tenantId: resolvedTenant, planTier: tenant.plan_tier });
+      return json({ ok: true, plan_tier: tenant.plan_tier, skills: res.skills, count: res.count });
+    }
+
+    // POST /api/skills/catalog/install — install one catalog skill.
+    // Body { tenant_id, skill_id }; device-signed (frozen payload
+    // `catalog-install:<tenant_id>:<skill_id>`) or x-internal-secret.
+    // Enforces the skill's tier AND the plan install cap (Free 1).
+    // Idempotent: a repeat install is ok:true + deduped:true.
+    if (path === "/api/skills/catalog/install" && method === "POST") {
+      const body = await readJson(request);
+      const tenantId = typeof body.tenant_id === "string" ? body.tenant_id : "";
+      const skillId = typeof body.skill_id === "string" ? body.skill_id : "";
+      if (!tenantId || !skillId) return json({ error: "bad_request" }, 400);
+      const auth = await authorizeDocsRequest(env.DB, {
+        internalSecret: env.INTERNAL_SECRET,
+        internalHeader: request.headers.get("x-internal-secret"),
+        deviceId: request.headers.get("x-device-id") ?? "",
+        nonce: request.headers.get("x-nonce"),
+        ts: request.headers.get("x-ts") ? Number(request.headers.get("x-ts")) : null,
+        sig: request.headers.get("x-signature"),
+        payloadRaw: `catalog-install:${tenantId}:${skillId}`,
+      });
+      if (!auth.ok) return json({ error: auth.error ?? "unauthorized" }, auth.error === "device_not_paired" ? 403 : 401);
+      const resolvedTenant = auth.tenant_id ?? tenantId;
+      if (auth.tenant_id && tenantId && auth.tenant_id !== tenantId) {
+        return json({ error: "forbidden" }, 403);
+      }
+      const tenant = await getTenant(env.DB, resolvedTenant);
+      if (!tenant) return json({ error: "tenant_not_found" }, 404);
+      const rl = await checkRateLimit(env, "skills", resolvedTenant);
+      if (!rl.allowed) return rateLimited(rl);
+      const res = await installCatalogSkill(env.DB, {
+        tenantId: resolvedTenant,
+        planTier: tenant.plan_tier,
+        skillId,
+        deviceId: auth.device_id ?? "",
+      });
+      if (!res.ok && res.error === "skill_not_found") return json({ error: "skill_not_found" }, 404);
+      if (!res.ok && res.error === "skill_tier_required") {
+        return json({ error: "skill_tier_required", required_tier: res.required_tier, plan_tier: res.plan_tier }, 403);
+      }
+      if (!res.ok && res.error === "skills_install_cap") {
+        return json({ error: "skills_install_cap", plan_tier: res.plan_tier, installed: res.installed, cap: res.cap }, 403);
+      }
+      if (!res.ok) return json({ error: "bad_request" }, 400);
+      return json({ ok: true, skill_id: skillId, deduped: res.deduped, skill: res.skill });
     }
 
     // --- Diagnostics read endpoints (U15, hub v17) ---
