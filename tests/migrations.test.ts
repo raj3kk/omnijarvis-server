@@ -510,3 +510,34 @@ describe("D1 migration 0016 (R2 shared memory + N-3 d1_migrations tracking)", ()
     expect(code.toLowerCase()).not.toContain("secret");
   });
 });
+
+const SQL18 = readFileSync(
+  new URL("../d1/migrations/0018_skills_catalog.sql", import.meta.url),
+  "utf8",
+);
+
+describe("D1 migration 0018 (GAP-FILL skills library: skill_catalog + installs + seeds)", () => {
+  it("creates the catalog + installs tables with tier CHECK + indexes", () => {
+    expect(SQL18).toContain("CREATE TABLE IF NOT EXISTS skill_catalog (");
+    expect(SQL18).toContain("CREATE TABLE IF NOT EXISTS skill_catalog_installs (");
+    expect(SQL18).toContain("CHECK (tier IN ('free', 'pro', 'business'))");
+    expect(SQL18).toContain("PRIMARY KEY (tenant_id, skill_id)");
+    expect(SQL18).toContain("idx_skill_catalog_tier");
+    expect(SQL18).toContain("idx_skill_catalog_installs_tenant");
+  });
+
+  it("seeds 12 starter skills + records itself in d1_migrations", () => {
+    expect(SQL18.match(/INSERT INTO skill_catalog /g)).toHaveLength(12);
+    expect(SQL18).toContain(
+      "INSERT OR IGNORE INTO d1_migrations (name, applied_at) VALUES ('0018_skills_catalog.sql'",
+    );
+  });
+
+  it("is non-destructive: no DROP TABLE / TRUNCATE / DELETE FROM, no secrets", () => {
+    const code = SQL18.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(code).not.toMatch(/DROP\s+TABLE/i);
+    expect(code).not.toMatch(/TRUNCATE/i);
+    expect(code).not.toMatch(/DELETE\s+FROM/i);
+    expect(code.toLowerCase()).not.toContain("secret");
+  });
+});

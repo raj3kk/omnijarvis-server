@@ -229,9 +229,30 @@ describe("handleRequest (2a-2 routes, D1 licences)", () => {
     expect(body.key_id).toBeUndefined();
   });
 
-  it("GET / -> version 21 (G-17 observability first-use)", async () => {
-    const body = (await route("/").json()) as Record<string, unknown>;
+  it("GET /health -> version 21 (G-17 observability first-use)", async () => {
+    // The version contract moved to /health when / became the landing
+    // page (professional site) — /health stays the JSON status endpoint.
+    const body = (await route("/health").json()) as Record<string, unknown>;
     expect(body.version).toBe("21");
+  });
+
+  it("GET / -> landing HTML (professional site)", async () => {
+    const res = route("/");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toContain("text/html");
+    const html = await res.text();
+    expect(html).toContain("OmniJarvis");
+    expect(html).toContain("/pricing");
+    expect(html).toContain("/download");
+  });
+
+  it("public pages -> 200 text/html", async () => {
+    const db = new FakeD1();
+    for (const p of ["/pricing", "/download", "/docs", "/privacy", "/terms", "/refund"]) {
+      const res = await handleRequest(new Request(`https://hub${p}`), fakeEnv(db));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("Content-Type")).toContain("text/html");
+    }
   });
 
   it("pairing code: derives from token", async () => {

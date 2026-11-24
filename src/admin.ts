@@ -26,6 +26,7 @@
  */
 import type { D1Like } from "./db";
 import { maskLicenceKey } from "./licence-web";
+import { esc, siteShell } from "./site";
 import { capWarnings } from "./billing";
 import { currentPeriod, getMonthUsage } from "./metering";
 import { PLAN_LIMITS } from "./router";
@@ -121,12 +122,10 @@ export async function adminOverview(db: D1Like, version: string): Promise<AdminO
 // Same shell style as licence-web.ts (server-rendered, one inline
 // <script>, same-origin fetch). No framework, no external assets.
 
-function adminShell(title: string, body: string): string {
-  return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${title} — OmniJarvis Admin</title>
-<style>body{font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;color:#222}input,button,textarea,select{font:inherit;padding:10px 12px;border-radius:8px;border:1px solid #bbb}input,textarea,select{width:100%;box-sizing:border-box;margin:8px 0}button{background:#111;color:#fff;border:0;cursor:pointer;margin:8px 8px 8px 0}button.secondary{background:#eee;color:#222}.msg{margin:12px 0;padding:10px;border-radius:8px;background:#f0f0f0;display:none}.msg.err{background:#fde8e8}.msg.ok{background:#e6f4ea}code{background:#f0f0f0;padding:2px 6px;border-radius:4px;word-break:break-all}h2{margin-top:32px;border-top:1px solid #ddd;padding-top:16px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:6px 8px;text-align:left;font-size:14px}</style>
-</head><body>${body}</body></html>`;
+function adminShell(title: string, body: string, narrow = false): string {
+  // Shared professional shell (site.ts) — same element IDs, same inline
+  // JS, same API calls. Only the look changes.
+  return siteShell(title, body, { active: "admin", narrow });
 }
 
 export function adminLoginPage(): string {
@@ -153,6 +152,7 @@ const r=await post("/api/licence-web/verify",{email,code,purpose:"login"});
 if(r.status===200){show("Verified! Admin console khul raha hai…",true);location.href="/admin";}
 else show("Error: "+(r.body.error||r.status)+" — "+(r.body.detail||"dobara try karo"),false);};
 </script>`,
+    true,
   );
 }
 
@@ -160,17 +160,17 @@ export function adminDashboardPage(email: string): string {
   return adminShell(
     "Admin console",
     `<h1>OmniJarvis Admin</h1>
-<p>Signed in as <strong>${email}</strong> (owner) — <a href="/licence/dashboard">licence dashboard</a></p>
+<p>Signed in as <strong>${esc(email)}</strong> (owner) — <a href="/licence/dashboard">licence dashboard</a></p>
 <div id="msg" class="msg"></div>
-<h2>Dashboard</h2><div id="overview">Loading…</div>
-<h2>Keys</h2><div id="keys">Loading…</div>
+<h2>Dashboard</h2><div id="overview"><div class="skel tall"></div><div class="skel"></div><div class="skel"></div></div>
+<h2>Keys</h2><div id="keys"><div class="skel tall"></div></div>
 <p style="font-size:14px">Founder Gemini key yahin se set hoti hai (tenant BYOK key, live-validated, encrypted). Admin GitHub token yahan se set NAHI ho sakta — Worker secrets Cloudflare API se bahar se set hote hain; neeche status + step dekho.</p>
 <h2>Training console</h2>
 <p style="font-size:14px">Jarvis ko train karo — ek instruction per line (max 50). Admin instructions jeet-ti hain (source=admin).</p>
 <textarea id="trainText" rows="4" placeholder="Hamesha Hinglish me jawab do&#10;Har subah 8 baje Purnea ka mausam batao"></textarea>
 <button id="trainBtn">Train Jarvis</button><span id="trainOut"></span>
-<h2>Jobs — Main Executor</h2><div id="jobs">Loading…</div>
-<h2>Users / licences</h2><div id="licences">Loading…</div>
+<h2>Jobs — Main Executor</h2><div id="jobs"><div class="skel"></div><div class="skel"></div></div>
+<h2>Users / licences</h2><div id="licences"><div class="skel"></div><div class="skel"></div></div>
 <h2>Launch gates &amp; backups</h2>
 <p style="font-size:14px">Ye do sections abhi bhi x-admin-token APIs se chalte hain (<code>/api/billing/admin/launch-gates</code>, <code>/api/billing/admin/backups</code>) — token owner ke paas hai, page se nahi khulte. Admin console v2 me session-gated honge.</p>
 <script>
