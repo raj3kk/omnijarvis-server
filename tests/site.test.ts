@@ -49,7 +49,7 @@ describe("public site pages (site.ts)", () => {
 
   it("download: APK version + size + install-over rule", () => {
     const html = downloadPage();
-    expect(html).toContain("1.20.0");
+    expect(html).toContain("1.20.1");
     expect(html).toContain("16.06 MiB");
     expect(html).toContain("Never uninstall");
     expect(html).toContain("drive.google.com");

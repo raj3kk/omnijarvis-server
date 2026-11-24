@@ -13,10 +13,10 @@
  * supplies the shell + CSS they render inside.
  */
 
-export const APK_VERSION = "1.20.0";
+export const APK_VERSION = "1.20.1";
 export const APK_SIZE = "16.06 MiB";
 export const APK_DOWNLOAD_URL =
-  "https://drive.google.com/uc?export=download&id=1OYKdlqFwEUlD7C7vceUDhNMG7DY7kCDN";
+  "https://drive.google.com/uc?export=download&id=169sOC3BBK2z55p5RkddgECg8YbTg_maQ";
 
 /** HTML-escape for server-rendered user data (emails, masked keys). */
 export function esc(s: string): string {
@@ -235,7 +235,7 @@ export function downloadPage(): string {
 <section class="section"><h2>What changed in v${APK_VERSION}</h2>
 <ul class="check"><li>Gemma on-device model removed — all chat is now cloud-only (Gemini, your key)</li><li>APK is 22.7 MB smaller than v1.19.0 (was 37.75 MB, now ${APK_SIZE})</li><li>No “Free Local Model” card, no model download — AI Brain shows Gemini, OpenAI, Groq, OpenRouter only</li><li>Offline: clear message, no crash, no faked answer</li><li>Everything else unchanged — Talker, Executor, browser, overlay, Trained Jarvis, FCM, pairing</li></ul>
 <p class="note">Full history: every release since v1.4.23 is listed in the app’s release notes. The current hub version is v22.</p></section>`,
-    { active: "download", description: "Download OmniJarvis for Android — v1.20.0, 16.06 MiB. Install over the previous version, never uninstall." },
+    { active: "download", description: "Download OmniJarvis for Android — v1.20.1, 16.06 MiB. Install over the previous version, never uninstall." },
   );
 }
 
