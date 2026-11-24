@@ -9,7 +9,9 @@ and asserts the three /mem/extract cases:
   2. Router configured + hub mocked -> 200, engine llm/router, the
      mocked facts returned, exactly ONE doc_extraction call, ZERO
      embeddings calls, and the payload carries kind doc_extraction +
-     the worker's MEM_EXTRACT_SYSTEM + MEM_EXTRACT_SCHEMA.
+     the worker's MEM_EXTRACT_SYSTEM + MEM_EXTRACT_SCHEMA. The hub
+     request must also carry a browser User-Agent header (Cloudflare
+     blocks urllib's default "Python-urllib/3.x" UA with 403).
   3. Router configured + hub error -> 502 mem_extract_failed, NO
      silent rule fallback. Two hub failure shapes: (a) HTTP 200 with
      {"ok": false, "error": "byok_required"} and (b) HTTP 500 with
@@ -54,6 +56,7 @@ PREFERENCE = "My name is Arjun Mehta. I like strong chai."
 
 MODE = {"mode": "ok"}  # ok | error_ok_false | error_http500
 CALLS: list[dict] = []
+UAS: list[str] = []  # User-Agent header per hub call (parallel to CALLS)
 
 
 class RouterHandler(BaseHTTPRequestHandler):
@@ -71,6 +74,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             return
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
         CALLS.append(body)
+        UAS.append(self.headers.get("User-Agent", ""))
         mode = MODE["mode"]
         if mode == "error_ok_false":
             data = json.dumps({
@@ -187,6 +191,7 @@ def main() -> int:
 
         # --- Case 2: router configured + hub mocked -> llm/router ---
         CALLS.clear()
+        UAS.clear()
         MODE["mode"] = "ok"
         worker = start_worker(with_router=True)
         try:
@@ -216,6 +221,10 @@ def main() -> int:
                   and body.get("messages") == [{"role": "user", "text": NATURAL}]
                   and body.get("tenant_id") == "t-mock",
                   json.dumps(body)[:400])
+            check("2g hub request carries a browser User-Agent (not Python-urllib)",
+                  len(UAS) == 1 and UAS[0].startswith("Mozilla/5.0")
+                  and "Python-urllib" not in UAS[0],
+                  f"UAS={UAS}")
 
             # --- Case 3: router configured + hub error -> 502, no fallback ---
             MODE["mode"] = "error_ok_false"

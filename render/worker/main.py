@@ -555,6 +555,10 @@ def _router_post(payload: dict, timeout: int = 60) -> dict:
         headers={
             "Content-Type": "application/json",
             "x-internal-secret": INTERNAL_SECRET,
+            # Browser UA: Cloudflare blocks urllib's default
+            # ("Python-urllib/3.x") as a bot (403) — without this the
+            # hub call never reaches the router.
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
         },
         method="POST",
     )
