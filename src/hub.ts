@@ -157,6 +157,16 @@ import {
   isAdminUser,
 } from "./admin";
 import { getIdempotencyRecord, storeIdempotencyRecord } from "./idempotency";
+// Public website (hub-served HTML) — one design system, see site.ts.
+import {
+  docsPage,
+  downloadPage,
+  landingPage,
+  pricingPage,
+  privacyPage,
+  refundPage,
+  termsPage,
+} from "./site";
 import { maybeSendCapWarning } from "./cap-warning";
 import { checkRateLimit, checkUpstashLive, probeUpstashCounter, upstashStatus, type RateLimitResult } from "./ratelimit";
 import { d1Batch, getDevice, getTenant, insertKeyAudit, insertTrace, verifyLicenceKey, type D1Like, type TenantRow } from "./db";
@@ -326,7 +336,9 @@ export function route(path: string): Response {
     return Response.json({ ok: true, service: SERVICE, version: VERSION });
   }
   if (p === "/") {
-    return Response.json({ ok: true, service: SERVICE, version: VERSION });
+    // Public landing page (professional site, site.ts). /health stays the
+    // JSON status endpoint — machines use /health, humans use /.
+    return new Response(landingPage(), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
   return Response.json({ error: "not_found" }, { status: 404 });
 }
@@ -701,6 +713,25 @@ export async function handleRequest(
   try {
     // Public: status + health (pure route()).
     if (path === "/" || path === "/health") return route(path);
+    // Public website pages (hub-served HTML, site.ts). No auth, no DB.
+    if (method === "GET" && path === "/pricing") {
+      return new Response(pricingPage(), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+    if (method === "GET" && path === "/download") {
+      return new Response(downloadPage(), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+    if (method === "GET" && path === "/docs") {
+      return new Response(docsPage(), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+    if (method === "GET" && path === "/privacy") {
+      return new Response(privacyPage(), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+    if (method === "GET" && path === "/terms") {
+      return new Response(termsPage(), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+    if (method === "GET" && path === "/refund") {
+      return new Response(refundPage(), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
     // Keep-alive probe (2a-4): REAL checks, not a static ok.
     // - D1 devices: device count (the Worker's core store) — `ok`
     //   reflects D1 only; a D1 failure fails the keepalive-check workflow.
