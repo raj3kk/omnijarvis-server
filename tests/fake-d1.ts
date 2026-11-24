@@ -62,6 +62,9 @@ const PK: Record<string, string[]> = {
   // R4 (0017): Gmail-send idempotency + cap warnings.
   idempotency_keys: ["tenant_id", "key"],
   cap_warnings: ["id"],
+  // GAP-FILL skills library (0018): catalog rows + per-tenant installs.
+  skill_catalog: ["id"],
+  skill_catalog_installs: ["tenant_id", "skill_id"],
 };
 
 export class FakeD1 implements D1Like {
