@@ -33,6 +33,18 @@
  * The hub router's 5-calls/turn + replies/mo caps do NOT apply to kind
  * main_executor (router.ts carve-out) — the job budget above is the cap
  * instead, and every Main call is still metered (llm_usage rows).
+ *
+ * Robustness (mainexec-robustness, §5.2 audit):
+ * - ToolRegistry (src/tools.ts): every tool the loop uses is a
+ *   registered entry (name, description, args schema, gate); the step
+ *   machine routes calls through runMainTool, which validates args
+ *   and records a `tool:<name>` trajectory entry per call.
+ * - Scan-feedback loop: a scan-blocked step stores the findings on
+ *   the plan step (`feedback`) and the next editor attempt sees them
+ *   in its prompt; retries are counted PER STEP (`retries`), not
+ *   job-wide — `retries_used` now counts CI-fix rounds only.
+ * - PR body carries the trajectory (formatTrajectoryForPr): the last
+ *   30 transcript entries, so the reviewer sees what the loop did.
  */
 import { getTenant, insertTrace, type D1Like } from "./db";
 import { listMemoriesByKind, loadApprovedPatterns } from "./memory";
@@ -54,6 +66,13 @@ import {
 import { scanSkillCode } from "./skills";
 import type { RenderEnv } from "./docs";
 import { sendFcm } from "./fcm";
+import {
+  getMainTool,
+  invokeTool,
+  summarizeToolArgs,
+  type ToolArgs,
+  type ToolCallOutcome,
+} from "./tools";
 
 export const MAIN_MAX_STEPS = 10;
 export const MAIN_MAX_STEPS_HARD = 20;
@@ -97,6 +116,21 @@ export interface MainPlanStep {
   title: string;
   file: string;
   action: string;
+  /**
+   * Per-step retry count (mainexec-robustness, §5.2 #9). The old code
+   * counted retries job-wide in `retries_used`, so two scan-blocked
+   * retries on step 1 ate the CI-fix budget too. The spec is max 2
+   * retries PER STEP — this counter is that budget. `retries_used` on
+   * the job now counts CI-fix rounds only (stepValidate).
+   */
+  retries?: number;
+  /**
+   * Last failure feedback for this step, shown to the editor on the
+   * next attempt (mainexec-robustness, §5.2 #9 — the scan-feedback
+   * loop). Set when a scan blocks the step; cleared when an edit
+   * passes the scan. Cap 1,000 chars — it rides the editor prompt.
+   */
+  feedback?: string;
 }
 
 export interface MainPlan {
@@ -224,6 +258,41 @@ export async function appendTranscript(
   const capped = entries.slice(-200);
   await updateMainJob(db, job.id, { transcript: JSON.stringify(capped) });
   job.transcript = JSON.stringify(capped);
+}
+
+async function savePlan(env: MainEnv, job: MainJob, plan: MainPlan): Promise<void> {
+  await updateMainJob(env.DB, job.id, { plan: JSON.stringify(plan) });
+  job.plan = JSON.stringify(plan);
+}
+
+/**
+ * Route one tool call through the registry (mainexec-robustness,
+ * §5.2 #3): schema validation via invokeTool, then a `tool:<name>`
+ * trajectory entry (args summarized — paths/names only, never file
+ * contents — plus ok/fail and the handler's one-line summary). The
+ * step machine calls tools ONLY through here (except the editor LLM
+ * call, which already logs `llm:editor` — see tools.ts).
+ */
+async function runMainTool<T>(
+  env: MainEnv,
+  job: MainJob,
+  name: string,
+  args: ToolArgs,
+  handler: (args: ToolArgs) => Promise<ToolCallOutcome<T>>,
+): Promise<ToolCallOutcome<T>> {
+  const def = getMainTool(name);
+  const started = now(env);
+  const out = def
+    ? await invokeTool(def, args, handler)
+    : { ok: false, error: "unknown_tool", summary: `no such tool: ${name}` };
+  const ms = now(env) - started;
+  await appendTranscript(env.DB, job, {
+    phase: `tool:${name}`,
+    note: `${summarizeToolArgs(args)} → ${out.ok ? "ok" : `fail: ${out.error ?? "tool_failed"}`} (${out.summary})`,
+    ms,
+    ok: out.ok,
+  });
+  return out;
 }
 
 export async function countJobsToday(db: D1Like, tenantId: string, nowMs = Date.now()): Promise<number> {
@@ -652,14 +721,27 @@ async function stepLocalize(env: MainEnv, job: MainJob): Promise<StepOutcome> {
     }
     ref = head.data;
   }
-  const mapRes = await buildRepoMap(env, owner, name, ref, job.ask, snapshot);
-  if (!mapRes.ok) {
-    return { done: false, retryable: mapRes.retryable, note: `repo map failed: ${mapRes.error}`, error: mapRes.error };
-  }
-  await appendTranscript(env.DB, job, {
-    phase: "repo-map",
-    note: `repo map built: ${mapRes.data.files} files, ${mapRes.data.symbols} symbols${mapRes.data.truncated ? " (truncated)" : ""}`,
+  // Tool-routed (§5.2 #3): the repo-map call goes through the
+  // registry, which validates args and records the trajectory entry
+  // (the old separate "repo-map" transcript entry is that entry now).
+  const mapOut = await runMainTool(env, job, "repo_map", { repo: job.repo, ref }, async () => {
+    const r = await buildRepoMap(env, owner, name, ref, job.ask, snapshot);
+    if (!r.ok) return { ok: false, error: r.error, summary: r.detail ?? r.error };
+    return {
+      ok: true,
+      data: r.data,
+      summary: `${r.data.files} files, ${r.data.symbols} symbols${r.data.truncated ? " (truncated)" : ""}`,
+    };
   });
+  if (!mapOut.ok || !mapOut.data) {
+    return {
+      done: false,
+      retryable: mapOut.error === "rate_limited" || mapOut.error === "fetch_failed",
+      note: `repo map failed: ${mapOut.error}`,
+      error: mapOut.error,
+    };
+  }
+  const mapRes = { ok: true as const, data: mapOut.data };
   // R2.3: run-start recall — approved patterns + admin training
   // memories go into the architect prompt, labelled. A recall read
   // failure never blocks the job (empty recall = plan without it).
@@ -849,7 +931,18 @@ async function stepEdit(env: MainEnv, job: MainJob): Promise<StepOutcome> {
     job.status = "validating";
     return stepValidate(env, job);
   }
-  const cur = await currentFileContent(env, job, owner, name, next.file);
+  // Tool-routed (§5.2 #3): the file read goes through the registry.
+  // (Explicit generic: the handler only returns `data` on success, so
+  // without it T would infer to the success member alone.)
+  const curOut = await runMainTool<Awaited<ReturnType<typeof currentFileContent>>>(env, job, "read_file", { path: next.file }, async () => {
+    const r = await currentFileContent(env, job, owner, name, next.file);
+    if (!r.ok) return { ok: false, error: r.error, summary: `read failed: ${r.error}` };
+    return { ok: true, data: r, summary: r.exists ? `${r.content.length} B` : "not found" };
+  });
+  const cur = curOut.data;
+  if (!cur) {
+    return { done: false, retryable: true, note: `file read failed: ${curOut.error ?? "tool_failed"}`, error: curOut.error ?? "tool_failed" };
+  }
   if (!cur.ok) {
     return { done: false, retryable: cur.retryable, note: `file read failed: ${cur.error}`, error: cur.error };
   }
@@ -863,12 +956,18 @@ async function stepEdit(env: MainEnv, job: MainJob): Promise<StepOutcome> {
     await appendTranscript(env.DB, job, { phase: "edit", note: `step ${next.id} skipped — file not found and action does not create it: ${next.file}` });
     return { done: true, note: `step ${next.id} skipped (file not found)` };
   }
+  // Scan-feedback loop (§5.2 #9): a step the scan blocked last time
+  // carries its findings into the editor prompt — the model must see
+  // WHY it was rejected, or it repeats the same blocked content.
+  const feedbackBlock = next.feedback
+    ? `\n\nPrevious attempt was rejected by the scan — fix ONLY these issues, change nothing else:\n${next.feedback}\n`
+    : "";
   const call = await callMainLlm(
     env,
     job,
     "editor",
     EDITOR_SYSTEM,
-    `Step: ${next.title}\nAction: ${next.action}\n\nCurrent file content (${next.file}${cur.exists ? "" : " — NEW FILE"}):\n${cur.content}\n\nReturn the complete new file content.`,
+    `Step: ${next.title}\nAction: ${next.action}\n\nCurrent file content (${next.file}${cur.exists ? "" : " — NEW FILE"}):\n${cur.content}${feedbackBlock}\n\nReturn the complete new file content.`,
   );
   if (!call.ok) {
     if (call.error === "job_llm_budget_exhausted") return { done: false, note: "job LLM budget exhausted", error: call.error };
@@ -876,37 +975,55 @@ async function stepEdit(env: MainEnv, job: MainJob): Promise<StepOutcome> {
   }
   const newContent = stripFences(call.text ?? "");
   if (!newContent || newContent === cur.content) {
-    job.retries_used += 1;
-    await updateMainJob(env.DB, job.id, { retries_used: job.retries_used });
-    if (job.retries_used > MAIN_MAX_RETRIES_PER_STEP) {
+    // Per-step retry budget (§5.2 #9) — the job-wide retries_used is
+    // reserved for CI-fix rounds (stepValidate).
+    next.retries = (next.retries ?? 0) + 1;
+    await savePlan(env, job, plan);
+    if (next.retries > MAIN_MAX_RETRIES_PER_STEP) {
       plan.done.push(next.id);
-      await updateMainJob(env.DB, job.id, { plan: JSON.stringify(plan) });
-      job.plan = JSON.stringify(plan);
+      await savePlan(env, job, plan);
       await appendTranscript(env.DB, job, { phase: "edit", note: `step ${next.id} dropped — editor returned no change after ${MAIN_MAX_RETRIES_PER_STEP} retries` });
       return { done: true, note: `step ${next.id} dropped (no change)` };
     }
-    return { done: false, retryable: true, note: `editor returned no change (retry ${job.retries_used}/${MAIN_MAX_RETRIES_PER_STEP})`, error: "editor_no_change" };
+    return { done: false, retryable: true, note: `editor returned no change (retry ${next.retries}/${MAIN_MAX_RETRIES_PER_STEP})`, error: "editor_no_change" };
   }
   if (newContent.length > MAIN_EDIT_MAX_BYTES) {
     return { done: false, note: "editor output exceeds the 64 KB edit cap", error: "edit_too_large" };
   }
-  const scan = await scanEdit(env, next.file, newContent);
+  // Tool-routed (§5.2 #3): the scan call goes through the registry;
+  // the tool entry records the verdict, so no separate "scan" entry.
+  const scanOut = await runMainTool(env, job, "scan_edit", { path: next.file }, async () => {
+    const v = await scanEdit(env, next.file, newContent);
+    return {
+      ok: v.verdict !== "blocked",
+      data: v,
+      error: v.verdict === "blocked" ? "scan_blocked" : undefined,
+      summary: `${v.verdict}${v.findings.length > 0 ? `: ${v.findings.slice(0, 3).join("; ")}` : ""}`,
+    };
+  });
+  const scan: ScanVerdict = scanOut.data ?? {
+    verdict: "scan_unavailable",
+    findings: ["scan tool failed — proceeding; CI is the real test"],
+  };
   await updateMainJob(env.DB, job.id, { scan_verdict: scan.verdict });
   job.scan_verdict = scan.verdict;
   if (scan.verdict === "blocked") {
-    job.retries_used += 1;
-    await updateMainJob(env.DB, job.id, { retries_used: job.retries_used });
-    await appendTranscript(env.DB, job, { phase: "scan", note: `scan BLOCKED step ${next.id}: ${scan.findings.join("; ")}` });
-    if (job.retries_used > MAIN_MAX_RETRIES_PER_STEP) {
+    // Scan-feedback loop (§5.2 #9): store the findings ON the step so
+    // the NEXT editor attempt sees them in its prompt (feedbackBlock
+    // above), and count the retry against THIS step, not the job.
+    next.feedback = scan.findings.join("; ").slice(0, 1000);
+    next.retries = (next.retries ?? 0) + 1;
+    await savePlan(env, job, plan);
+    if (next.retries > MAIN_MAX_RETRIES_PER_STEP) {
       plan.done.push(next.id);
-      await updateMainJob(env.DB, job.id, { plan: JSON.stringify(plan) });
-      job.plan = JSON.stringify(plan);
+      await savePlan(env, job, plan);
       return { done: true, note: `step ${next.id} dropped (scan blocked after retries)` };
     }
     return { done: false, retryable: true, note: `scan blocked step ${next.id}: ${scan.findings.join("; ")}`, error: "scan_blocked" };
   }
-  if (scan.verdict === "scan_unavailable") {
-    await appendTranscript(env.DB, job, { phase: "scan", note: `render scan unavailable for ${next.file}: ${scan.findings.join("; ")} — proceeding; CI is the real test` });
+  if (scan.verdict === "clean" && next.feedback) {
+    // A clean scan consumes any feedback from an earlier blocked try.
+    next.feedback = undefined;
   }
   if (job.mode === "dry-run") {
     await appendTranscript(env.DB, job, {
@@ -915,7 +1032,16 @@ async function stepEdit(env: MainEnv, job: MainJob): Promise<StepOutcome> {
       patch: { path: next.file, content: newContent },
     });
   } else {
-    const committed = await commitPatches(env, job, owner, name, [{ path: next.file, content: newContent }], `Main Executor: ${next.title} (${job.id})`);
+    // Tool-routed (§5.2 #3): the commit goes through the registry.
+    const commitOut = await runMainTool<Awaited<ReturnType<typeof commitPatches>>>(env, job, "commit_patches", { files: [next.file], message: `Main Executor: ${next.title} (${job.id})` }, async () => {
+      const r = await commitPatches(env, job, owner, name, [{ path: next.file, content: newContent }], `Main Executor: ${next.title} (${job.id})`);
+      if (!r.ok) return { ok: false, error: r.error, summary: `commit failed: ${r.error}` };
+      return { ok: true, data: r, summary: `committed on ${job.branch} (${r.head.slice(0, 7)})` };
+    });
+    const committed = commitOut.data;
+    if (!committed) {
+      return { done: false, retryable: true, note: `commit failed: ${commitOut.error ?? "tool_failed"}`, error: commitOut.error ?? "tool_failed" };
+    }
     if (!committed.ok) {
       if (committed.error === "github_not_configured") {
         // Token was removed mid-job — fall back to dry-run queuing.
@@ -958,7 +1084,19 @@ async function stepValidate(env: MainEnv, job: MainJob): Promise<StepOutcome> {
     job.ci_status = "no_changes";
     return stepPr(env, job);
   }
-  const checks = await getCheckSummary(env, owner, name, job.branch);
+  // Tool-routed (§5.2 #3): the CI poll goes through the registry.
+  // (branch captured first: property narrowing does not survive into
+  // the handler closure.)
+  const branch = job.branch;
+  const checksOut = await runMainTool<Awaited<ReturnType<typeof getCheckSummary>>>(env, job, "ci_poll", { repo: job.repo, ref: branch }, async () => {
+    const r = await getCheckSummary(env, owner, name, branch);
+    if (!r.ok) return { ok: false, error: r.error, summary: `CI poll failed: ${r.error}` };
+    return { ok: true, data: r, summary: `${r.data.state} (${r.data.checks.length} check(s))` };
+  });
+  const checks = checksOut.data;
+  if (!checks) {
+    return { done: false, retryable: true, note: `CI poll failed: ${checksOut.error ?? "tool_failed"}`, error: checksOut.error ?? "tool_failed" };
+  }
   if (!checks.ok) {
     return { done: false, retryable: checks.error === "rate_limited" || checks.error === "fetch_failed", note: `CI poll failed: ${checks.error}`, error: checks.error };
   }
@@ -1008,7 +1146,24 @@ async function stepValidate(env: MainEnv, job: MainJob): Promise<StepOutcome> {
   return { done: true, note: `CI failed — fix step queued (retry ${job.retries_used}/${MAIN_MAX_RETRIES_PER_STEP})` };
 }
 
-function buildPrBody(job: MainJob, plan: MainPlan | null): string {
+/**
+ * Compact trajectory for the PR body (mainexec-robustness, §5.2 #15):
+ * the last 30 transcript entries as `phase: note` lines, each capped
+ * at 140 chars, the whole section capped at ~6,000 chars. The PR
+ * reviewer sees what the loop actually did, in order — not just the
+ * verdict summary. Tool calls (`tool:<name>`) and LLM calls
+ * (`llm:<phase>`) are in there by construction.
+ */
+export function formatTrajectoryForPr(job: MainJob): string {
+  const entries = parseTranscript(job).slice(-30);
+  if (entries.length === 0) return "(no trajectory recorded)";
+  const lines = entries.map((e) => `- ${e.phase}: ${(e.note ?? "").slice(0, 140)}`);
+  let out = lines.join("\n");
+  if (out.length > 6000) out = `${out.slice(0, 6000)}\n- … (truncated)`;
+  return out;
+}
+
+export function buildPrBody(job: MainJob, plan: MainPlan | null): string {
   const steps = plan
     ? plan.steps.map((s) => `- [${plan.done.includes(s.id) ? "x" : " "}] ${s.title} (${s.file})`).join("\n")
     : "(no plan)";
@@ -1026,6 +1181,7 @@ function buildPrBody(job: MainJob, plan: MainPlan | null): string {
     `- LLM calls: ${job.llm_calls} (models: ${models})\n` +
     `- Steps used: ${job.steps_used}\n` +
     (patches.length > 0 ? `- Patches queued (dry-run): ${patches.map((p) => p.patch?.path).join(", ")}\n` : "") +
+    `\n## Trajectory\n${formatTrajectoryForPr(job)}\n` +
     `\n## Reviewer notes\n` +
     `- Proposed by the OmniJarvis Main Executor (server, global). Merge only after review.\n` +
     `- This PR was never merged by the agent — the user merges, always.\n` +
@@ -1064,7 +1220,23 @@ async function stepPr(env: MainEnv, job: MainJob): Promise<StepOutcome> {
     await updateMainJob(env.DB, job.id, { status: "partial", error_code: "no_changes", error: "Koi change commit nahi hua — PR kholne ke liye kuch nahi." });
     return { done: true, note: "no branch — nothing to PR" };
   }
-  const pr = await createPullRequest(env, owner, name, { title, body, head: job.branch, base: job.base_branch });
+  // Tool-routed (§5.2 #3): PR creation goes through the registry.
+  // (branch captured first: property narrowing does not survive into
+  // the handler closure.)
+  const branch = job.branch;
+  const prOut = await runMainTool<Awaited<ReturnType<typeof createPullRequest>>>(env, job, "create_pr", { title, head: branch, base: job.base_branch }, async () => {
+    const r = await createPullRequest(env, owner, name, { title, body, head: branch, base: job.base_branch });
+    if (!r.ok) return { ok: false, error: r.error, summary: `PR create failed: ${r.error}` };
+    return { ok: true, data: r, summary: `PR #${r.data.number} opened` };
+  });
+  const pr = prOut.data;
+  if (!pr) {
+    if (prOut.error === "github_not_configured") {
+      await updateMainJob(env.DB, job.id, { status: "blocked_token", error_code: "github_token_not_configured", error: TOKEN_UNBLOCK_INSTRUCTIONS });
+      return { done: true, note: "token gone before PR — queued as blocked_token" };
+    }
+    return { done: false, retryable: prOut.error === "rate_limited" || prOut.error === "fetch_failed", note: `PR create failed: ${prOut.error}`, error: prOut.error };
+  }
   if (!pr.ok) {
     if (pr.error === "github_not_configured") {
       await updateMainJob(env.DB, job.id, { status: "blocked_token", error_code: "github_token_not_configured", error: TOKEN_UNBLOCK_INSTRUCTIONS });
@@ -1111,7 +1283,17 @@ async function resumeBlockedToken(env: MainEnv, job: MainJob): Promise<StepOutco
     await updateMainJob(env.DB, job.id, { status: "partial", error_code: "no_changes", error: "Queued patch nahi mila — PR kholne ke liye kuch nahi." });
     return { done: true, note: "blocked_token resumed but no queued patches" };
   }
-  const committed = await commitPatches(env, job, owner, name, patches, `Main Executor: ${job.ask.slice(0, 80)} (${job.id})`);
+  // Tool-routed (§5.2 #3): the queued-patch commit goes through the
+  // registry, same as the per-step commit in stepEdit.
+  const commitOut = await runMainTool<Awaited<ReturnType<typeof commitPatches>>>(env, job, "commit_patches", { files: patches.map((p) => p.path), message: `Main Executor: ${job.ask.slice(0, 80)} (${job.id})` }, async () => {
+    const r = await commitPatches(env, job, owner, name, patches, `Main Executor: ${job.ask.slice(0, 80)} (${job.id})`);
+    if (!r.ok) return { ok: false, error: r.error, summary: `commit failed: ${r.error}` };
+    return { ok: true, data: r, summary: `committed on ${job.branch} (${r.head.slice(0, 7)})` };
+  });
+  const committed = commitOut.data;
+  if (!committed) {
+    return { done: false, retryable: true, note: `queued-patch commit failed: ${commitOut.error ?? "tool_failed"}`, error: commitOut.error ?? "tool_failed" };
+  }
   if (!committed.ok) {
     return { done: false, retryable: committed.retryable, note: `queued-patch commit failed: ${committed.error}`, error: committed.error };
   }
