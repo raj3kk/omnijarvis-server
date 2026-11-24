@@ -23,11 +23,13 @@ Endpoints:
   (`bandit_available`, `bandit_findings`) — `findings` stays AST-only
   so the hub's scanSkillCode contract is unchanged.
 - POST /mem/extract -> text -> extracted memories (facts/preferences)
-  as structured JSON. LLM/embeddings go through the hub router
-  (/api/llm/route) when HUB_LLM_URL + INTERNAL_SECRET are set and the
-  mem0 library is installed; otherwise a deterministic rule-based
-  fallback extracts (engine field says which — never a fake mem0).
-  No key is ever baked into the worker; mem0 Platform is never used.
+  as structured JSON. When HUB_LLM_URL + INTERNAL_SECRET are set, the
+  worker calls the hub router (/api/llm/route, kind doc_extraction)
+  DIRECTLY for fact extraction — no mem0 library (mem0ai does not fit
+  the Vercel bundle; see the Memory section below). Otherwise a
+  deterministic rule-based fallback extracts (engine field says which
+  — never a fake LLM). No key is ever baked into the worker; mem0
+  Platform is never used.
 - POST /doc/extract-docling -> PDF -> Docling layout+tables extraction
   (separate endpoint, not a flag on /doc/extract: different heavy dep,
   lazy import, different response shape, /doc/extract stays untouched).
@@ -49,7 +51,7 @@ classification is not needed.
 
 RAM discipline (Vercel 2 GB): one page / one doc at a time, 150 dpi
 renders, pixmaps freed explicitly. No state on disk (in-memory BytesIO).
-Heavy optional deps (docling, mem0ai, bandit, browser-use) are LAZY
+Heavy optional deps (docling, bandit, browser-use) are LAZY
 imports inside their endpoints, so the base worker starts and serves
 the original routes even when none of them is installed.
 """
@@ -62,6 +64,7 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -83,7 +86,7 @@ MAX_SCAN_BYTES = 512 * 1024
 MAX_MEM_TEXT_CHARS = 8000
 MAX_MEMORIES_PER_CALL = 20
 # Hub router (memory.ts: worker /mem/extract -> hub /api/llm/route).
-# Both env vars must be set for the mem0 path; unset -> rule fallback.
+# Both env vars must be set for the LLM path; unset -> rule fallback.
 HUB_LLM_URL = os.environ.get("HUB_LLM_URL", "").rstrip("/")
 INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")
 # Browser-Use (see BROWSER_USE.md): default OFF; allowlist empty = deny all.
@@ -502,17 +505,25 @@ async def doc_certificate(
         )
 
 
-# --- Mem0 extraction (item #28; mem0 library only, never Platform) ---
-# Design (memory.ts + hub /api/llm/route): mem0's DEFAULT config needs an
-# OpenAI key (gpt-4o-mini + text-embedding-ada-002), so the worker NEVER
-# uses the default. Instead the mem0 Memory object's .llm, .embedding_model
-# and .vector_store are swapped for adapters that POST to the hub router
-# (x-internal-secret) or keep nothing (null store); the hub owns keys,
-# BYOK checks, caps and metering, and persists into D1. No key is baked
-# into the worker, no secret is ever logged, and mem0 telemetry is off
-# (MEM0_TELEMETRY=false). When the router is not configured (or mem0 is
-# not installed) the endpoint still answers via a deterministic rule-based
-# extractor — engine field says which.
+# --- Memory extraction (item #28; direct hub-router call, no mem0) ---
+# Design (memory.ts + hub /api/llm/route): the hub owns keys, BYOK
+# checks, caps and metering, and persists into D1; the worker sends one
+# POST to the hub router (kind doc_extraction, MEM_EXTRACT_SYSTEM +
+# MEM_EXTRACT_SCHEMA, Gemini responseSchema-enforced) and parses the
+# {"facts": [...]} reply. No key is baked into the worker, no secret is
+# ever logged. History: the worker used to drive the mem0 LIBRARY
+# (adapters swapping .llm/.embedding_model/.vector_store) — removed
+# 2026-11-24 because mem0ai is NOT installed on the Vercel worker and
+# cannot be: the merged light install with mem0ai is ~574 MB, over
+# Vercel's 500 MB function-bundle limit, and mem0ai needs protobuf<7
+# vs the light pin protobuf==7.36.2 (ResolutionImpossible). Setting the
+# env vars on the old code would 502 every /mem/extract call (the
+# handler 502s on any mem0 failure with no rule fallback — by design,
+# never silently downgrades a configured LLM claim to rules). The
+# direct call needs no mem0ai, fits the bundle, and has no protobuf
+# conflict. When the router is not configured the endpoint still
+# answers via a deterministic rule-based extractor — engine field says
+# which.
 
 MEM_EXTRACT_SYSTEM = (
     "Extract durable memories from the user's message as a JSON object "
@@ -521,37 +532,17 @@ MEM_EXTRACT_SYSTEM = (
     "greetings, one-off questions and anything already implied. Short "
     "strings, one fact per item."
 )
-# NOTE: mem0 parses json.loads(response)["facts"] and uses each fact as a
-# DICT KEY (new_message_embeddings[new_mem]) — facts MUST be plain
-# strings, not {content, kind} objects, or add() dies with
-# "unhashable type: 'dict'". Kinds are therefore not produced by the
-# mem0 path (all memories are kind "fact"); the rule fallback keeps
-# its own fact/preference split.
+# NOTE: facts MUST be plain strings, not {content, kind} objects — the
+# hub + D1 store expect string facts, and the direct parser below only
+# accepts strings. Kinds are therefore not produced by the LLM path
+# (all memories are kind "fact"); the rule fallback keeps its own
+# fact/preference split.
 MEM_EXTRACT_SCHEMA = {
     "type": "object",
     "properties": {
         "facts": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["facts"],
-}
-MEM_ACTIONS_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "memory": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "text": {"type": "string"},
-                    "event": {"type": "string"},
-                    "old_memory": {"type": "string"},
-                },
-                "required": ["text", "event"],
-            },
-        },
-    },
-    "required": ["memory"],
 }
 
 
@@ -570,139 +561,71 @@ def _router_post(payload: dict, timeout: int = 60) -> dict:
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
+def _parse_extract_facts(raw: str) -> list[str]:
+    """Parse the router's extraction reply into plain-string facts.
 
-def _mem0_router_adapters(tenant_id: str, turn_id: str):
-    """Build mem0-compatible adapters backed by the hub router.
+    The hub enforces MEM_EXTRACT_SCHEMA (Gemini responseSchema), so the
+    reply is {"facts": ["..."]} — fences are stripped defensively, and
+    a reply that is not JSON or has no facts array raises (never guess
+    facts; the caller turns it into an honest 502). Non-string / empty
+    entries are skipped; an empty facts list is a valid result (the LLM
+    found nothing durable) — count 0 with engine llm/router."""
+    cleaned = (raw or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`").strip()
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].strip()
+    try:
+        parsed = json.loads(cleaned)
+    except Exception as exc:
+        raise RuntimeError(f"router reply is not JSON: {exc}") from exc
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("facts"), list):
+        raise RuntimeError("router reply has no facts array")
+    return [f.strip() for f in parsed["facts"] if isinstance(f, str) and f.strip()]
 
-    mem0 calls .llm.generate_response(messages, response_format=...) twice
-    per add(): (1) fact extraction — user prompt starts with "Input:";
-    (2) update-memory actions — prompt mentions "new retrieved facts".
-    The response_schema sent to the router matches the call: facts schema
-    for (1), actions schema for (2). Embeddings go through kind
-    "embeddings". Returns (llm, embedder, vector_store) where the vector
-    store is an in-memory null store — the worker stores nothing; the
-    hub persists extracted memories into D1 (memory.ts storeMemory).
-    """
-    from mem0.embeddings.base import EmbeddingBase
-    from mem0.llms.base import LLMBase
-    from mem0.vector_stores.base import VectorStoreBase
 
-    class RouterLlm(LLMBase):
-        def __init__(self):
-            super().__init__(config={"model": "hub-router", "api_key": "not-used-hub-router"})
+def _hub_error_detail(exc: Exception) -> str:
+    """Best-effort hub error code from an HTTPError body ({error, detail}).
+    Falls back to the exception text when the body is unreadable."""
+    try:
+        if isinstance(exc, urllib.error.HTTPError):
+            body = json.loads(exc.read().decode("utf-8", "replace") or "{}")
+            if isinstance(body, dict) and body.get("error"):
+                detail = str(body.get("detail") or "")
+                return str(body["error"]) + (f": {detail}" if detail else "")
+    except Exception:
+        pass
+    return str(exc)[:100]
 
-        def generate_response(self, messages, tools=None, tool_choice="auto", **kwargs) -> str:
-            # mem0 sends [system, user]; detect the call type from the
-            # USER message only (the system prompt precedes it).
-            # 1.x: fact extraction user prompt starts with "Input:";
-            #      update-memory prompt mentions "new retrieved facts".
-            # 2.x (V3 pipeline): ONE additive-extraction call whose user
-            #      prompt has "## New Messages" sections; it parses
-            #      {"memory": [{"text": ...}]}.
-            user_texts = [str(m.get("content", "")) for m in messages if m.get("role") == "user"]
-            last_user = user_texts[-1] if user_texts else ""
-            if "## New Messages" in last_user:
-                schema: dict | None = MEM_ACTIONS_SCHEMA
-            elif last_user.lstrip().startswith("Input:"):
-                schema = MEM_EXTRACT_SCHEMA
-            elif "new retrieved facts are mentioned" in last_user:
-                schema = MEM_ACTIONS_SCHEMA
-            else:
-                schema = None
-            payload = {
-                "tenant_id": tenant_id,
-                "turn_id": turn_id,
-                "kind": "doc_extraction",
-                "messages": [
-                    {"role": m.get("role", "user"), "text": m.get("content", "")}
-                    for m in messages
-                ],
-                "system": MEM_EXTRACT_SYSTEM,
-            }
-            if schema is not None:
-                payload["response_schema"] = schema
-            result = _router_post(payload, timeout=120)
-            if not result.get("ok"):
-                raise RuntimeError("router: " + str(result.get("error", "upstream_error"))[:100])
-            text = result.get("text") or ""
-            if not text and isinstance(result.get("response"), dict):
-                text = json.dumps(result["response"], ensure_ascii=False)
-            return text
 
-    class RouterEmbedder(EmbeddingBase):
-        def embed(self, text, memory_action=None) -> list:
-            result = _router_post(
-                {
-                    "tenant_id": tenant_id,
-                    "turn_id": turn_id,
-                    "kind": "embeddings",
-                    "messages": [{"role": "user", "text": text}],
-                }
-            )
-            if not result.get("ok") or not result.get("embedding"):
-                raise RuntimeError("router embedding: " + str(result.get("error", "failed"))[:100])
-            return list(result["embedding"])
-
-    class NullVectorStore(VectorStoreBase):
-        """In-memory no-persistence store: search always empty (so every
-        fact is an ADD), insert/get keep rows in a dict for the call."""
-
-        def __init__(self):
-            self._rows: dict[str, dict] = {}
-
-        def create_col(self, name, vector_size, distance):
-            return None
-
-        def insert(self, vectors, payloads=None, ids=None):
-            ids = ids or []
-            for i, mid in enumerate(ids):
-                self._rows[mid] = (payloads or [{}])[i] if payloads else {}
-            return ids
-
-        def search(self, query, vectors, limit=5, top_k=None, filters=None, **_kw):
-            # mem0 1.x calls search(..., limit=5); 2.x calls
-            # search(..., top_k=5). Accept both; always empty (ADD-only).
-            return []
-
-        def search_batch(self, queries, vectors_list, top_k=1, filters=None, **_kw):
-            return [[] for _ in (queries or [])]
-
-        def delete(self, vector_id):
-            self._rows.pop(vector_id, None)
-
-        def update(self, vector_id, vector=None, payload=None):
-            if payload is not None:
-                self._rows[vector_id] = payload
-
-        def get(self, vector_id):
-            payload = self._rows.get(vector_id)
-            if payload is None:
-                return None
-
-            class _Row:
-                pass
-
-            row = _Row()
-            row.id = vector_id
-            row.payload = payload
-            return row
-
-        def list_cols(self):
-            return []
-
-        def delete_col(self):
-            self._rows.clear()
-
-        def col_info(self):
-            return {"name": "null-store", "count": len(self._rows)}
-
-        def reset(self):
-            self._rows.clear()
-
-        def list(self, filters=None, limit=100, top_k=None, **_kw):
-            return []
-
-    return RouterLlm(), RouterEmbedder(), NullVectorStore()
+def _router_extract(text: str, tenant_id: str, turn_id: str) -> tuple[list[dict], str]:
+    """Direct hub-router extraction — no mem0 library. One POST to the
+    hub /api/llm/route (kind doc_extraction, MEM_EXTRACT_SYSTEM +
+    MEM_EXTRACT_SCHEMA), parse {"facts": [...]} into memories. Returns
+    (memories, engine). Raises RuntimeError on any failure — the caller
+    reports it, never silently downgrades a configured LLM claim to
+    rules. No embeddings call is made (the direct path extracts facts
+    only; the hub persists into D1)."""
+    payload = {
+        "tenant_id": tenant_id,
+        "turn_id": turn_id,
+        "kind": "doc_extraction",
+        "messages": [{"role": "user", "text": text}],
+        "system": MEM_EXTRACT_SYSTEM,
+        "response_schema": MEM_EXTRACT_SCHEMA,
+    }
+    try:
+        result = _router_post(payload, timeout=120)
+    except Exception as exc:  # noqa: BLE001 — wrapped into an honest error
+        raise RuntimeError("router: " + _hub_error_detail(exc)) from exc
+    if not result.get("ok"):
+        raise RuntimeError("router: " + str(result.get("error", "upstream_error"))[:100])
+    raw = result.get("text") or ""
+    if not raw and isinstance(result.get("response"), dict):
+        raw = json.dumps(result["response"], ensure_ascii=False)
+    facts = _parse_extract_facts(raw)
+    memories = [{"content": f, "kind": "fact"} for f in facts]
+    return memories[:MAX_MEMORIES_PER_CALL], "llm/router"
 
 
 # Deterministic rule fallback: no LLM, no key, no library. Patterns are
@@ -746,82 +669,16 @@ def _rule_extract_memories(text: str) -> list[dict]:
     return out
 
 
-def _mem0_extract(text: str, tenant_id: str, turn_id: str, user_id: str,
-                  metadata: dict) -> tuple[list[dict], str]:
-    """mem0-library extraction via hub-router adapters. Returns
-    (memories, engine). Raises RuntimeError on any failure — the caller
-    reports it, never silently downgrades a mem0 claim to rules.
-
-    Construction notes (verified against mem0ai 1.0.4 AND 2.2.1 source;
-    the adapter works on both — see _mem0_router_adapters):
-    - Memory.__init__ builds a real OpenAI LLM/embedder + Qdrant store
-      from the config, so dummy placeholders are given — but .llm,
-      .embedding_model and .vector_store are ALL swapped before add(),
-      so no OpenAI/Qdrant call is ever made and no key exists.
-    - The placeholder OpenAI client is constructed by mem0 even though
-      it is never called — and its constructor parses the process proxy
-      env vars (HTTP_PROXY etc. AND no_proxy) via httpx. Sandbox/egress
-      values can hold entries httpx cannot parse (here: IPv6 literals
-      in no_proxy → "Invalid port: ':1]'"), so ALL proxy vars are
-      scrubbed around from_config only, then restored.
-    - Telemetry is OFF (MEM0_TELEMETRY=false set before the import;
-      mem0 ships PostHog + a telemetry vector store otherwise).
-    - history_db_path points at a temp dir: the worker keeps no state
-      (the hub persists into D1); the temp dir is deleted after add().
-    - The null vector store makes every fact an ADD (search is empty);
-      the hub owns dedup/persistence downstream."""
-    import tempfile
-
-    os.environ.setdefault("MEM0_TELEMETRY", "false")
-    from mem0 import Memory  # lazy: base worker works without mem0ai
-
-    _PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-                   "http_proxy", "https_proxy", "all_proxy", "no_proxy")
-    with tempfile.TemporaryDirectory() as td:
-        config = {
-            "llm": {"provider": "openai", "config": {"model": "gpt-4o-mini", "api_key": "not-used-hub-router"}},
-            "embedder": {"provider": "openai", "config": {"model": "text-embedding-3-small", "api_key": "not-used-hub-router"}},
-            "vector_store": {"provider": "qdrant", "config": {"collection_name": "unused", "path": td}},
-            "history_db_path": os.path.join(td, "history.db"),
-        }
-        saved_proxies = {k: os.environ.pop(k) for k in _PROXY_VARS if k in os.environ}
-        try:
-            mem = Memory.from_config(config)
-        finally:
-            os.environ.update(saved_proxies)
-        llm, embedder, store = _mem0_router_adapters(tenant_id, turn_id)
-        mem.llm = llm
-        mem.embedding_model = embedder
-        mem.vector_store = store
-        result = mem.add(
-            messages=[{"role": "user", "content": text}],
-            user_id=user_id,
-            metadata={**metadata, "tenant_id": tenant_id},
-        )
-    memories: list[dict] = []
-    # 1.x returns {"results": [{memory, event}]}; 2.x returns the list
-    # directly ([{id, memory, event}]). Accept both.
-    if isinstance(result, list):
-        rows = result
-    elif isinstance(result, dict):
-        rows = (result or {}).get("results", []) or []
-    else:
-        rows = []
-    for row in rows:
-        content = (row or {}).get("memory", "")
-        if not content:
-            continue
-        memories.append({"content": content, "kind": "fact", "event": (row or {}).get("event", "ADD")})
-    return memories[:MAX_MEMORIES_PER_CALL], "mem0+hub-router"
-
-
 @app.post("/mem/extract")
 async def mem_extract(request: Request):
     """Text -> extracted memories. Body JSON: {tenant_id, text,
     user_id?, metadata?, turn_id?}. Response: {ok, memories[], engine,
-    model, count}. engine is `mem0+hub-router` when the mem0 library
-    ran with the hub router, else `rule_fallback` (deterministic, no
-    LLM). The worker stores nothing — the hub persists into D1."""
+    model, count}. engine is `llm/router` when the hub router extracted
+    facts (direct call, no mem0 library), else `rule_fallback`
+    (deterministic, no LLM) when the router is not configured. A
+    configured router call that fails returns 502 `mem_extract_failed`
+    — never a silent rule fallback. The worker stores nothing — the
+    hub persists into D1."""
     try:
         body = await request.json()
     except Exception:
@@ -848,12 +705,12 @@ async def mem_extract(request: Request):
     router_ready = bool(HUB_LLM_URL and INTERNAL_SECRET)
     if router_ready:
         try:
-            memories, engine = _mem0_extract(text, tenant_id.strip(), turn_id, user_id, metadata)
+            memories, engine = _router_extract(text, tenant_id.strip(), turn_id)
             return {
                 "ok": True,
                 "memories": memories,
                 "engine": engine,
-                "model": "hub-router/doc_extraction (+gemini-embedding-001)",
+                "model": "hub-router/doc_extraction",
                 "count": len(memories),
             }
         except Exception as exc:  # noqa: BLE001 — honest error, no silent fallback
@@ -861,7 +718,9 @@ async def mem_extract(request: Request):
                 {"ok": False, "error": "mem_extract_failed", "detail": str(exc)[:200]},
                 status_code=502,
             )
-    reason = "router_not_configured" if not router_ready else "mem0_unavailable"
+    # Router not configured: the rule fallback is the honest answer
+    # (the mem0 library path was removed 2026-11-24 — see the Memory
+    # section above; there is no "mem0_unavailable" branch anymore).
     memories = _rule_extract_memories(text)
     return {
         "ok": True,
@@ -869,7 +728,7 @@ async def mem_extract(request: Request):
         "engine": "rule_fallback",
         "model": "rule_fallback (no LLM call made)",
         "count": len(memories),
-        "note": reason + ": extraction ran without mem0/router; hub must set HUB_LLM_URL + INTERNAL_SECRET for the mem0 path",
+        "note": "router_not_configured: extraction ran without the hub router; hub must set HUB_LLM_URL + INTERNAL_SECRET for the LLM path",
     }
 
 

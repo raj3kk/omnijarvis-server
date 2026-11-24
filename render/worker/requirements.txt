@@ -68,3 +68,6 @@ webencodings==0.6.1
 # bandit_available=false), so the light worker loses nothing it
 # cannot honestly report. The protobuf pin also returns to ==7.36.2
 # (mem0ai needed protobuf<7 — ResolutionImpossible with the light set).
+# 2026-11-24: mem0ai is no longer needed at all — /mem/extract calls
+# the hub router directly (direct-router extraction, no mem0 library);
+# the mem0 code path was removed from main.py.
