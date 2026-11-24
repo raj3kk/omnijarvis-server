@@ -134,7 +134,7 @@ export function siteShell(title: string, body: string, opts: { active?: SiteNav;
 <div><h4>Account</h4><a href="/licence">Get a free licence</a><a href="/licence/login">Log in</a><a href="/licence/dashboard">Licence dashboard</a></div>
 <div><h4>Legal</h4><a href="/privacy">Privacy Policy</a><a href="/terms">Terms of Service</a><a href="/refund">Refund Policy</a></div>
 <div><h4>OmniJarvis</h4><p class="note">Your phone, your AI assistant. Free to start, no card. Talker talks, Executor works.</p></div>
-</div><div class="footbottom">© 2026 OmniJarvis · P.R. Digital Enterprises, India · Hub v21</div></footer>
+</div><div class="footbottom">© 2026 OmniJarvis · P.R. Digital Enterprises, India · Hub v22</div></footer>
 </body></html>`;
 }
 
@@ -234,7 +234,7 @@ export function downloadPage(): string {
 
 <section class="section"><h2>What changed in v${APK_VERSION}</h2>
 <ul class="check"><li>Gemma on-device model removed — all chat is now cloud-only (Gemini, your key)</li><li>APK is 22.7 MB smaller than v1.19.0 (was 37.75 MB, now ${APK_SIZE})</li><li>No “Free Local Model” card, no model download — AI Brain shows Gemini, OpenAI, Groq, OpenRouter only</li><li>Offline: clear message, no crash, no faked answer</li><li>Everything else unchanged — Talker, Executor, browser, overlay, Trained Jarvis, FCM, pairing</li></ul>
-<p class="note">Full history: every release since v1.4.23 is listed in the app’s release notes. The current hub version is v21.</p></section>`,
+<p class="note">Full history: every release since v1.4.23 is listed in the app’s release notes. The current hub version is v22.</p></section>`,
     { active: "download", description: "Download OmniJarvis for Android — v1.20.0, 16.06 MiB. Install over the previous version, never uninstall." },
   );
 }

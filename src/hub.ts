@@ -121,7 +121,7 @@ export interface Env {
 }
 
 const SERVICE = "omnijarvis-hub";
-const VERSION = "21"; // 21: G-17 observability first-use — Sentry call site + Langfuse OTel rewrite + /api/observability/probe; 20 was R4 models + admin website + FCM triggers
+const VERSION = "22"; // 22: professional website + skills library + Main Executor robustness + skills routes; 21 was G-17 observability first-use — Sentry call site + Langfuse OTel rewrite + /api/observability/probe
 
 import { consumePairingToken, deriveSixDigit, deriveTenantId, issuePairingToken, registerDevice } from "./pairing";
 import { getHubPublicKey, importPrivateKey } from "./crypto";
