@@ -217,6 +217,7 @@ import {
   embedText,
   listMemoriesByKind,
   loadApprovedPatterns,
+  parseDocExtractionFacts,
   qdrantStatus,
   searchMemories,
   storeMemory,
@@ -1163,6 +1164,43 @@ export async function handleRequest(
             turn_id: typeof body.turn_id === "string" ? body.turn_id : "",
           }),
         );
+        // G-26: persist doc_extraction facts into D1 memories. The
+        // render worker only returns the facts (by design); the hub
+        // owns persistence (memory.ts + hub /api/llm/route). This runs
+        // synchronously (awaited) — the caller reads D1 right after
+        // the call, so waitUntil would be too late. Best-effort per
+        // fact: a failed embed/store is traced and skipped, and an
+        // unparseable reply is skipped silently (the worker reports
+        // it as 502 itself). The response is unchanged. Traces carry
+        // only {tenant_id, memory_id, kind} — never fact content.
+        if ((typeof body.kind === "string" ? body.kind : "quick_command") === "doc_extraction" && typeof result.text === "string") {
+          let facts: string[];
+          try {
+            facts = parseDocExtractionFacts(result.text);
+          } catch {
+            facts = [];
+          }
+          const turnId = typeof body.turn_id === "string" ? body.turn_id : "";
+          for (const fact of facts.slice(0, 20)) {
+            const memoryId = `mem-${turnId}-${Date.now()}`;
+            try {
+              const emb = await embedText(
+                { db: env.DB, masterKeyB64: env.KEY_ENC_SECRET, founderKey: env.FOUNDER_GEMINI_KEY, config },
+                tenantId,
+                fact,
+                memoryId,
+              );
+              if (!emb.ok) throw new Error(emb.error);
+              await storeMemory(env.DB, tenantId, fact, "fact", emb.embedding);
+              await insertTrace(env.DB, tenantId, "", "memory_store", { memory_id: memoryId, kind: "fact" });
+            } catch (e) {
+              await insertTrace(env.DB, tenantId, "", "memory_persist_failed", {
+                kind: "doc_extraction",
+                reason: e instanceof Error ? e.message : String(e),
+              });
+            }
+          }
+        }
         return json(result);
       }
       const code = result.error_code ?? "upstream_error";
@@ -1173,7 +1211,7 @@ export async function handleRequest(
             ? 429
             : code === "tenant_not_found"
               ? 404
-              : code === "bad_request" || code === "invalid_key" || code === "live_not_routed"
+              : code === "bad_request" || code === "invalid_key" || code === "live_not_routed" || code === "no_route"
                 ? 400
                 : 502;
       return json({ error: code, detail: result.error ?? undefined }, status);

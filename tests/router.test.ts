@@ -891,6 +891,64 @@ describe("hub LLM routes (R-T14, R-T16)", () => {
     expect(((await res.json()) as Record<string, unknown>).error).toBe("bad_request");
   });
 
+  it("G-25 /api/llm/route: unknown kind 'chat' -> HTTP 400 no_route; a valid kind still works", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    await seedTenantWithKey(db, "t-g25", master);
+    // Unknown kind: no chain exists, so the router fails with no_route.
+    // The hub maps that to 400 (not 502).
+    const unknown = await handleRequest(
+      new Request("https://hub/api/llm/route", { method: "POST", headers: { "Content-Type": "application/json", "x-internal-secret": "test-internal" }, body: JSON.stringify({ tenant_id: "t-g25", turn_id: "turn-g25", kind: "chat", messages: [{ role: "user", text: "hi" }] }) }),
+      fakeEnv(db, { KEY_ENC_SECRET: master }),
+    );
+    expect(unknown.status).toBe(400);
+    expect(((await unknown.json()) as Record<string, unknown>).error).toBe("no_route");
+    // A valid kind still routes (mock Gemini 200).
+    vi.stubGlobal("fetch", async () => okText("audit-ok", 11, 3));
+    const valid = await handleRequest(
+      new Request("https://hub/api/llm/route", { method: "POST", headers: { "Content-Type": "application/json", "x-internal-secret": "test-internal" }, body: JSON.stringify({ tenant_id: "t-g25", turn_id: "turn-g25b", kind: "casual_chat", messages: [{ role: "user", text: "hi" }] }) }),
+      fakeEnv(db, { KEY_ENC_SECRET: master }),
+    );
+    expect(valid.status).toBe(200);
+    expect(((await valid.json()) as Record<string, unknown>).ok).toBe(true);
+  });
+
+  it("G-26 /api/llm/route: doc_extraction persists 2 facts to D1 memories; casual_chat persists nothing", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    await seedTenantWithKey(db, "t-g26", master);
+    const facts = ["Stays up late working on shop after dinner", "Keeps a notebook beside the bed for nighttime ideas"];
+    // Gemini generateContent returns the extraction JSON; :embedContent
+    // returns a small embedding (one embed call per fact).
+    vi.stubGlobal("fetch", async (url: unknown) => {
+      const u = String(url);
+      if (u.includes(":embedContent")) {
+        return new Response(JSON.stringify({ embedding: { values: [0.1, 0.2, 0.3] } }), { status: 200 });
+      }
+      return okText(JSON.stringify({ facts }));
+    });
+    const res = await handleRequest(
+      new Request("https://hub/api/llm/route", { method: "POST", headers: { "Content-Type": "application/json", "x-internal-secret": "test-internal" }, body: JSON.stringify({ tenant_id: "t-g26", turn_id: "turn-g26", kind: "doc_extraction", messages: [{ role: "user", text: "I usually stay up late working on my shop after dinner, and I always keep a notebook beside my bed for ideas that come at night." }], system: "Extract durable facts.", response_schema: { type: "object", properties: { facts: { type: "array", items: { type: "string" } } } } }) }),
+      fakeEnv(db, { KEY_ENC_SECRET: master }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    expect(body.text).toBe(JSON.stringify({ facts }));
+    const rows = (await db.prepare("SELECT * FROM memories WHERE tenant_id = ?").bind("t-g26").all()).results as Record<string, unknown>[];
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.content).sort()).toEqual([...facts].sort());
+    expect(rows.every((r) => r.kind === "fact")).toBe(true);
+    // Negative: a casual_chat turn with the same setup persists nothing.
+    const chat = await handleRequest(
+      new Request("https://hub/api/llm/route", { method: "POST", headers: { "Content-Type": "application/json", "x-internal-secret": "test-internal" }, body: JSON.stringify({ tenant_id: "t-g26", turn_id: "turn-g26b", kind: "casual_chat", messages: [{ role: "user", text: "hello" }] }) }),
+      fakeEnv(db, { KEY_ENC_SECRET: master }),
+    );
+    expect(chat.status).toBe(200);
+    const after = (await db.prepare("SELECT * FROM memories WHERE tenant_id = ?").bind("t-g26").all()).results as Record<string, unknown>[];
+    expect(after).toHaveLength(2);
+  });
+
   it("R-T26 hub groq-key: 401 without token; invalid -> 400; valid -> 200, key never echoed, envelope decrypts; DELETE clears", async () => {
     const db = new FakeD1();
     const master = await makeMasterKeyB64();

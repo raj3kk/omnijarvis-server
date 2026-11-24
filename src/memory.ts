@@ -108,6 +108,39 @@ export async function embedText(
   return { ok: true, embedding: result.embedding };
 }
 
+/**
+ * Parse the router's doc_extraction reply into plain-string facts.
+ *
+ * Mirrors the render worker's _parse_extract_facts (render/worker/main.py):
+ * the hub enforces MEM_EXTRACT_SCHEMA, so the reply is {"facts": ["..."]} —
+ * fences are stripped defensively, and a reply that is not JSON or has no
+ * facts array throws (never guess facts). Non-string / empty entries are
+ * skipped; an empty facts list is a valid result (the LLM found nothing
+ * durable). Used by the /api/llm/route handler to persist doc_extraction
+ * facts into D1 (G-26).
+ */
+export function parseDocExtractionFacts(raw: string): string[] {
+  let cleaned = (raw ?? "").trim();
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^`+/, "").replace(/`+$/, "").trim();
+    if (cleaned.toLowerCase().startsWith("json")) {
+      cleaned = cleaned.slice(4).trim();
+    }
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (e) {
+    throw new Error(`router reply is not JSON: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (typeof parsed !== "object" || parsed === null || !Array.isArray((parsed as { facts?: unknown }).facts)) {
+    throw new Error("router reply has no facts array");
+  }
+  return ((parsed as { facts: unknown[] }).facts as unknown[])
+    .filter((f): f is string => typeof f === "string" && f.trim().length > 0)
+    .map((f) => f.trim());
+}
+
 // --- D1 memory store (the Phase 3 store) ---
 
 /**
