@@ -13,10 +13,10 @@
  * supplies the shell + CSS they render inside.
  */
 
-export const APK_VERSION = "1.20.1";
-export const APK_SIZE = "16.06 MiB";
+export const APK_VERSION = "1.21.0";
+export const APK_SIZE = "16.08 MiB";
 export const APK_DOWNLOAD_URL =
-  "https://drive.google.com/uc?export=download&id=169sOC3BBK2z55p5RkddgECg8YbTg_maQ";
+  "https://drive.google.com/uc?export=download&id=12JJhfYAUCCGu6g35x6BcGNHPF1pJ5o1Z";
 
 /** HTML-escape for server-rendered user data (emails, masked keys). */
 export function esc(s: string): string {
@@ -233,9 +233,9 @@ export function downloadPage(): string {
 <div class="callout warn"><strong>What you need:</strong> an Android phone, internet (chat is cloud-only — with no internet the app shows a clear message instead of answering), and your own Gemini API key, added once in the app (AI Brain → Gemini). No key, no chat — the app will tell you exactly that.</div></section>
 
 <section class="section"><h2>What changed in v${APK_VERSION}</h2>
-<ul class="check"><li>Gemma on-device model removed — all chat is now cloud-only (Gemini, your key)</li><li>APK is 22.7 MB smaller than v1.19.0 (was 37.75 MB, now ${APK_SIZE})</li><li>No “Free Local Model” card, no model download — AI Brain shows Gemini, OpenAI, Groq, OpenRouter only</li><li>Offline: clear message, no crash, no faked answer</li><li>Everything else unchanged — Talker, Executor, browser, overlay, Trained Jarvis, FCM, pairing</li></ul>
+<ul class="check"><li>New Skills tab — browse the 12 hub skills and install them from the app (Free + Pro tiers)</li><li>Gemma on-device model removed — all chat is now cloud-only (Gemini, your key)</li><li>APK is 22.7 MB smaller than v1.19.0 (was 37.75 MB, now ${APK_SIZE})</li><li>No “Free Local Model” card, no model download — AI Brain shows Gemini, OpenAI, Groq, OpenRouter only</li><li>Offline: clear message, no crash, no faked answer</li><li>Everything else unchanged — Talker, Executor, browser, overlay, Trained Jarvis, FCM, pairing</li></ul>
 <p class="note">Full history: every release since v1.4.23 is listed in the app’s release notes. The current hub version is v22.</p></section>`,
-    { active: "download", description: "Download OmniJarvis for Android — v1.20.1, 16.06 MiB. Install over the previous version, never uninstall." },
+    { active: "download", description: "Download OmniJarvis for Android — v1.21.0, 16.08 MiB. Install over the previous version, never uninstall." },
   );
 }
 
