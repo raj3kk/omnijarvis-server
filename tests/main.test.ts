@@ -6,16 +6,21 @@ import { routeLlm, type RouterDeps } from "../src/router";
 import { insertKeyAudit } from "../src/db";
 import {
   MAIN_MAX_CALLS_PER_JOB,
+  buildPrBody,
   buildRepoMap,
   countJobsToday,
   createMainJob,
+  formatTrajectoryForPr,
   getMainJob,
   listPendingMainJobs,
+  parsePlan,
   parseTranscript,
   runMainStep,
   scanEdit,
   stepMainJobs,
   type MainEnv,
+  type MainJob,
+  type MainPlan,
 } from "../src/main";
 
 const FIXED_NOW = Date.UTC(2026, 10, 23, 12, 0, 0);
@@ -416,5 +421,191 @@ describe("key_audit (N-7 fix)", () => {
     expect(row?.key_kind).toBe("gemini");
     expect(row?.action).toBe("set");
     expect(row?.actor).toBe("admin");
+  });
+});
+
+describe("mainexec-robustness (§5.2 #9): scan-feedback loop + per-step retries", () => {
+  const PY_SNAPSHOT = [{ path: "x.py", content: "import os\nos.system('ls')\n" }];
+  const PY_PLAN = JSON.stringify({
+    steps: [{ id: "s1", title: "Replace os.system", file: "x.py", action: "Replace the os.system call with a safe alternative" }],
+  });
+
+  it("scan-blocked findings reach the editor prompt on the retry (not just the transcript)", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    await seedTenantWithKey(db, "t-1", master);
+    const { fetchFn, calls } = makeMockFetch({
+      geminiQueue: [
+        PY_PLAN,
+        "import os\nos.system('ls')\n# changed comment\n",
+        "import subprocess\nsubprocess.run(['ls'])\n",
+      ],
+      scanFindings: [[{ line: 3, pattern: "os.system", detail: "shell — use subprocess" }], []],
+    });
+    const env = mainEnvWithKeys(db, fetchFn, master, { WORKER_URL: "https://render.test" });
+    const created = await createMainJob(env, {
+      tenantId: "t-1",
+      ask: "Replace the os.system call in x.py",
+      repo: "raj3kk/omnijarvis-server",
+      snapshotFiles: PY_SNAPSHOT,
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("create failed");
+    const jobId = created.job.id;
+
+    const s1 = await runMainStep(env, jobId);
+    if (!s1.ok) throw new Error("s1 failed: " + s1.error);
+    expect(s1.job.status).toBe("planned");
+
+    // Editor attempt 1: content still trips the scan -> retryable, and
+    // the findings are stored ON the step for the next attempt.
+    const s2 = await runMainStep(env, jobId);
+    expect(s2.ok).toBe(false);
+    if (s2.ok) throw new Error("s2 should have been scan-blocked");
+    expect(s2.error).toBe("scan_blocked");
+    expect(s2.retryable).toBe(true);
+    const mid = await getMainJob(db, jobId);
+    const midPlan = mid ? parsePlan(mid) : null;
+    expect(midPlan?.steps[0].retries).toBe(1);
+    expect(midPlan?.steps[0].feedback).toContain("os.system");
+    expect(midPlan?.steps[0].feedback).toContain("shell — use subprocess");
+    // The job-wide CI-fix budget is untouched by the scan retry.
+    expect(mid?.retries_used).toBe(0);
+
+    // Editor attempt 2: the prompt must carry the feedback block.
+    const s3 = await runMainStep(env, jobId);
+    if (!s3.ok) throw new Error("s3 failed: " + s3.error);
+    expect(s3.job.status).toBe("blocked_token");
+    expect(s3.job.scan_verdict).toBe("clean");
+    const geminiCalls = calls.filter((c) => c.url.includes("generativelanguage.googleapis.com"));
+    expect(geminiCalls.length).toBe(3);
+    expect(geminiCalls[2].body).toContain("Previous attempt was rejected by the scan");
+    expect(geminiCalls[2].body).toContain("shell — use subprocess");
+    // Feedback is consumed: the stored plan has no feedback left.
+    const finalPlan = parsePlan(s3.job);
+    expect(finalPlan?.steps[0].feedback).toBeUndefined();
+    // Tool routing: every tool call left a trajectory entry.
+    const entries = parseTranscript(s3.job);
+    expect(entries.some((e) => e.phase === "tool:repo_map")).toBe(true);
+    expect(entries.some((e) => e.phase === "tool:read_file")).toBe(true);
+    expect(entries.some((e) => e.phase === "tool:scan_edit")).toBe(true);
+  });
+
+  it("editor no-change retries are per-step: 3rd no-change drops the step, CI budget untouched", async () => {
+    const db = new FakeD1();
+    const master = await makeMasterKeyB64();
+    await seedTenantWithKey(db, "t-1", master);
+    // No trailing newline in the snapshot: stripFences trims the editor
+    // output, so equality needs the trimmed form to match exactly.
+    const nochangeSnapshot = [{ path: "README.md", content: "# Jarvis\n\nHello." }];
+    const same = "# Jarvis\n\nHello.\n";
+    const { fetchFn } = makeMockFetch({ geminiQueue: [PLAN_JSON, same, same, same] });
+    const env = mainEnvWithKeys(db, fetchFn, master);
+    const created = await createMainJob(env, {
+      tenantId: "t-1",
+      ask: "Append a Troubleshooting section to README.md",
+      repo: "raj3kk/omnijarvis-server",
+      snapshotFiles: nochangeSnapshot,
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("create failed");
+    const jobId = created.job.id;
+
+    const s1 = await runMainStep(env, jobId);
+    if (!s1.ok) throw new Error("s1 failed: " + s1.error);
+    expect(s1.job.status).toBe("planned");
+
+    const r1 = await runMainStep(env, jobId);
+    expect(r1.ok).toBe(false);
+    if (r1.ok) throw new Error("r1 should be a retryable no-change");
+    expect(r1.error).toBe("editor_no_change");
+    const r2 = await runMainStep(env, jobId);
+    expect(r2.ok).toBe(false);
+    if (r2.ok) throw new Error("r2 should be a retryable no-change");
+    expect(r2.error).toBe("editor_no_change");
+
+    // 3rd no-change exceeds the per-step budget -> step dropped. The
+    // drop returns done (pre-existing shape: the NEXT invocation
+    // chains into validate), so one more step finishes the job.
+    const r3 = await runMainStep(env, jobId);
+    if (!r3.ok) throw new Error("r3 failed: " + r3.error);
+    expect(parsePlan(r3.job)?.done).toContain("s1");
+    expect(parsePlan(r3.job)?.steps[0].retries).toBe(3);
+    expect(r3.job.retries_used).toBe(0);
+    const r4 = await runMainStep(env, jobId);
+    if (!r4.ok) throw new Error("r4 failed: " + r4.error);
+    expect(r4.job.status).toBe("blocked_token");
+    const plan = parsePlan(r4.job);
+    expect(plan?.done).toContain("s1");
+    expect(plan?.steps[0].retries).toBe(3);
+    expect(r4.job.retries_used).toBe(0);
+  });
+});
+
+describe("mainexec-robustness (§5.2 #15): PR body carries the trajectory", () => {
+  function fakeJob(transcript: unknown[]): MainJob {
+    return {
+      id: "main-test-1",
+      tenant_id: "t-1",
+      device_id: null,
+      ask: "Add a Troubleshooting section",
+      repo: "raj3kk/omnijarvis-server",
+      base_branch: "main",
+      branch: "agent-mode/test-1",
+      status: "validating",
+      mode: "github",
+      plan: null,
+      transcript: JSON.stringify(transcript),
+      pr_url: null,
+      pr_number: null,
+      ci_status: "success",
+      scan_verdict: "clean",
+      llm_calls: 2,
+      steps_used: 2,
+      retries_used: 0,
+      error: null,
+      error_code: null,
+      created_at: FIXED_NOW,
+      updated_at: FIXED_NOW,
+    };
+  }
+
+  it("buildPrBody includes a Trajectory section with tool + LLM entries in order", () => {
+    const job = fakeJob([
+      { at: FIXED_NOW, phase: "created", note: "Job created (github mode)" },
+      { at: FIXED_NOW, phase: "tool:repo_map", note: "repo=raj3kk/omnijarvis-server, ref=main → ok (108 files, 12 symbols)" },
+      { at: FIXED_NOW, phase: "llm:architect", note: "model gemini-3.5-flash-lite — 100 in / 20 out" },
+      { at: FIXED_NOW, phase: "tool:scan_edit", note: "path=README.md → ok (clean)" },
+      { at: FIXED_NOW, phase: "commit", note: "committed README.md on agent-mode/test-1 (abc1234)" },
+      { at: FIXED_NOW, phase: "tool:ci_poll", note: "repo=raj3kk/omnijarvis-server, ref=agent-mode/test-1 → ok (success (2 check(s)))" },
+    ]);
+    const plan: MainPlan = {
+      steps: [{ id: "s1", title: "Add Troubleshooting section", file: "README.md", action: "Append" }],
+      done: ["s1"],
+    };
+    const body = buildPrBody(job, plan);
+    expect(body).toContain("## Trajectory");
+    expect(body).toContain("- tool:repo_map:");
+    expect(body).toContain("- llm:architect:");
+    expect(body).toContain("- tool:ci_poll:");
+    expect(body).toContain("## Evidence");
+    expect(body).toContain("- Scan: clean");
+    expect(body).toContain("- CI: success");
+    // Trajectory comes before the reviewer notes.
+    expect(body.indexOf("## Trajectory")).toBeLessThan(body.indexOf("## Reviewer notes"));
+  });
+
+  it("formatTrajectoryForPr keeps only the last 30 entries", () => {
+    const entries = Array.from({ length: 40 }, (_, i) => ({
+      at: FIXED_NOW,
+      phase: `tool:step-${i}`,
+      note: `entry ${i}`,
+    }));
+    const out = formatTrajectoryForPr(fakeJob(entries));
+    const lines = out.split("\n");
+    expect(lines).toHaveLength(30);
+    expect(lines[0]).toContain("entry 10");
+    expect(lines[29]).toContain("entry 39");
+    expect(formatTrajectoryForPr(fakeJob([]))).toBe("(no trajectory recorded)");
   });
 });
