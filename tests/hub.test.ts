@@ -229,11 +229,11 @@ describe("handleRequest (2a-2 routes, D1 licences)", () => {
     expect(body.key_id).toBeUndefined();
   });
 
-  it("GET /health -> version 21 (G-17 observability first-use)", async () => {
+  it("GET /health -> version 22 (website + skills + Main Executor robustness + skills routes)", async () => {
     // The version contract moved to /health when / became the landing
     // page (professional site) — /health stays the JSON status endpoint.
     const body = (await route("/health").json()) as Record<string, unknown>;
-    expect(body.version).toBe("21");
+    expect(body.version).toBe("22");
   });
 
   it("GET / -> landing HTML (professional site)", async () => {

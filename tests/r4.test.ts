@@ -388,7 +388,7 @@ describe("R4.5 admin website", () => {
     expect(res.text).not.toContain("Training console");
   });
 
-  it("GET /api/admin/overview without a session -> 401; with owner session -> live counts, version 21", async () => {
+  it("GET /api/admin/overview without a session -> 401; with owner session -> live counts, version 22", async () => {
     const db = new FakeD1();
     await seedTenant(db, "t-admin", "pro", OWNER_ADMIN_EMAIL);
     const noAuth = await callHub(db, "GET", "/api/admin/overview");
@@ -397,7 +397,7 @@ describe("R4.5 admin website", () => {
     const res = await callHub(db, "GET", "/api/admin/overview", null, { cookie: `lic_session=${token}` });
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
-    expect(res.body.version).toBe("21");
+    expect(res.body.version).toBe("22");
     expect(res.body.devices.count).toBe(0);
     expect(res.body.usage.tenant_id).toBe("t-admin");
     expect(res.body.usage.replies_cap).toBe(2500);
@@ -416,11 +416,11 @@ describe("R4.5 admin website", () => {
     expect(JSON.stringify(res.body)).not.toContain("gsk_");
   });
 
-  it("GET /health reports version 21", async () => {
+  it("GET /health reports version 22", async () => {
     const db = new FakeD1();
     const res = await callHub(db, "GET", "/health");
     expect(res.status).toBe(200);
-    expect(res.body.version).toBe("21");
+    expect(res.body.version).toBe("22");
   });
 });
 

@@ -23,11 +23,11 @@ test("hub /health returns ok + a version string", async ({ request }) => {
   expect(body.version).toMatch(/^\d+$/);
 });
 
-test("hub / renders the version JSON in a real browser", async ({ page }) => {
+test("hub / renders the landing page in a real browser", async ({ page }) => {
   const res = await page.goto(HUB);
   expect(res?.status()).toBe(200);
   const text = (await page.content()) ?? "";
-  expect(text).toContain("omnijarvis-hub");
+  expect(text).toContain("OmniJarvis");
 });
 
 test("hub unknown path is 404, not 500", async ({ request }) => {
