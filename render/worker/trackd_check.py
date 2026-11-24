@@ -83,9 +83,12 @@ def main() -> int:
               "arjun mehta" in joined and "patna" in joined, joined[:300])
         check("mem/extract rule_fallback model tag",
               r.get("model", "").startswith("rule_fallback"), str(r.get("model")))
-    elif engine == "mem0+hub-router":
-        check("mem/extract mem0 engine tag", True, engine)
-        check("mem/extract mem0 memories have content",
+    elif engine in ("llm/router", "mem0+hub-router"):
+        # llm/router = direct hub-router extraction (current); mem0+hub-router
+        # = the removed mem0-library path (kept so the check still reads an
+        # old deployment honestly until it is redeployed).
+        check("mem/extract LLM engine tag", True, engine)
+        check("mem/extract LLM memories have content",
               all(m.get("content") for m in mems), str(mems)[:300])
     else:
         check("mem/extract engine is known", False, f"engine={engine!r}")

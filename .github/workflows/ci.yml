@@ -66,3 +66,5 @@ jobs:
           curl -sf http://127.0.0.1:8000/health
           python render/worker/smoke_check.py http://127.0.0.1:8000 "$(cat /tmp/render.pid)"
           kill "$(cat /tmp/render.pid)" || true
+      - name: Mem/router extraction tests (rule fallback + direct LLM path + hub-error 502)
+        run: python render/worker/mem_router_test.py
